@@ -1,0 +1,14 @@
+#ifndef MEMORY_H
+#define MEMORY_H
+
+#define KERNEL_BASE     0xC0000000
+#define KERNEL_PHYS     0x00100000
+
+#define HEAP_START      0xD0000000
+#define HEAP_END        0xE0000000
+#define HEAP_INITIAL_PAGES 16
+
+#define USER_SPACE_START 0x00400000
+#define USER_SPACE_END   0xC0000000
+
+#endif

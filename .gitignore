@@ -1,0 +1,19 @@
+# Build artifacts
+*.o
+*.elf
+*.iso
+*.bin
+*.img
+
+# QEMU
+iso_root/
+
+# Editor
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# OS
+.DS_Store
