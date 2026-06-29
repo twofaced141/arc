@@ -59,9 +59,8 @@ page_directory_t *vmm_create_directory(void) {
         dir->entries[i] = 0;
 
     for (int i = 0; i < 1024; i++) {
-        if (kernel_directory->entries[i] & VMM_PRESENT) {
+        if (kernel_directory->entries[i] & VMM_PRESENT)
             dir->entries[i] = kernel_directory->entries[i];
-        }
     }
 
     return dir;
@@ -84,7 +83,8 @@ void vmm_free_directory(page_directory_t *dir) {
         if (!(dir->entries[i] & VMM_PRESENT))
             continue;
 
-        if ((uint32_t)i * 4096 * 1024 >= HEAP_START && (uint32_t)i * 4096 * 1024 < HEAP_END)
+        uint32_t virt_base = (uint32_t)i * 1024 * PAGE_SIZE;
+        if (virt_base >= KERNEL_BASE)
             continue;
 
         page_table_t *table = (page_table_t *)(dir->entries[i] & ~0xFFF);
@@ -176,105 +176,172 @@ static void page_fault_handler(registers_t *r) {
         return;
     }
 
-    terminal_print("\nPAGE FAULT at 0x");
-
-    char hex[] = "0123456789ABCDEF";
-    for (int i = 28; i >= 0; i -= 4)
-        terminal_putchar(hex[(fault_addr >> i) & 0xF]);
-
-    terminal_print("\nError: ");
-    if (error_code & VMM_FLAG_PRESENT) terminal_print("PRESENT ");
-    if (error_code & VMM_FLAG_WRITE) terminal_print("WRITE ");
-    if (error_code & VMM_FLAG_USER) terminal_print("USER ");
-    if (error_code & VMM_FLAG_RESERVED) terminal_print("RESERVED ");
-    if (error_code & VMM_FLAG_FETCH) terminal_print("FETCH ");
-    terminal_print("\n");
+    debug_print("PAGE FAULT at 0x");
+    debug_print_hex32(fault_addr);
+    debug_print(" err=0x");
+    debug_print_hex32(error_code);
+    debug_print(" eip=0x");
+    debug_print_hex32(r->eip);
+    debug_print("\r\n");
 
     panic("Page Fault", r);
 }
 
-static void *heap_current;
-static void *heap_start;
-static void *heap_end;
+typedef struct heap_block {
+    uint32_t size;
+    struct heap_block *next;
+} heap_block_t;
 
-void vmm_init_heap(void) {
-    heap_start = (void *)HEAP_START;
-    heap_end = (void *)HEAP_END;
-    heap_current = heap_start;
+#define HEAP_BLOCK_FREE    1
+#define HEAP_SIZE_MASK    (~1U)
+#define HEAP_HEADER_SIZE   sizeof(heap_block_t)
+#define HEAP_ALIGNMENT     16
+#define HEAP_ALIGN(sz)     (((sz) + (HEAP_ALIGNMENT - 1)) & ~(HEAP_ALIGNMENT - 1))
+#define HEAP_MIN_BLOCK     (HEAP_ALIGN(HEAP_HEADER_SIZE + HEAP_ALIGNMENT))
 
-    for (uint32_t i = 0; i < HEAP_INITIAL_PAGES; i++) {
+static heap_block_t *heap_free_list;
+static uint32_t heap_mapped_end;
+static uint32_t heap_brk;
+
+static void heap_map_until(uint32_t addr) {
+    while (heap_mapped_end < addr) {
         void *phys = pmm_alloc_page();
-        if (!phys)
-            break;
+        if (!phys) break;
         vmm_map_page(kernel_directory, (uint32_t)phys,
-                      HEAP_START + i * PAGE_SIZE,
-                      VMM_PRESENT | VMM_WRITABLE);
+                     heap_mapped_end, VMM_PRESENT | VMM_WRITABLE);
+        heap_mapped_end += PAGE_SIZE;
     }
-
-    debug_print("vmm: heap initialized at 0xD0000000\r\n");
 }
 
-static uint32_t heap_sbrk(uint32_t pages) {
-    uint32_t allocated = 0;
-
-    for (uint32_t i = 0; i < pages; i++) {
-        uint32_t addr = (uint32_t)heap_current + allocated;
-        if (addr >= HEAP_END)
-            break;
-
-        void *phys = pmm_alloc_page();
-        if (!phys)
-            break;
-
-        vmm_map_page(kernel_directory, (uint32_t)phys, addr,
-                      VMM_PRESENT | VMM_WRITABLE);
-        allocated += PAGE_SIZE;
+static void heap_coalesce(heap_block_t *b) {
+    heap_block_t *next = (heap_block_t *)((uint8_t *)b + (b->size & HEAP_SIZE_MASK));
+    if ((uint32_t)next < heap_mapped_end && (next->size & HEAP_BLOCK_FREE)) {
+        b->size = (b->size & HEAP_SIZE_MASK) + (next->size & HEAP_SIZE_MASK);
+        b->next = next->next;
     }
+}
 
-    return allocated;
+void vmm_init_heap(void) {
+    heap_free_list = NULL;
+    heap_mapped_end = HEAP_START;
+    heap_brk = HEAP_START;
+
+    heap_map_until(HEAP_START + HEAP_INITIAL_PAGES * PAGE_SIZE);
+
+    debug_print("vmm: heap initialized at 0xD0000000\r\n");
 }
 
 void *kmalloc(uint32_t size) {
     if (size == 0)
         return NULL;
 
-    uint32_t aligned = (size + 15) & ~15;
-    uint32_t pages_needed = (aligned + PAGE_SIZE - 1) / PAGE_SIZE;
+    uint32_t need = HEAP_HEADER_SIZE + HEAP_ALIGN(size);
+    if (need < HEAP_MIN_BLOCK)
+        need = HEAP_MIN_BLOCK;
 
-    uint32_t addr = (uint32_t)heap_current;
-    uint32_t heap_used = addr - (uint32_t)heap_start;
-    uint32_t heap_total_pages = heap_used / PAGE_SIZE + pages_needed + 1;
+    heap_block_t *prev = NULL;
+    heap_block_t *b = heap_free_list;
 
-    if (heap_total_pages > HEAP_INITIAL_PAGES) {
-        uint32_t extra = heap_total_pages - HEAP_INITIAL_PAGES;
-        uint32_t allocated = heap_sbrk(extra);
-        if (allocated < extra * PAGE_SIZE) {
-            return NULL;
+    while (b) {
+        uint32_t block_size = b->size & HEAP_SIZE_MASK;
+        if (block_size >= need) {
+            uint32_t remaining = block_size - need;
+            if (remaining >= HEAP_MIN_BLOCK) {
+                b->size = need | 0;
+                heap_block_t *split = (heap_block_t *)((uint8_t *)b + need);
+                split->size = remaining | HEAP_BLOCK_FREE;
+                split->next = b->next;
+                if (prev)
+                    prev->next = split;
+                else
+                    heap_free_list = split;
+            } else {
+                b->size = block_size | 0;
+                if (prev)
+                    prev->next = b->next;
+                else
+                    heap_free_list = b->next;
+            }
+            return (void *)((uint8_t *)b + HEAP_HEADER_SIZE);
         }
+        prev = b;
+        b = b->next;
     }
 
-    heap_current = (void *)(addr + aligned);
-    return (void *)addr;
+    uint32_t addr = heap_brk;
+    uint32_t new_brk = addr + need;
+    if (new_brk >= HEAP_END)
+        return NULL;
+
+    heap_map_until(new_brk);
+    heap_brk = new_brk;
+
+    heap_block_t *block = (heap_block_t *)addr;
+    block->size = need | 0;
+    block->next = NULL;
+    return (void *)((uint8_t *)block + HEAP_HEADER_SIZE);
 }
 
 void *kcalloc(uint32_t count, uint32_t size) {
     uint32_t total = count * size;
     void *ptr = kmalloc(total);
     if (ptr) {
-        uint32_t *p = (uint32_t *)ptr;
-        for (uint32_t i = 0; i < total / 4; i++)
+        uint8_t *p = (uint8_t *)ptr;
+        for (uint32_t i = 0; i < total; i++)
             p[i] = 0;
-        for (uint32_t i = 0; i < total % 4; i++)
-            ((uint8_t *)ptr)[total - 1 - i] = 0;
     }
     return ptr;
 }
 
 void kfree(void *addr) {
-    (void)addr;
+    if (!addr)
+        return;
+
+    heap_block_t *b = (heap_block_t *)((uint8_t *)addr - HEAP_HEADER_SIZE);
+    uint32_t block_size = b->size & HEAP_SIZE_MASK;
+
+    b->size = block_size | HEAP_BLOCK_FREE;
+
+    heap_block_t *prev = NULL;
+    heap_block_t *cur = heap_free_list;
+
+    while (cur && (uint32_t)cur < (uint32_t)b) {
+        prev = cur;
+        cur = cur->next;
+    }
+
+    b->next = cur;
+    if (prev)
+        prev->next = b;
+    else
+        heap_free_list = b;
+
+    heap_coalesce(b);
+    if (prev && (uint32_t)prev + (prev->size & HEAP_SIZE_MASK) == (uint32_t)b)
+        heap_coalesce(prev);
+}
+
+void *vmm_temp_map(uint32_t phys) {
+    debug_print("temp_map phys=0x");
+    debug_print_hex32(phys);
+    debug_print("\r\n");
+    vmm_map_page(kernel_directory, phys, TEMP_VADDR, VMM_PRESENT | VMM_WRITABLE);
+    debug_print("temp_map done\r\n");
+    return (void *)TEMP_VADDR;
+}
+
+void vmm_temp_unmap(void) {
+    vmm_unmap_page(kernel_directory, TEMP_VADDR);
+    invlpg(TEMP_VADDR);
 }
 
 void vmm_init(void) {
+    uint32_t esp_val;
+    __asm__ __volatile__("mov %%esp, %0" : "=r"(esp_val));
+    debug_print("vmm_init esp=0x");
+    debug_print_hex32(esp_val);
+    debug_print("\r\n");
+
     kernel_directory = (page_directory_t *)pmm_alloc_page();
     if (!kernel_directory) {
         terminal_print("VMM: failed to alloc kernel page directory\n");
@@ -284,16 +351,14 @@ void vmm_init(void) {
     for (int i = 0; i < 1024; i++)
         kernel_directory->entries[i] = 0;
 
-    for (uint32_t virt = 0; virt < 0x00400000; virt += PAGE_SIZE) {
-        void *phys = (void *)virt;
-        vmm_map_page(kernel_directory, (uint32_t)phys, virt,
-                      VMM_PRESENT | VMM_WRITABLE);
+    /* Identity map первые 64MB — чтобы page tables были доступны по физическим адресам */
+    for (uint32_t virt = 0; virt < 0x04000000; virt += PAGE_SIZE) {
+        vmm_map_page(kernel_directory, virt, virt, VMM_PRESENT | VMM_WRITABLE);
     }
 
-    uint32_t kernel_phys_start = KERNEL_PHYS;
-    uint32_t kernel_size = 0x400000;
-    for (uint32_t offset = 0; offset < kernel_size; offset += PAGE_SIZE) {
-        vmm_map_page(kernel_directory, kernel_phys_start + offset,
+    /* Kernel higher half: физ 1MB+ -> виртуальный 0xC0000000+ */
+    for (uint32_t offset = 0; offset < 0x400000; offset += PAGE_SIZE) {
+        vmm_map_page(kernel_directory, KERNEL_PHYS + offset,
                       KERNEL_BASE + offset,
                       VMM_PRESENT | VMM_WRITABLE);
     }
@@ -309,5 +374,5 @@ void vmm_init(void) {
 
     debug_print("vmm: paging enabled\r\n");
     debug_print("vmm: kernel mapped at 0xC0000000 (higher half)\r\n");
-    debug_print("vmm: identity map 0-4MB\r\n");
+    debug_print("vmm: identity map 0-64MB\r\n");
 }
