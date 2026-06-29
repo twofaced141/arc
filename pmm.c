@@ -1,5 +1,6 @@
 #include "pmm.h"
 #include "terminal.h"
+#include "debug.h"
 
 #define MAX_PAGES (1024 * 1024)
 
@@ -87,25 +88,56 @@ void pmm_init(multiboot2_info_t *mboot) {
         }
     }
 
-    uint32_t bitmap_start = ((uint32_t)&_kernel_end + PAGE_SIZE - 1) / PAGE_SIZE;
-    uint32_t bitmap_pages = (sizeof(bitmap) + PAGE_SIZE - 1) / PAGE_SIZE;
-    for (uint32_t i = 0; i < bitmap_pages; i++) {
-        if (!bitmap_test(bitmap_start + i)) {
-            bitmap_set(bitmap_start + i);
+    debug_print("pmm: kernel_end=0x");
+    debug_print_hex32((uint32_t)&_kernel_end);
+    debug_print(" kernel_end_page=0x");
+    debug_print_hex32(kernel_end_page);
+    debug_print(" first free page test: ");
+    debug_print(bitmap_test(0x139) ? "USED" : "FREE");
+    debug_print("\r\n");
+
+    uint32_t bitmap_phys = (uint32_t)bitmap;
+    uint32_t bitmap_size = sizeof(bitmap);
+    uint32_t bmap_start = bitmap_phys / PAGE_SIZE;
+    uint32_t bmap_end = (bitmap_phys + bitmap_size + PAGE_SIZE - 1) / PAGE_SIZE;
+
+    for (uint32_t i = bmap_start; i < bmap_end; i++) {
+        if (!bitmap_test(i)) {
+            bitmap_set(i);
             free_pages--;
         }
     }
+
+    debug_print("pmm: bitmap at 0x");
+    debug_print_hex32(bitmap_phys);
+    debug_print(" size=0x");
+    debug_print_hex32(bitmap_size);
+    debug_print("\r\n");
 }
 
 void *pmm_alloc_page(void) {
+    static uint32_t call_count = 0;
     if (free_pages == 0)
         return (void *)0;
 
     for (uint32_t i = 0; i < total_pages; i++) {
         if (!bitmap_test(i)) {
             bitmap_set(i);
+            if (!bitmap_test(i)) {
+                debug_print("pmm: bitmap_set FAILED for i=");
+                debug_print_hex32(i);
+                debug_print("\r\n");
+                continue;
+            }
             free_pages--;
-            return (void *)(i * PAGE_SIZE);
+            call_count++;
+            void *result = (void *)(i * PAGE_SIZE);
+            debug_print("pmm_alloc #");
+            debug_print_hex32(call_count);
+            debug_print(": 0x");
+            debug_print_hex32((uint32_t)result);
+            debug_print("\r\n");
+            return result;
         }
     }
     return (void *)0;

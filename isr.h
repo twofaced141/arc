@@ -3,6 +3,10 @@
 
 #include <stdint.h>
 
+#define SYSCALL_PUTC  1u
+#define SYSCALL_YIELD 2u
+#define SYSCALL_EXIT  3u
+
 typedef struct {
     uint32_t gs, fs, es, ds;
     uint32_t edi, esi, ebp, esp, ebx, edx, ecx, eax;

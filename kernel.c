@@ -10,6 +10,8 @@
 #include "pit.h"
 #include "pmm.h"
 #include "vmm.h"
+#include "process.h"
+#include "scheduler.h"
 #include "multiboot2.h"
 
 #define VGA_BUFFER 0xB8000
@@ -236,6 +238,30 @@ void kernel_main(uint32_t mboot_magic, multiboot2_info_t *mboot_info) {
         kfree(a5);
         terminal_print("HEAP: all tests done\n");
         terminal_print("VMM: address spaces ready\n");
+
+        process_init();
+        debug_print("process_init done\r\n");
+        scheduler_init();
+        debug_print("scheduler_init done\r\n");
+
+        uint8_t user_code[] = {
+            0xBB, 0x41, 0x00, 0x00, 0x00,
+            0xB8, 0x01, 0x00, 0x00, 0x00,
+            0xCD, 0x80,
+            0xB8, 0x02, 0x00, 0x00, 0x00,
+            0xCD, 0x80,
+            0xEB, 0xF5
+        };
+        process_t *proc = process_create_user(0x00100000, user_code, sizeof(user_code));
+        if (proc) {
+            scheduler_add_process(proc);
+            terminal_print("SCHEDULER: user process created (pid=");
+            terminal_putchar('0' + proc->pid);
+            terminal_print(")\n");
+
+        } else {
+            terminal_print("SCHEDULER: failed to create process\n");
+        }
     } else {
         terminal_print("ERROR: not booted with Multiboot2!\n");
     }

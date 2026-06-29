@@ -60,4 +60,8 @@ void *kmalloc(uint32_t size);
 void *kcalloc(uint32_t count, uint32_t size);
 void  kfree(void *addr);
 
+#define TEMP_VADDR 0xFFC00000
+void *vmm_temp_map(uint32_t phys);
+void  vmm_temp_unmap(void);
+
 #endif

@@ -32,8 +32,8 @@ ISR_ERRCODE   13
 ISR_ERRCODE   14
 ISR_NOERRCODE 15
 ISR_NOERRCODE 16
-ISR_ERRCODE   17
-ISR_NOERRCODE 18
+ISR_NOERRCODE 17
+ISR_ERRCODE   18
 ISR_NOERRCODE 19
 ISR_NOERRCODE 20
 ISR_NOERRCODE 21
@@ -47,6 +47,7 @@ ISR_NOERRCODE 28
 ISR_NOERRCODE 29
 ISR_ERRCODE   30
 ISR_NOERRCODE 31
+ISR_NOERRCODE 128
 
 .macro IRQ num, vec
 .global irq\num
@@ -76,17 +77,39 @@ IRQ 15, 47
 .extern isr_handler
 isr_common_stub:
     pusha
-    push %ds
-    push %es
-    push %fs
-    push %gs
+    xor %eax, %eax
+    mov %ds, %ax
+    push %eax
+    xor %eax, %eax
+    mov %es, %ax
+    push %eax
+    xor %eax, %eax
+    mov %fs, %ax
+    push %eax
+    xor %eax, %eax
+    mov %gs, %ax
+    push %eax
+    mov $0x10, %ax
+    mov %ax, %ds
+    mov %ax, %es
+    mov %ax, %fs
+    mov %ax, %gs
+    cld
     push %esp
     call isr_handler
     add $4, %esp
-    pop %gs
-    pop %fs
-    pop %es
-    pop %ds
+    push %esp
+    call scheduler_switch
+    add $4, %esp
+    mov %eax, %esp
+    pop %eax
+    mov %ax, %gs
+    pop %eax
+    mov %ax, %fs
+    pop %eax
+    mov %ax, %es
+    pop %eax
+    mov %ax, %ds
     popa
     add $8, %esp
     iret
@@ -94,17 +117,39 @@ isr_common_stub:
 .extern irq_handler
 irq_common_stub:
     pusha
-    push %ds
-    push %es
-    push %fs
-    push %gs
+    xor %eax, %eax
+    mov %ds, %ax
+    push %eax
+    xor %eax, %eax
+    mov %es, %ax
+    push %eax
+    xor %eax, %eax
+    mov %fs, %ax
+    push %eax
+    xor %eax, %eax
+    mov %gs, %ax
+    push %eax
+    mov $0x10, %ax
+    mov %ax, %ds
+    mov %ax, %es
+    mov %ax, %fs
+    mov %ax, %gs
+    cld
     push %esp
     call irq_handler
     add $4, %esp
-    pop %gs
-    pop %fs
-    pop %es
-    pop %ds
+    push %esp
+    call scheduler_switch
+    add $4, %esp
+    mov %eax, %esp
+    pop %eax
+    mov %ax, %gs
+    pop %eax
+    mov %ax, %fs
+    pop %eax
+    mov %ax, %es
+    pop %eax
+    mov %ax, %ds
     popa
     add $8, %esp
     iret

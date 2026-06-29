@@ -8,7 +8,7 @@ CFLAGS   = -ffreestanding -nostdlib -nostartfiles -nodefaultlibs \
 ASFLAGS  = --32
 LDFLAGS  = -T linker.ld -nostdlib -m elf_i386
 
-OBJS = boot.o gdt.o kernel.o interrupts.o idt.o isr.o keyboard.o pit.o debug.o panic.o pmm.o vmm.o
+OBJS = boot.o gdt.o kernel.o interrupts.o idt.o isr.o keyboard.o pit.o debug.o panic.o pmm.o vmm.o process.o scheduler.o
 
 all: kernel.elf
 
@@ -46,6 +46,12 @@ pmm.o: pmm.c pmm.h multiboot2.h terminal.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 vmm.o: vmm.c vmm.h pmm.h terminal.h debug.h panic.h isr.h
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+process.o: process.c process.h vmm.h pmm.h isr.h gdt.h
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+scheduler.o: scheduler.c scheduler.h process.h gdt.h vmm.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 kernel.elf: $(OBJS) linker.ld
