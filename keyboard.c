@@ -2,6 +2,11 @@
 #include "idt.h"
 #include "isr.h"
 
+#define LSHIFT_MAKE  0x2A
+#define RSHIFT_MAKE  0x36
+#define LSHIFT_BREAK 0xAA
+#define RSHIFT_BREAK 0xB6
+
 static const char scancode_ascii[] = {
     0, 0, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', 0,
     0, 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', '\n',
@@ -10,9 +15,18 @@ static const char scancode_ascii[] = {
     0, ' '
 };
 
+static const char scancode_shifted[] = {
+    0, 0, '!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '+', 0,
+    0, 'Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P', '{', '}', '\n',
+    0, 'A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', ':', '"', '~', 0,
+    '|', 'Z', 'X', 'C', 'V', 'B', 'N', 'M', '<', '>', '?', 0, '*',
+    0, ' '
+};
+
 static volatile char key_buffer[256];
 static volatile uint8_t key_buffer_head;
 static volatile uint8_t key_buffer_tail;
+static volatile uint8_t shift_pressed;
 
 static void ps2_wait_input(void) {
     while (inb(0x64) & 0x02);
@@ -30,13 +44,23 @@ static void keyboard_irq_handler(registers_t *r) {
     (void)r;
 
     sc = inb(0x60);
+
+    if (sc == LSHIFT_MAKE || sc == RSHIFT_MAKE) {
+        shift_pressed = 1;
+        return;
+    }
+    if (sc == LSHIFT_BREAK || sc == RSHIFT_BREAK) {
+        shift_pressed = 0;
+        return;
+    }
+
     if (sc & 0x80)
         return;
 
     if (sc >= sizeof(scancode_ascii))
         return;
 
-    c = scancode_ascii[sc];
+    c = shift_pressed ? scancode_shifted[sc] : scancode_ascii[sc];
     if (!c)
         return;
 
