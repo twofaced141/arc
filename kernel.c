@@ -207,6 +207,34 @@ void kernel_main(uint32_t mboot_magic, multiboot2_info_t *mboot_info) {
 
         terminal_print("VMM: kernel at 0xC0000000 (higher half)\n");
         terminal_print("VMM: heap at 0xD0000000-0xE0000000\n");
+        terminal_print("HEAP: testing allocator...\n");
+        void *a1 = kmalloc(32);
+        void *a2 = kmalloc(64);
+        void *a3 = kmalloc(128);
+        debug_printf("heap: a1=0x%x a2=0x%x a3=0x%x\r\n", a1, a2, a3);
+        if (a1 && a2 && a3) {
+            __builtin_memset(a1, 0xAA, 32);
+            __builtin_memset(a2, 0xBB, 64);
+            __builtin_memset(a3, 0xCC, 128);
+        }
+        terminal_print("HEAP: allocated 32+64+128, fill ok\n");
+
+        kfree(a2);
+        terminal_print("HEAP: freed middle block\n");
+        void *a4 = kmalloc(32);
+        debug_printf("heap: a4=0x%x (should reuse a2)\r\n", a4);
+        terminal_print("HEAP: alloc 32 after free");
+        terminal_print(a4 ? " OK\n" : " FAIL\n");
+
+        kfree(a1);
+        kfree(a3);
+        terminal_print("HEAP: freed all\n");
+        void *a5 = kmalloc(256);
+        terminal_print("HEAP: alloc 256 after full free");
+        terminal_print(a5 ? " OK\n" : " FAIL\n");
+        __builtin_memset(a5, 0xDD, 256);
+        kfree(a5);
+        terminal_print("HEAP: all tests done\n");
         terminal_print("VMM: address spaces ready\n");
     } else {
         terminal_print("ERROR: not booted with Multiboot2!\n");
