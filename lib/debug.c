@@ -88,7 +88,18 @@ void debug_printf(const char *fmt, ...) {
             debug_print_dec(val);
             break;
         }
-        case 'x':
+        case 'x': {
+            uint32_t val = va_arg(args, uint32_t);
+            int started = 0;
+            for (int i = 28; i >= 0; i -= 4) {
+                uint8_t nibble = (val >> i) & 0xF;
+                if (nibble || started || i == 0) {
+                    debug_putchar(hex_digits[nibble]);
+                    started = 1;
+                }
+            }
+            break;
+        }
         case 'p': {
             uint32_t val = va_arg(args, uint32_t);
             debug_print("0x");

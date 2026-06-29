@@ -1,12 +1,14 @@
 #include "pmm.h"
 #include "terminal.h"
 #include "debug.h"
+#include "vmm.h"
 
 #define MAX_PAGES (1024 * 1024)
 
 static uint8_t bitmap[MAX_PAGES / 8];
 static uint32_t total_pages;
 static uint32_t free_pages;
+static uint16_t *refcounts;
 
 extern uint32_t _kernel_end;
 
@@ -108,6 +110,31 @@ void pmm_init(multiboot2_info_t *mboot) {
         }
     }
 
+    /* Reserve multiboot2 module pages */
+    for (tag = multiboot2_first_tag(mboot); tag->type != MULTIBOOT_TAG_END; tag = multiboot2_next_tag(tag)) {
+        if (tag->type == MULTIBOOT_TAG_MODULE) {
+            multiboot2_tag_module_t *mod = (multiboot2_tag_module_t *)tag;
+            uint32_t mod_start_page = mod->mod_start / PAGE_SIZE;
+            uint32_t mod_end_page = (mod->mod_end + PAGE_SIZE - 1) / PAGE_SIZE;
+            for (uint32_t i = mod_start_page; i < mod_end_page; i++) {
+                if (!bitmap_test(i)) {
+                    bitmap_set(i);
+                    free_pages--;
+                }
+            }
+        }
+    }
+
+    /* Reserve multiboot2 info structure pages */
+    uint32_t mboot_start_page = (uint32_t)mboot / PAGE_SIZE;
+    uint32_t mboot_end_page = ((uint32_t)mboot + mboot->total_size + PAGE_SIZE - 1) / PAGE_SIZE;
+    for (uint32_t i = mboot_start_page; i < mboot_end_page; i++) {
+        if (!bitmap_test(i)) {
+            bitmap_set(i);
+            free_pages--;
+        }
+    }
+
     debug_print("pmm: bitmap at 0x");
     debug_print_hex32(bitmap_phys);
     debug_print(" size=0x");
@@ -116,28 +143,18 @@ void pmm_init(multiboot2_info_t *mboot) {
 }
 
 void *pmm_alloc_page(void) {
-    static uint32_t call_count = 0;
     if (free_pages == 0)
         return (void *)0;
 
     for (uint32_t i = 0; i < total_pages; i++) {
         if (!bitmap_test(i)) {
             bitmap_set(i);
-            if (!bitmap_test(i)) {
-                debug_print("pmm: bitmap_set FAILED for i=");
-                debug_print_hex32(i);
-                debug_print("\r\n");
+            if (!bitmap_test(i))
                 continue;
-            }
             free_pages--;
-            call_count++;
-            void *result = (void *)(i * PAGE_SIZE);
-            debug_print("pmm_alloc #");
-            debug_print_hex32(call_count);
-            debug_print(": 0x");
-            debug_print_hex32((uint32_t)result);
-            debug_print("\r\n");
-            return result;
+            if (refcounts)
+                refcounts[i] = 1;
+            return (void *)(i * PAGE_SIZE);
         }
     }
     return (void *)0;
@@ -158,6 +175,8 @@ void *pmm_alloc_pages(uint32_t count) {
             for (uint32_t k = 0; k < count; k++) {
                 bitmap_set(i + k);
                 free_pages--;
+                if (refcounts)
+                    refcounts[i + k] = 1;
             }
             return (void *)(i * PAGE_SIZE);
         }
@@ -185,4 +204,35 @@ void pmm_free_pages(void *addr, uint32_t count) {
 
 uint32_t pmm_get_free_pages(void) {
     return free_pages;
+}
+
+void pmm_refcount_init(void) {
+    uint32_t rc_bytes = total_pages * sizeof(uint16_t);
+    refcounts = (uint16_t *)kcalloc(1, rc_bytes);
+    if (!refcounts) {
+        debug_print("pmm: refcount table alloc failed\r\n");
+        return;
+    }
+    for (uint32_t i = 0; i < total_pages; i++) {
+        if (bitmap_test(i))
+            refcounts[i] = 1;
+    }
+    debug_printf("pmm: refcounts %u bytes via kcalloc\r\n", rc_bytes);
+}
+
+void pmm_refcount_inc(uint32_t phys) {
+    uint32_t idx = phys / PAGE_SIZE;
+    if (idx < total_pages)
+        refcounts[idx]++;
+}
+
+void pmm_refcount_dec(uint32_t phys) {
+    uint32_t idx = phys / PAGE_SIZE;
+    if (idx >= total_pages) return;
+    if (refcounts[idx] > 1) {
+        refcounts[idx]--;
+    } else {
+        refcounts[idx] = 0;
+        pmm_free_page((void *)phys);
+    }
 }

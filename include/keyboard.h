@@ -5,5 +5,6 @@
 
 void keyboard_init(void);
 char keyboard_getchar(void);  // blocks until a mapped key is pressed
+uint32_t keyboard_read(char *buf, uint32_t max);  // non-blocking, returns count
 
 #endif

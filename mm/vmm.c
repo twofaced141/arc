@@ -13,7 +13,7 @@ static inline void invlpg(uint32_t addr) {
 }
 
 static inline void switch_cr3(uint32_t dir) {
-    __asm__ __volatile__("mov %0, %%cr3" :: "r"(dir));
+    __asm__ __volatile__("mov %0, %%cr3" :: "r"(dir) : "memory");
 }
 
 static inline uint32_t read_cr0(void) {
@@ -75,6 +75,10 @@ page_directory_t *vmm_get_current_directory(void) {
     return current_directory;
 }
 
+page_directory_t *vmm_get_kernel_directory(void) {
+    return kernel_directory;
+}
+
 void vmm_free_directory(page_directory_t *dir) {
     if (dir == kernel_directory || dir == current_directory)
         return;
@@ -87,13 +91,14 @@ void vmm_free_directory(page_directory_t *dir) {
         if (virt_base >= KERNEL_BASE)
             continue;
 
+        if (dir->entries[i] == kernel_directory->entries[i])
+            continue;
+
         page_table_t *table = (page_table_t *)(dir->entries[i] & ~0xFFF);
 
         for (int j = 0; j < 1024; j++) {
-            if (table->entries[j] & VMM_PRESENT) {
-                void *page = (void *)(table->entries[j] & ~0xFFF);
-                pmm_free_page(page);
-            }
+            if (table->entries[j] & VMM_PRESENT)
+                pmm_refcount_dec(table->entries[j] & ~0xFFF);
         }
 
         pmm_free_page(table);
@@ -170,6 +175,42 @@ void vmm_register_fault_handler(page_fault_handler_t handler) {
 static void page_fault_handler(registers_t *r) {
     uint32_t fault_addr = read_cr2();
     uint32_t error_code = r->err_code;
+
+    /* COW: user-mode write to a present page with VMM_COW flag */
+    if ((error_code & 0x7) == 0x7) {
+        uint32_t pd_idx = fault_addr >> 22;
+        uint32_t pt_idx = (fault_addr >> 12) & 0x3FF;
+
+        if (current_directory->entries[pd_idx] & VMM_PRESENT) {
+            page_table_t *table = (page_table_t *)(current_directory->entries[pd_idx] & ~0xFFF);
+            uint32_t pte = table->entries[pt_idx];
+
+            if ((pte & VMM_COW) && !(pte & VMM_WRITABLE)) {
+                uint32_t old_phys = pte & ~0xFFF;
+                uint32_t new_phys = (uint32_t)pmm_alloc_page();
+                if (!new_phys)
+                    panic("COW: OOM", r);
+
+                uint8_t tmp[4096];
+                uint8_t *src = (uint8_t *)vmm_temp_map(old_phys);
+                for (uint32_t i = 0; i < 4096; i++) tmp[i] = src[i];
+                vmm_temp_unmap();
+
+                uint8_t *dst = (uint8_t *)vmm_temp_map(new_phys);
+                for (uint32_t i = 0; i < 4096; i++) dst[i] = tmp[i];
+                vmm_temp_unmap();
+
+                pmm_refcount_dec(old_phys);
+
+                uint32_t new_flags = (pte & 0xFFF) | VMM_WRITABLE;
+                new_flags &= ~VMM_COW;
+                table->entries[pt_idx] = (new_phys & ~0xFFF) | new_flags;
+                invlpg(fault_addr);
+
+                return;
+            }
+        }
+    }
 
     if (fault_handler) {
         fault_handler(fault_addr, error_code);
@@ -322,17 +363,78 @@ void kfree(void *addr) {
 }
 
 void *vmm_temp_map(uint32_t phys) {
-    debug_print("temp_map phys=0x");
-    debug_print_hex32(phys);
-    debug_print("\r\n");
     vmm_map_page(kernel_directory, phys, TEMP_VADDR, VMM_PRESENT | VMM_WRITABLE);
-    debug_print("temp_map done\r\n");
     return (void *)TEMP_VADDR;
 }
 
 void vmm_temp_unmap(void) {
     vmm_unmap_page(kernel_directory, TEMP_VADDR);
     invlpg(TEMP_VADDR);
+}
+
+void vmm_fork_cow_pages(page_directory_t *parent_dir, page_directory_t *child_dir) {
+    extern page_directory_t *kernel_directory;
+    for (int pd_idx = 0; pd_idx < 768; pd_idx++) {
+        uint32_t parent_pde = parent_dir->entries[pd_idx];
+        if (!(parent_pde & VMM_PRESENT))
+            continue;
+        if (parent_pde == kernel_directory->entries[pd_idx])
+            continue;
+
+        page_table_t *parent_table = (page_table_t *)(parent_pde & ~0xFFF);
+
+        page_table_t *child_table = (page_table_t *)pmm_alloc_page();
+        if (!child_table)
+            continue;
+
+        for (int pt_idx = 0; pt_idx < 1024; pt_idx++)
+            child_table->entries[pt_idx] = 0;
+
+        for (int pt_idx = 0; pt_idx < 1024; pt_idx++) {
+            uint32_t pte = parent_table->entries[pt_idx];
+            if (!(pte & VMM_PRESENT))
+                continue;
+
+            uint32_t phys = pte & ~0xFFF;
+            uint32_t flags = pte & 0xFFF;
+
+            flags |= VMM_COW;
+            if (flags & VMM_WRITABLE) {
+                flags &= ~VMM_WRITABLE;
+
+                parent_table->entries[pt_idx] = phys | flags;
+
+                uint32_t vaddr = (pd_idx << 22) | (pt_idx << 12);
+                invlpg(vaddr);
+            }
+
+            child_table->entries[pt_idx] = phys | flags;
+            pmm_refcount_inc(phys);
+        }
+
+        uint32_t pde_flags = parent_pde & 0xFFF;
+        child_dir->entries[pd_idx] = ((uint32_t)child_table & ~0xFFF) | pde_flags;
+    }
+}
+
+void vmm_clear_user_pages(page_directory_t *dir) {
+    extern page_directory_t *kernel_directory;
+    for (int i = 0; i < 768; i++) {
+        uint32_t pde = dir->entries[i];
+        if (!(pde & VMM_PRESENT))
+            continue;
+        if (pde == kernel_directory->entries[i])
+            continue;
+        page_table_t *table = (page_table_t *)(pde & ~0xFFF);
+        for (int j = 0; j < 1024; j++) {
+            uint32_t pte = table->entries[j];
+            if (pte & VMM_PRESENT)
+                pmm_refcount_dec(pte & ~0xFFF);
+            table->entries[j] = 0;
+        }
+        pmm_free_page(table);
+        dir->entries[i] = 0;
+    }
 }
 
 void vmm_init(void) {
@@ -343,10 +445,8 @@ void vmm_init(void) {
     debug_print("\r\n");
 
     kernel_directory = (page_directory_t *)pmm_alloc_page();
-    if (!kernel_directory) {
-        terminal_print("VMM: failed to alloc kernel page directory\n");
+    if (!kernel_directory)
         return;
-    }
 
     for (int i = 0; i < 1024; i++)
         kernel_directory->entries[i] = 0;
@@ -361,6 +461,16 @@ void vmm_init(void) {
         vmm_map_page(kernel_directory, KERNEL_PHYS + offset,
                       KERNEL_BASE + offset,
                       VMM_PRESENT | VMM_WRITABLE);
+    }
+
+    /* Pre-create TEMP_VADDR PDE so vmm_create_directory copies it for all processes */
+    {
+        uint32_t pd_idx = TEMP_VADDR >> 22;
+        if (!(kernel_directory->entries[pd_idx] & VMM_PRESENT)) {
+            page_table_t *t = (page_table_t *)pmm_alloc_page();
+            for (int i = 0; i < 1024; i++) t->entries[i] = 0;
+            kernel_directory->entries[pd_idx] = (uint32_t)t | VMM_PRESENT | VMM_WRITABLE;
+        }
     }
 
     current_directory = kernel_directory;

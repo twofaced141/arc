@@ -4,78 +4,67 @@ LD       = ld
 CFLAGS   = -ffreestanding -nostdlib -nostartfiles -nodefaultlibs \
            -m32 -Wall -Wextra -std=c17 \
            -fno-pic -no-pie -fno-stack-protector \
-           -fno-asynchronous-unwind-tables -mno-sse -mno-mmx -O0
+           -fno-asynchronous-unwind-tables -mno-sse -mno-mmx -O0 \
+           -fno-builtin -I include
 ASFLAGS  = --32
-LDFLAGS  = -T linker.ld -nostdlib -m elf_i386
+LDFLAGS  = -T boot/linker.ld -nostdlib -m elf_i386
 
-OBJS = boot.o gdt.o kernel.o interrupts.o idt.o isr.o keyboard.o pit.o debug.o panic.o pmm.o vmm.o process.o scheduler.o
+KERNEL_DIRS = kernel interrupts drivers mm proc fs lib boot
+SRCS_C  = $(wildcard $(addsuffix /*.c,$(KERNEL_DIRS)))
+SRCS_S  = $(wildcard $(addsuffix /*.s,$(KERNEL_DIRS)))
+OBJS    = $(SRCS_C:.c=.o) $(SRCS_S:.s=.o)
 
-all: kernel.elf
+all: kernel.elf user_code.elf pipe_test.elf
 
-boot.o: boot.s
+%.o: %.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+%.o: %.s
 	$(AS) $(ASFLAGS) -o $@ $<
 
-gdt.o: gdt.c gdt.h
-	$(CC) $(CFLAGS) -c -o $@ $<
-
-interrupts.o: interrupts.s
-	$(AS) $(ASFLAGS) -o $@ $<
-
-idt.o: idt.c idt.h
-	$(CC) $(CFLAGS) -c -o $@ $<
-
-isr.o: isr.c isr.h idt.h
-	$(CC) $(CFLAGS) -c -o $@ $<
-
-keyboard.o: keyboard.c keyboard.h isr.h idt.h terminal.h
-	$(CC) $(CFLAGS) -c -o $@ $<
-
-pit.o: pit.c pit.h idt.h isr.h
-	$(CC) $(CFLAGS) -c -o $@ $<
-
-debug.o: debug.c debug.h idt.h
-	$(CC) $(CFLAGS) -c -o $@ $<
-
-panic.o: panic.c panic.h isr.h debug.h
-	$(CC) $(CFLAGS) -c -o $@ $<
-
-kernel.o: kernel.c terminal.h idt.h isr.h keyboard.h debug.h pmm.h vmm.h multiboot2.h
-	$(CC) $(CFLAGS) -c -o $@ $<
-
-pmm.o: pmm.c pmm.h multiboot2.h terminal.h
-	$(CC) $(CFLAGS) -c -o $@ $<
-
-vmm.o: vmm.c vmm.h pmm.h terminal.h debug.h panic.h isr.h
-	$(CC) $(CFLAGS) -c -o $@ $<
-
-process.o: process.c process.h vmm.h pmm.h isr.h gdt.h
-	$(CC) $(CFLAGS) -c -o $@ $<
-
-scheduler.o: scheduler.c scheduler.h process.h gdt.h vmm.h
-	$(CC) $(CFLAGS) -c -o $@ $<
-
-kernel.elf: $(OBJS) linker.ld
+kernel.elf: $(OBJS) boot/linker.ld
 	$(LD) $(LDFLAGS) -o $@ $(OBJS)
 
-clean:
-	rm -rf *.o *.elf iso_root os.iso
+user_code.elf: user/user_code.s
+	$(AS) $(ASFLAGS) -o user_code.o user/user_code.s
+	ld -Ttext=0x08000000 -nostdlib -m elf_i386 -o $@ user_code.o
 
-# Новая цель для проверки валидности Multiboot2 заголовка перед запуском
+pipe_test.elf: user/pipe_test.c
+	$(CC) $(CFLAGS) -nostartfiles -c -o pipe_test.o user/pipe_test.c
+	ld -Ttext=0x08000000 -nostdlib -m elf_i386 -o $@ pipe_test.o
+
+clean:
+	rm -rf *.o *.elf *.bin iso_root os.iso disk.img
+	find . -name '*.o' -type f -delete
+
 check: kernel.elf
 	grub-file --is-x86-multiboot2 kernel.elf
 
-# Создание ISO и запуск через CD-ROM
-run: kernel.elf
+TEST_FILES = user/test.txt user_code.elf pipe_test.elf
+
+disk.img:
+	dd if=/dev/zero of=$@ bs=1M count=16 2>/dev/null
+	mkfs.ext2 -b 1024 -F $@ 2>/dev/null
+	printf "HELLO EXT2 WORLD." > /tmp/kernel_hello.txt
+	printf "NESTED FILE" > /tmp/kernel_nested.txt
+	printf "write /tmp/kernel_hello.txt hello.txt\nmkdir /subdir\nwrite /tmp/kernel_nested.txt /subdir/nested.txt\n" | debugfs -w $@ 2>/dev/null
+	rm -f /tmp/kernel_hello.txt /tmp/kernel_nested.txt
+
+run: kernel.elf $(TEST_FILES) disk.img
 	mkdir -p iso_root/boot/grub
 	cp kernel.elf iso_root/boot/
+	cp user/test.txt user_code.elf pipe_test.elf iso_root/boot/
 	@echo 'set timeout=0' > iso_root/boot/grub/grub.cfg
 	@echo 'set default=0' >> iso_root/boot/grub/grub.cfg
 	@echo '' >> iso_root/boot/grub/grub.cfg
 	@echo 'menuentry "my_kernel" {' >> iso_root/boot/grub/grub.cfg
 	@echo '    multiboot2 /boot/kernel.elf' >> iso_root/boot/grub/grub.cfg
+	@echo '    module2 /boot/test.txt test.txt' >> iso_root/boot/grub/grub.cfg
+	@echo '    module2 /boot/user_code.elf user_code.elf' >> iso_root/boot/grub/grub.cfg
+	@echo '    module2 /boot/pipe_test.elf pipe_test.elf' >> iso_root/boot/grub/grub.cfg
 	@echo '    boot' >> iso_root/boot/grub/grub.cfg
 	@echo '}' >> iso_root/boot/grub/grub.cfg
 	grub-mkrescue -o os.iso iso_root
-	qemu-system-i386 -cdrom os.iso -serial stdio -no-reboot
+	qemu-system-i386 -cdrom os.iso -hda disk.img -serial stdio -no-reboot -m 64
 
 .PHONY: all clean run check

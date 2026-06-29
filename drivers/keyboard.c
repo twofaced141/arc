@@ -100,6 +100,15 @@ void keyboard_init(void) {
     register_interrupt_handler(33, keyboard_irq_handler);
 }
 
+uint32_t keyboard_read(char *buf, uint32_t max) {
+    uint32_t count = 0;
+    while (count < max && key_buffer_head != key_buffer_tail) {
+        buf[count++] = key_buffer[key_buffer_head];
+        key_buffer_head = (uint8_t)(key_buffer_head + 1);
+    }
+    return count;
+}
+
 char keyboard_getchar(void) {
     while (key_buffer_head == key_buffer_tail)
         __asm__ __volatile__("hlt");

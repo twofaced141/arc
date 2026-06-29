@@ -20,6 +20,7 @@
 #define VMM_FLAG_USER     (1 << 2)
 #define VMM_FLAG_RESERVED (1 << 3)
 #define VMM_FLAG_FETCH    (1 << 4)
+#define VMM_COW           (1 << 9)
 
 typedef struct {
     uint32_t entries[1024];
@@ -47,6 +48,7 @@ page_directory_t *vmm_create_directory(void);
 void vmm_switch_directory(page_directory_t *dir);
 void vmm_free_directory(page_directory_t *dir);
 page_directory_t *vmm_get_current_directory(void);
+page_directory_t *vmm_get_kernel_directory(void);
 
 void vmm_map_page(page_directory_t *dir, uint32_t phys, uint32_t virt, uint32_t flags);
 void vmm_unmap_page(page_directory_t *dir, uint32_t virt);
@@ -55,6 +57,8 @@ int vmm_get_page_flags(page_directory_t *dir, uint32_t virt);
 int vmm_is_page_present(page_directory_t *dir, uint32_t virt);
 
 void vmm_register_fault_handler(page_fault_handler_t handler);
+void vmm_fork_cow_pages(page_directory_t *parent_dir, page_directory_t *child_dir);
+void vmm_clear_user_pages(page_directory_t *dir);
 
 void *kmalloc(uint32_t size);
 void *kcalloc(uint32_t count, uint32_t size);

@@ -58,13 +58,8 @@ void isr_handler(registers_t *r) {
 void irq_handler(registers_t *r) {
     if (!logged_first_user_irq && ((r->cs & 3) == 3)) {
         logged_first_user_irq = 1;
-        debug_print("irq: from ring3 int=0x");
-        debug_print_hex32(r->int_no);
-        debug_print(" cs=0x");
-        debug_print_hex32(r->cs);
-        debug_print(" eip=0x");
-        debug_print_hex32(r->eip);
-        debug_print("\r\n");
+        debug_printf("irq: ring3 int=%u eip=%p cs=%x\r\n",
+                     r->int_no - 32, r->eip, r->cs);
     }
 
     if (interrupt_handlers[r->int_no])

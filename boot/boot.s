@@ -1,15 +1,18 @@
 .section .multiboot2
-.balign 8                          # Обязательное выравнивание для Multiboot2!
+.balign 8
 header_start:
     .long 0xE85250D6
     .long 0
     .long header_end - header_start
     .long 0x100000000 - (0xE85250D6 + 0 + (header_end - header_start))
 
+    .align 8
     .word 0
     .word 0
     .long 8
 header_end:
+
+.set KERNEL_STACK, stack_top
 
 .section .text
 .global _start

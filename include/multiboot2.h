@@ -6,6 +6,7 @@
 #define MULTIBOOT2_MAGIC 0x36d76289
 
 #define MULTIBOOT_TAG_END              0
+#define MULTIBOOT_TAG_MODULE           3
 #define MULTIBOOT_TAG_BASIC_MEMINFO    4
 #define MULTIBOOT_TAG_MMAP             6
 
@@ -25,12 +26,25 @@ typedef struct {
     uint32_t size;
 } __attribute__((packed)) multiboot2_tag_t;
 
+#define MULTIBOOT_TAG_FRAMEBUFFER     8
+
+#define MULTIBOOT_FRAMEBUFFER_TEXT     0
+#define MULTIBOOT_FRAMEBUFFER_GRAPHICS 3
+
 typedef struct {
     uint32_t type;
     uint32_t size;
     uint32_t mem_lower;
     uint32_t mem_upper;
 } __attribute__((packed)) multiboot2_tag_basic_meminfo_t;
+
+typedef struct {
+    uint32_t type;
+    uint32_t size;
+    uint32_t mod_start;
+    uint32_t mod_end;
+    char     cmdline[];
+} __attribute__((packed)) multiboot2_tag_module_t;
 
 typedef struct {
     uint64_t addr;
@@ -46,6 +60,23 @@ typedef struct {
     uint32_t entry_version;
     multiboot2_mmap_entry_t entries[];
 } __attribute__((packed)) multiboot2_tag_mmap_t;
+
+typedef struct {
+    uint32_t type;
+    uint32_t size;
+    uint32_t fb_addr;
+    uint32_t fb_pitch;
+    uint32_t fb_width;
+    uint32_t fb_height;
+    uint32_t fb_bpp;
+    uint32_t fb_type;
+    uint32_t fb_red_pos;
+    uint32_t fb_red_mask_size;
+    uint32_t fb_green_pos;
+    uint32_t fb_green_mask_size;
+    uint32_t fb_blue_pos;
+    uint32_t fb_blue_mask_size;
+} __attribute__((packed)) multiboot2_tag_framebuffer_t;
 
 static inline multiboot2_tag_t *multiboot2_first_tag(multiboot2_info_t *info) {
     return (multiboot2_tag_t *)((uint8_t *)info + 8);

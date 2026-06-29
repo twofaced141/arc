@@ -14,4 +14,8 @@ void  pmm_free_page(void *page);
 void  pmm_free_pages(void *addr, uint32_t count);
 uint32_t pmm_get_free_pages(void);
 
+void pmm_refcount_init(void);
+void pmm_refcount_inc(uint32_t phys);
+void pmm_refcount_dec(uint32_t phys);
+
 #endif
