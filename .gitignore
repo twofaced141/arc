@@ -15,5 +15,9 @@ iso_root/
 .vscode/
 .idea/
 
+# Logs
+*.log
+log
+
 # OS
 .DS_Store
