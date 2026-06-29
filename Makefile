@@ -4,7 +4,7 @@ LD       = ld
 CFLAGS   = -ffreestanding -nostdlib -nostartfiles -nodefaultlibs \
            -m32 -Wall -Wextra -std=c17 \
            -fno-pic -no-pie -fno-stack-protector \
-           -fno-asynchronous-unwind-tables -mno-sse -mno-mmx
+           -fno-asynchronous-unwind-tables -mno-sse -mno-mmx -O0
 ASFLAGS  = --32
 LDFLAGS  = -T linker.ld -nostdlib -m elf_i386
 

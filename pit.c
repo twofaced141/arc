@@ -1,6 +1,7 @@
 #include "pit.h"
 #include "idt.h"
 #include "isr.h"
+#include "debug.h"
 
 #define PIT_CMD   0x43
 #define PIT_CH0   0x40
@@ -13,8 +14,9 @@
 static volatile uint32_t pit_ticks = 0;
 
 static void pit_callback(registers_t *r) {
-    (void)r;
     pit_ticks++;
+    if (pit_ticks == 1)
+        debug_print("pit: first tick\r\n");
 }
 
 uint32_t pit_get_ticks(void) {

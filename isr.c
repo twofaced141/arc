@@ -1,8 +1,11 @@
 #include "isr.h"
 #include "idt.h"
 #include "panic.h"
+#include "debug.h"
+#include "terminal.h"
 
 static isr_t interrupt_handlers[256];
+static int logged_first_user_irq;
 
 static const char *const exception_messages[32] = {
     "Division By Zero",
@@ -40,8 +43,12 @@ static const char *const exception_messages[32] = {
 };
 
 void isr_handler(registers_t *r) {
-    const char *reason = "Unknown Exception";
+    if (interrupt_handlers[r->int_no]) {
+        interrupt_handlers[r->int_no](r);
+        return;
+    }
 
+    const char *reason = "Unknown Exception";
     if (r->int_no < 32)
         reason = exception_messages[r->int_no];
 
@@ -49,6 +56,17 @@ void isr_handler(registers_t *r) {
 }
 
 void irq_handler(registers_t *r) {
+    if (!logged_first_user_irq && ((r->cs & 3) == 3)) {
+        logged_first_user_irq = 1;
+        debug_print("irq: from ring3 int=0x");
+        debug_print_hex32(r->int_no);
+        debug_print(" cs=0x");
+        debug_print_hex32(r->cs);
+        debug_print(" eip=0x");
+        debug_print_hex32(r->eip);
+        debug_print("\r\n");
+    }
+
     if (interrupt_handlers[r->int_no])
         interrupt_handlers[r->int_no](r);
 

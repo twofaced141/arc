@@ -103,6 +103,7 @@ extern void isr16(void); extern void isr17(void); extern void isr18(void); exter
 extern void isr20(void); extern void isr21(void); extern void isr22(void); extern void isr23(void);
 extern void isr24(void); extern void isr25(void); extern void isr26(void); extern void isr27(void);
 extern void isr28(void); extern void isr29(void); extern void isr30(void); extern void isr31(void);
+extern void isr128(void);
 
 extern void irq0(void);  extern void irq1(void);  extern void irq2(void);  extern void irq3(void);
 extern void irq4(void);  extern void irq5(void);  extern void irq6(void);  extern void irq7(void);
@@ -146,6 +147,7 @@ static void idt_install(void) {
     idt_set_gate(29, (uint32_t)isr29, code_selector, 0x8E);
     idt_set_gate(30, (uint32_t)isr30, code_selector, 0x8E);
     idt_set_gate(31, (uint32_t)isr31, code_selector, 0x8E);
+    idt_set_gate(128, (uint32_t)isr128, code_selector, 0xEE);
 
     idt_set_gate(32, (uint32_t)irq0,  code_selector, 0x8E);
     idt_set_gate(33, (uint32_t)irq1,  code_selector, 0x8E);
@@ -168,6 +170,12 @@ static void idt_install(void) {
 }
 
 void kernel_main(uint32_t mboot_magic, multiboot2_info_t *mboot_info) {
+    uint32_t esp_val;
+    __asm__ __volatile__("mov %%esp, %0" : "=r"(esp_val));
+    debug_print("kernel_main esp=0x");
+    debug_print_hex32(esp_val);
+    debug_print("\r\n");
+
     terminal_init();
     terminal_print("Hello from base kernel!\n");
     terminal_print("Multiboot2 compliant on x86\n");
@@ -200,75 +208,13 @@ void kernel_main(uint32_t mboot_magic, multiboot2_info_t *mboot_info) {
         terminal_print("VMM: kernel at 0xC0000000 (higher half)\n");
         terminal_print("VMM: heap at 0xD0000000-0xE0000000\n");
         terminal_print("VMM: address spaces ready\n");
-
-        terminal_print("--- VMM TESTS ---\n");
-
-        uint32_t test_virt = 0x01000000;
-        void *test_phys = pmm_alloc_page();
-        if (test_phys) {
-            vmm_map_page(vmm_get_current_directory(), (uint32_t)test_phys, test_virt, VMM_PRESENT | VMM_WRITABLE);
-            uint32_t phys_back = vmm_get_physical(vmm_get_current_directory(), test_virt);
-            terminal_print("map:    0x01000000 -> ");
-            terminal_print(phys_back == (uint32_t)test_phys ? "OK" : "FAIL");
-            terminal_print("\n");
-
-            *(volatile uint32_t *)test_virt = 0xDEADBEEF;
-            terminal_print("write:  ");
-            terminal_print(*(volatile uint32_t *)test_virt == 0xDEADBEEF ? "OK" : "FAIL");
-            terminal_print("\n");
-
-            vmm_unmap_page(vmm_get_current_directory(), test_virt);
-            terminal_print("unmap:  OK\n");
-
-            pmm_free_page(test_phys);
-        }
-
-        page_directory_t *new_dir = vmm_create_directory();
-        terminal_print("fork:   ");
-        terminal_print(new_dir ? "OK" : "FAIL");
-        terminal_print("\n");
-
-        void *p1 = kmalloc(128);
-        void *p2 = kmalloc(256);
-        terminal_print("kmalloc:");
-        terminal_print(p1 && p2 ? " OK" : " FAIL");
-        terminal_print("\n");
-
-        *(volatile uint32_t *)p1 = 0xCAFEBABE;
-        terminal_print("kwrite: ");
-        terminal_print(*(volatile uint32_t *)p1 == 0xCAFEBABE ? "OK" : "FAIL");
-        terminal_print("\n");
-
-        terminal_print("--- END TESTS ---\n");
-
-        char buf[64];
-        uint32_t free = pmm_get_free_pages();
-        uint32_t free_mb = (free * PAGE_SIZE) / (1024 * 1024);
-        terminal_print("Free memory: ");
-        int i = 0;
-        if (free_mb == 0) {
-            buf[i++] = '0';
-        } else {
-            char tmp[12];
-            int j = 0;
-            while (free_mb) { tmp[j++] = '0' + free_mb % 10; free_mb /= 10; }
-            while (j--) buf[i++] = tmp[j];
-        }
-        buf[i++] = 'M';
-        buf[i++] = 'B';
-        buf[i] = '\0';
-        terminal_print(buf);
-        terminal_print("\n");
-
-        terminal_print("VMM: kernel at 0xC0000000 (higher half)\n");
-        terminal_print("VMM: heap at 0xD0000000-0xE0000000\n");
-        terminal_print("VMM: address spaces ready\n");
     } else {
         terminal_print("ERROR: not booted with Multiboot2!\n");
     }
 
+    debug_print("before sti\r\n");
     __asm__ __volatile__("sti");
-    debug_print("interrupts enabled\r\n");
+    debug_print("after sti\r\n");
 
     // panic("Test", &test_registers);
 
