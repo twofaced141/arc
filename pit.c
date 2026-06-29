@@ -14,6 +14,7 @@
 static volatile uint32_t pit_ticks = 0;
 
 static void pit_callback(registers_t *r) {
+    (void)r;
     pit_ticks++;
     if (pit_ticks == 1)
         debug_print("pit: first tick\r\n");
