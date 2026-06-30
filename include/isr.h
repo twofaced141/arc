@@ -30,6 +30,7 @@
 #define SYSCALL_GETTIME  24u
 #define SYSCALL_SIGACTION 25u
 #define SYSCALL_SIGRETURN 26u
+#define SYSCALL_KMALLOC_TEST 27u
 
 typedef struct {
     uint32_t gs, fs, es, ds;

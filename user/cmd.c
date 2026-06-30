@@ -12,6 +12,7 @@
 #define SYSCALL_LISTDIR 19
 #define SYSCALL_KILL    20
 #define SYSCALL_GETTIME 24
+#define SYSCALL_KMALLOC_TEST 27
 
 static __attribute__((unused)) int syscall(int num, int a, int b, int c, int d) {
     int ret;
@@ -151,6 +152,46 @@ void _start(void) {
         syscall(SYSCALL_WRITE, 1, (int)buf, n, 0);
     syscall(SYSCALL_CLOSE, fd, 0, 0, 0);
     putc('\n');
+    syscall(SYSCALL_EXIT, 0, 0, 0, 0);
+}
+#endif
+
+#ifdef CMD_KMALLOC_TEST
+static void putKB(uint32_t bytes) {
+    if (bytes >= 1024 * 1024) {
+        putdec(bytes / (1024 * 1024));
+        puts(" MB");
+    } else if (bytes >= 1024) {
+        putdec(bytes / 1024);
+        puts(" KB");
+    } else {
+        putdec(bytes);
+        puts(" B");
+    }
+}
+
+void _start(void) {
+    const char *args = (const char *)0xBFFFF000;
+    if (*args == 's' || *args == '\0') {
+        uint32_t size = 64;
+        int r = syscall(SYSCALL_KMALLOC_TEST, 0, (int)size, 0, 0);
+        if (r < 0) {
+            puts("kmalloc_test: alloc failed\n");
+        } else {
+            putKB(size);
+            puts(" alloc/fill/verify/free OK\n");
+        }
+    }
+    if (*args == 'o' || *args == '\0') {
+        int max = syscall(SYSCALL_KMALLOC_TEST, 1, 0, 0, 0);
+        if (max < 0) {
+            puts("kmalloc_test: OOM test failed\n");
+        } else {
+            puts("largest single kmalloc: ");
+            putKB((uint32_t)max);
+            putc('\n');
+        }
+    }
     syscall(SYSCALL_EXIT, 0, 0, 0, 0);
 }
 #endif

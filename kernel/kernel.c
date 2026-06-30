@@ -100,7 +100,8 @@ static const char *syscall_names[] = {
     "getpid", "putc", "yield", "exit", "write", "read",
     "sleep", "getticks", "open", "close", "lseek", "fstat", "brk", "sbrk",
     "fork", "execve", "waitpid", "chdir", "getcwd", "listdir", "kill", "dup2",
-    "pipe", "ioctl", "gettime", "sigaction", "sigreturn"
+    "pipe", "ioctl", "gettime", "sigaction", "sigreturn",
+    "kmalloc_test"
 };
 
 extern uint32_t scheduler_syscall_no;
@@ -476,6 +477,39 @@ static void syscall_handler(registers_t *r) {
             r->eax = 0;
         else
             r->eax = -1;
+        break;
+    }
+    case SYSCALL_KMALLOC_TEST: {
+        int mode = (int)r->ebx;
+        if (mode == 0) {
+            uint32_t size = r->ecx;
+            uint8_t *p = (uint8_t *)kmalloc(size);
+            if (!p) { r->eax = -1; break; }
+            for (uint32_t i = 0; i < size; i++)
+                p[i] = (uint8_t)(i & 0xFF);
+            uint32_t ok = 1;
+            for (uint32_t i = 0; i < size; i++) {
+                if (p[i] != (uint8_t)(i & 0xFF)) { ok = 0; break; }
+            }
+            kfree(p);
+            r->eax = ok ? 0 : -1;
+        } else if (mode == 1) {
+            uint32_t total = 0;
+            uint32_t max_avail = 0;
+            for (uint32_t sz = 16; sz <= 0x40000000; sz *= 2) {
+                void *p = kmalloc(sz);
+                if (!p) {
+                    max_avail = total;
+                    break;
+                }
+                total += sz;
+                kfree(p);
+            }
+            if (max_avail == 0) max_avail = total;
+            r->eax = (int)max_avail;
+        } else {
+            r->eax = -1;
+        }
         break;
     }
     }

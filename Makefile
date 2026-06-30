@@ -14,7 +14,7 @@ SRCS_C  = $(wildcard $(addsuffix /*.c,$(KERNEL_DIRS)))
 SRCS_S  = $(wildcard $(addsuffix /*.s,$(KERNEL_DIRS)))
 OBJS    = $(SRCS_C:.c=.o) $(SRCS_S:.s=.o)
 
-CMD_NAMES = pwd getpid clear ls kill cat date
+CMD_NAMES = pwd getpid clear ls kill cat date kmalloc_test
 CMD_ELFS  = $(addsuffix .elf,$(addprefix cmd_,$(CMD_NAMES)))
 
 all: kernel.elf init.elf shell.elf $(CMD_ELFS)
