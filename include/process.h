@@ -16,8 +16,9 @@
 #define PROC_ZOMBIE   4
 
 #define MAX_PROCESSES    64
-#define PROC_KSTACK_SIZE 8192
-#define USER_HEAP_START  0x40000000
+#define PROC_KSTACK_SIZE   8192
+#define USER_HEAP_START    0x40000000
+#define USER_STACK_PAGES   4
 
 typedef struct process {
     uint32_t pid;
@@ -40,6 +41,11 @@ typedef struct process {
     sigaction_t sigactions[32];
     uint32_t signal_pending;
     uint32_t signal_blocked;
+    uint32_t mmap_brk;
+    uint16_t uid;
+    uint16_t gid;
+    uint16_t euid;
+    uint16_t egid;
 } process_t;
 
 extern process_t processes[];

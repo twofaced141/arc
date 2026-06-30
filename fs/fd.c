@@ -4,6 +4,8 @@
 #include "terminal.h"
 #include "fs.h"
 #include "vmm.h"
+#include "ext2.h"
+#include "procfs.h"
 
 void fd_init_table(fd_entry_t *table) {
     for (int i = 0; i < FD_MAX; i++) {
@@ -17,9 +19,67 @@ void fd_init_table(fd_entry_t *table) {
     table[2].type = FD_STDERR;
 }
 
+static int streq(const char *a, const char *b) {
+    while (*a && *b && *a == *b) { a++; b++; }
+    return *a == *b;
+}
+
 int fd_open(fd_entry_t *table, const char *name, uint32_t flags, uint32_t cwd_inode) {
+    if (streq(name, "/dev/null")) {
+        for (int i = 3; i < FD_MAX; i++) {
+            if (table[i].type == FD_NONE) {
+                table[i].type  = FD_NULL;
+                table[i].flags = flags;
+                table[i].file  = NULL;
+                table[i].pos   = 0;
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    if (streq(name, "/dev/zero")) {
+        for (int i = 3; i < FD_MAX; i++) {
+            if (table[i].type == FD_NONE) {
+                table[i].type  = FD_ZERO;
+                table[i].flags = flags;
+                table[i].file  = NULL;
+                table[i].pos   = 0;
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    if (procfs_is_proc_path(name)) {
+        proc_file_t *pf = NULL;
+        if (procfs_open(name, &pf) < 0)
+            return -1;
+        for (int i = 3; i < FD_MAX; i++) {
+            if (table[i].type == FD_NONE) {
+                table[i].type  = FD_PROC;
+                table[i].flags = flags;
+                table[i].file  = (file_t *)pf;
+                table[i].pos   = 0;
+                return i;
+            }
+        }
+        procfs_close(pf);
+        return -1;
+    }
+
     file_t *f = fs_open(name, cwd_inode);
-    if (!f) return -1;
+    if (!f) {
+        if (flags & O_CREAT) {
+            uint32_t new_ino;
+            if (fs_create(name, cwd_inode, &new_ino) < 0)
+                return -1;
+            f = fs_open(name, cwd_inode);
+            if (!f) return -1;
+        } else {
+            return -1;
+        }
+    }
 
     for (int i = 3; i < FD_MAX; i++) {
         if (table[i].type == FD_NONE) {
@@ -49,6 +109,10 @@ int fd_close(fd_entry_t *table, int fd) {
             kfree(p);
     }
 
+    if (table[fd].type == FD_PROC) {
+        procfs_close((proc_file_t *)table[fd].file);
+    }
+
     table[fd].type  = FD_NONE;
     table[fd].flags = 0;
     table[fd].file  = NULL;
@@ -59,6 +123,15 @@ int fd_close(fd_entry_t *table, int fd) {
 int fd_read(fd_entry_t *table, int fd, void *buf, uint32_t count) {
     if (fd < 0 || fd >= FD_MAX || table[fd].type == FD_NONE)
         return -1;
+
+    if (table[fd].type == FD_NULL)
+        return 0;
+
+    if (table[fd].type == FD_ZERO) {
+        for (uint32_t i = 0; i < count; i++)
+            ((uint8_t *)buf)[i] = 0;
+        return (int)count;
+    }
 
     if (table[fd].type == FD_STDIN)
         return (int)keyboard_read((char *)buf, count);
@@ -85,6 +158,18 @@ int fd_read(fd_entry_t *table, int fd, void *buf, uint32_t count) {
         return (int)to_read;
     }
 
+    if (table[fd].type == FD_PROC) {
+        proc_file_t *pf = (proc_file_t *)table[fd].file;
+        if (!pf || !pf->content) return -1;
+        uint32_t remaining = pf->size - table[fd].pos;
+        if (remaining == 0) return 0;
+        uint32_t to_read = (uint32_t)count < remaining ? (uint32_t)count : remaining;
+        for (uint32_t i = 0; i < to_read; i++)
+            ((uint8_t *)buf)[i] = pf->content[table[fd].pos + i];
+        table[fd].pos += to_read;
+        return (int)to_read;
+    }
+
     return -1;
 }
 
@@ -92,9 +177,18 @@ int fd_write(fd_entry_t *table, int fd, const void *buf, uint32_t count) {
     if (fd < 0 || fd >= FD_MAX || table[fd].type == FD_NONE)
         return -1;
 
+    if (table[fd].type == FD_NULL || table[fd].type == FD_ZERO)
+        return (int)count;
+
     if (table[fd].type == FD_STDOUT || table[fd].type == FD_STDERR) {
         terminal_write((const char *)buf, count);
         return (int)count;
+    }
+
+    if (table[fd].type == FD_FILE) {
+        int ret = fs_write(table[fd].file, buf, table[fd].pos, count);
+        if (ret > 0) table[fd].pos += ret;
+        return ret;
     }
 
     if (table[fd].type == FD_PIPE) {
@@ -123,7 +217,32 @@ int fd_write(fd_entry_t *table, int fd, const void *buf, uint32_t count) {
 }
 
 int fd_lseek(fd_entry_t *table, int fd, int32_t offset, int whence) {
-    if (fd < 0 || fd >= FD_MAX || table[fd].type != FD_FILE)
+    if (fd < 0 || fd >= FD_MAX || table[fd].type == FD_NONE)
+        return -1;
+
+    if (table[fd].type == FD_PROC) {
+        proc_file_t *pf = (proc_file_t *)table[fd].file;
+        if (!pf) return -1;
+        uint32_t new_pos;
+        switch (whence) {
+        case SEEK_SET:
+            new_pos = (uint32_t)offset;
+            break;
+        case SEEK_CUR:
+            new_pos = table[fd].pos + (uint32_t)offset;
+            break;
+        case SEEK_END:
+            new_pos = pf->size + (uint32_t)offset;
+            break;
+        default:
+            return -1;
+        }
+        if (new_pos > pf->size) new_pos = pf->size;
+        table[fd].pos = new_pos;
+        return (int)new_pos;
+    }
+
+    if (table[fd].type != FD_FILE)
         return -1;
 
     uint32_t new_pos;
@@ -149,10 +268,80 @@ int fd_lseek(fd_entry_t *table, int fd, int32_t offset, int whence) {
 }
 
 int fd_fstat(fd_entry_t *table, int fd, stat_t *st) {
-    if (fd < 0 || fd >= FD_MAX || table[fd].type != FD_FILE)
+    if (fd < 0 || fd >= FD_MAX || table[fd].type == FD_NONE)
         return -1;
 
-    st->st_size = table[fd].file->size;
+    st->st_dev = 0;
+    st->st_ino = 0;
+    st->st_mode = 0;
+    st->st_nlink = 0;
+    st->st_uid = 0;
+    st->st_gid = 0;
+    st->st_rdev = 0;
+    st->st_size = 0;
+    st->st_atime = 0;
+    st->st_mtime = 0;
+    st->st_ctime = 0;
+    st->st_blksize = 1024;
+    st->st_blocks = 0;
+
+    if (table[fd].type == FD_FILE || table[fd].type == FD_STDIN ||
+        table[fd].type == FD_STDOUT || table[fd].type == FD_STDERR) {
+        file_t *f = table[fd].file;
+        if (f && f->ext2_ino) {
+            st->st_ino = f->ext2_ino;
+            st->st_size = f->size;
+            ext2_fs_t *fs = fs_get_ext2();
+            if (fs && fs->present) {
+                ext2_inode_t inode;
+                if (ext2_read_inode(fs, f->ext2_ino, &inode) == 0) {
+                    st->st_mode = inode.mode;
+                    st->st_nlink = inode.links_count;
+                    st->st_uid = inode.uid;
+                    st->st_gid = inode.gid;
+                    st->st_atime = inode.atime;
+                    st->st_mtime = inode.mtime;
+                    st->st_ctime = inode.ctime;
+                    st->st_blocks = inode.blocks;
+                }
+            }
+            return 0;
+        }
+        if (table[fd].type == FD_STDIN) {
+            st->st_mode = 0x2000 | 0666;
+            return 0;
+        }
+        if (table[fd].type == FD_STDOUT || table[fd].type == FD_STDERR) {
+            st->st_mode = 0x2000 | 0666;
+            return 0;
+        }
+        if (f) {
+            st->st_size = f->size;
+            return 0;
+        }
+        return -1;
+    }
+
+    if (table[fd].type == FD_NULL || table[fd].type == FD_ZERO) {
+        st->st_mode = 0x2000 | 0666;
+        st->st_rdev = 1;
+        return 0;
+    }
+
+    if (table[fd].type == FD_PIPE) {
+        st->st_mode = 0x1000 | 0600;
+        return 0;
+    }
+
+    if (table[fd].type == FD_PROC) {
+        proc_file_t *pf = (proc_file_t *)table[fd].file;
+        if (pf) {
+            st->st_size = pf->size;
+        }
+        st->st_mode = 0444;
+        return 0;
+    }
+
     return 0;
 }
 

@@ -50,7 +50,7 @@ void vmm_free_directory(page_directory_t *dir);
 page_directory_t *vmm_get_current_directory(void);
 page_directory_t *vmm_get_kernel_directory(void);
 
-void vmm_map_page(page_directory_t *dir, uint32_t phys, uint32_t virt, uint32_t flags);
+int vmm_map_page(page_directory_t *dir, uint32_t phys, uint32_t virt, uint32_t flags);
 void vmm_unmap_page(page_directory_t *dir, uint32_t virt);
 uint32_t vmm_get_physical(page_directory_t *dir, uint32_t virt);
 int vmm_get_page_flags(page_directory_t *dir, uint32_t virt);

@@ -206,6 +206,10 @@ uint32_t pmm_get_free_pages(void) {
     return free_pages;
 }
 
+uint32_t pmm_get_total_pages(void) {
+    return total_pages;
+}
+
 void pmm_refcount_init(void) {
     uint32_t rc_bytes = total_pages * sizeof(uint16_t);
     refcounts = (uint16_t *)kcalloc(1, rc_bytes);

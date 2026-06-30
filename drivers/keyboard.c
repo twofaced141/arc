@@ -9,7 +9,7 @@
 #define RSHIFT_BREAK 0xB6
 
 static const char scancode_ascii[] = {
-    0, 0, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', 0,
+    0, 0, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', '\b',
     0, 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', '\n',
     0, 'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', '\'', '`', 0,
     '\\', 'z', 'x', 'c', 'v', 'b', 'n', 'm', ',', '.', '/', 0, '*',
@@ -17,7 +17,7 @@ static const char scancode_ascii[] = {
 };
 
 static const char scancode_shifted[] = {
-    0, 0, '!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '+', 0,
+    0, 0, '!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '+', '\b',
     0, 'Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P', '{', '}', '\n',
     0, 'A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', ':', '"', '~', 0,
     '|', 'Z', 'X', 'C', 'V', 'B', 'N', 'M', '<', '>', '?', 0, '*',
@@ -28,7 +28,10 @@ static volatile char key_buffer[256];
 static volatile uint8_t key_buffer_head;
 static volatile uint8_t key_buffer_tail;
 static volatile uint8_t shift_pressed;
+static volatile uint8_t extended;
 static spinlock_t keyboard_lock = SPINLOCK_INIT;
+
+#define EXT_SCANCODE 0xE0
 
 static void ps2_wait_input(void) {
     while (inb(0x64) & 0x02);
@@ -38,14 +41,25 @@ static void ps2_wait_output(void) {
     while (!(inb(0x64) & 0x01));
 }
 
+static void keyboard_push(char c) {
+    uint8_t next_tail = (uint8_t)(key_buffer_tail + 1);
+    if (next_tail == key_buffer_head) return;
+    key_buffer[key_buffer_tail] = c;
+    key_buffer_tail = next_tail;
+}
+
 static void keyboard_irq_handler(registers_t *r) {
     uint8_t sc;
-    uint8_t next_tail;
     char c;
 
     (void)r;
 
     sc = inb(0x60);
+
+    if (sc == EXT_SCANCODE) {
+        extended = 1;
+        return;
+    }
 
     if (sc == LSHIFT_MAKE || sc == RSHIFT_MAKE) {
         shift_pressed = 1;
@@ -56,8 +70,19 @@ static void keyboard_irq_handler(registers_t *r) {
         return;
     }
 
-    if (sc & 0x80)
+    if (sc & 0x80) {
+        extended = 0;
         return;
+    }
+
+    if (extended) {
+        extended = 0;
+        if (sc == 0x48) { keyboard_push(0x1B); keyboard_push('['); keyboard_push('A'); }
+        else if (sc == 0x50) { keyboard_push(0x1B); keyboard_push('['); keyboard_push('B'); }
+        else if (sc == 0x4D) { keyboard_push(0x1B); keyboard_push('['); keyboard_push('C'); }
+        else if (sc == 0x4B) { keyboard_push(0x1B); keyboard_push('['); keyboard_push('D'); }
+        return;
+    }
 
     if (sc >= sizeof(scancode_ascii))
         return;
@@ -66,12 +91,7 @@ static void keyboard_irq_handler(registers_t *r) {
     if (!c)
         return;
 
-    next_tail = (uint8_t)(key_buffer_tail + 1);
-    if (next_tail == key_buffer_head)
-        return;
-
-    key_buffer[key_buffer_tail] = c;
-    key_buffer_tail = next_tail;
+    keyboard_push(c);
 }
 
 void keyboard_init(void) {

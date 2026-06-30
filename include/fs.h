@@ -22,5 +22,7 @@ file_t *fs_open(const char *name, uint32_t cwd_inode);
 void    fs_read(file_t *f, void *buf, uint32_t offset, uint32_t size);
 void    fs_set_ext2(ext2_fs_t *fs);
 ext2_fs_t *fs_get_ext2(void);
+int     fs_write(file_t *f, const void *buf, uint32_t offset, uint32_t size);
+int     fs_create(const char *name, uint32_t cwd_inode, uint32_t *out_ino);
 
 #endif

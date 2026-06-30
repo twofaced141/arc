@@ -52,6 +52,11 @@ process_t *process_create_user(uint32_t eip, const void *code, uint32_t code_siz
     fd_init_table(proc->fd_table);
     proc->heap_break = USER_HEAP_START;
     proc->heap_mapped_end = USER_HEAP_START;
+    proc->mmap_brk = USER_MMAP_START;
+    proc->uid = 0;
+    proc->gid = 0;
+    proc->euid = 0;
+    proc->egid = 0;
 
     proc->page_dir = vmm_create_directory();
     if (!proc->page_dir) { pmm_free_pages(proc->kernel_stack, PROC_KSTACK_SIZE / PAGE_SIZE); proc->state = PROC_UNUSED; return NULL; }
@@ -84,15 +89,17 @@ process_t *process_create_user(uint32_t eip, const void *code, uint32_t code_siz
                 tmp[j] = 0;
             vmm_temp_unmap();
         }
-        vmm_map_page(proc->page_dir, phys, code_virt + i * PAGE_SIZE,
+        (void)vmm_map_page(proc->page_dir, phys, code_virt + i * PAGE_SIZE,
                      VMM_PRESENT | VMM_WRITABLE | VMM_USER);
     }
 
     uint32_t user_stack_top = 0xC0000000;
-    uint32_t user_stack_phys = (uint32_t)pmm_alloc_page();
-    if (!user_stack_phys) goto err_code_pages;
-    vmm_map_page(proc->page_dir, user_stack_phys, user_stack_top - PAGE_SIZE,
-                 VMM_PRESENT | VMM_WRITABLE | VMM_USER);
+    for (int si = 0; si < USER_STACK_PAGES; si++) {
+        uint32_t phys = (uint32_t)pmm_alloc_page();
+        if (!phys) goto err_code_pages;
+        vmm_map_page(proc->page_dir, phys, user_stack_top - (si + 1) * PAGE_SIZE,
+                     VMM_PRESENT | VMM_WRITABLE | VMM_USER);
+    }
     proc->user_esp = user_stack_top;
     proc->eip = eip;
 
@@ -170,6 +177,11 @@ process_t *process_create_elf(file_t *file) {
     proc->parent_pid = 0;
     proc->wait_child_pid = 0;
     proc->cwd_inode = EXT2_ROOT_INO;
+    proc->mmap_brk = USER_MMAP_START;
+    proc->uid = 0;
+    proc->gid = 0;
+    proc->euid = 0;
+    proc->egid = 0;
     signal_init_process(proc);
 
     proc->kernel_stack = (uint8_t *)pmm_alloc_pages(PROC_KSTACK_SIZE / PAGE_SIZE);
@@ -206,7 +218,7 @@ process_t *process_create_elf(file_t *file) {
             uint32_t phys = (uint32_t)pmm_alloc_page();
             if (!phys) goto err_load;
 
-            vmm_map_page(proc->page_dir, phys, vaddr, page_flags);
+            (void)vmm_map_page(proc->page_dir, phys, vaddr, page_flags);
 
             uint8_t *page = (uint8_t *)vmm_temp_map(phys);
             for (uint32_t j = 0; j < PAGE_SIZE; j++)
@@ -229,10 +241,12 @@ process_t *process_create_elf(file_t *file) {
     kfree(phdrs);
 
     uint32_t user_stack_top = 0xC0000000;
-    uint32_t user_stack_phys = (uint32_t)pmm_alloc_page();
-    if (!user_stack_phys) goto err_cleanup;
-    vmm_map_page(proc->page_dir, user_stack_phys, user_stack_top - PAGE_SIZE,
-                 VMM_PRESENT | VMM_WRITABLE | VMM_USER);
+    for (int si = 0; si < USER_STACK_PAGES; si++) {
+        uint32_t phys = (uint32_t)pmm_alloc_page();
+        if (!phys) goto err_cleanup;
+        vmm_map_page(proc->page_dir, phys, user_stack_top - (si + 1) * PAGE_SIZE,
+                     VMM_PRESENT | VMM_WRITABLE | VMM_USER);
+    }
     proc->user_esp = user_stack_top;
     proc->eip = entry;
 
@@ -309,7 +323,7 @@ int process_exec(process_t *proc, const char *path, const char *args, registers_
             uint32_t phys = (uint32_t)pmm_alloc_page();
             if (!phys) { kfree(phdrs); return -1; }
 
-            vmm_map_page(proc->page_dir, phys, vaddr, page_flags);
+            (void)vmm_map_page(proc->page_dir, phys, vaddr, page_flags);
 
             uint8_t *page = (uint8_t *)vmm_temp_map(phys);
             for (uint32_t j = 0; j < PAGE_SIZE; j++)
@@ -332,12 +346,16 @@ int process_exec(process_t *proc, const char *path, const char *args, registers_
     kfree(phdrs);
 
     uint32_t user_stack_top = 0xC0000000;
-    uint32_t user_stack_phys = (uint32_t)pmm_alloc_page();
-    if (!user_stack_phys) return -1;
-    vmm_map_page(proc->page_dir, user_stack_phys, user_stack_top - PAGE_SIZE,
-                 VMM_PRESENT | VMM_WRITABLE | VMM_USER);
+    uint32_t stack_top_phys = 0;
+    for (int si = 0; si < USER_STACK_PAGES; si++) {
+        uint32_t phys = (uint32_t)pmm_alloc_page();
+        if (!phys) return -1;
+        vmm_map_page(proc->page_dir, phys, user_stack_top - (si + 1) * PAGE_SIZE,
+                     VMM_PRESENT | VMM_WRITABLE | VMM_USER);
+        if (si == 0) stack_top_phys = phys;
+    }
 
-    uint8_t *stack_page = (uint8_t *)vmm_temp_map(user_stack_phys);
+    uint8_t *stack_page = (uint8_t *)vmm_temp_map(stack_top_phys);
     stack_page[0] = '\0';
     if (args) {
         uint32_t i = 0;
@@ -364,6 +382,7 @@ int process_exec(process_t *proc, const char *path, const char *args, registers_
     proc->user_esp = user_stack_top;
     proc->heap_break = USER_HEAP_START;
     proc->heap_mapped_end = USER_HEAP_START;
+    proc->mmap_brk = USER_MMAP_START;
     for (int i = 0; i < FD_MAX; i++)
         fd_close(proc->fd_table, i);
     fd_init_table(proc->fd_table);
@@ -394,6 +413,11 @@ process_t *process_fork(process_t *parent, registers_t *r) {
     child->parent_pid = parent->pid;
     child->wait_child_pid = 0;
     child->cwd_inode = parent->cwd_inode;
+    child->mmap_brk = parent->mmap_brk;
+    child->uid = parent->uid;
+    child->gid = parent->gid;
+    child->euid = parent->euid;
+    child->egid = parent->egid;
     for (int i = 0; i < 32; i++)
         child->sigactions[i] = parent->sigactions[i];
     child->signal_pending = 0;

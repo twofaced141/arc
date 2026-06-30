@@ -66,6 +66,7 @@ void scheduler_init(void) {
 
     if (setup_idle() < 0)
         return;
+    scheduler_add_process(idle_process);
 }
 
 void scheduler_add_process(process_t *proc) {

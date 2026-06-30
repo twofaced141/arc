@@ -1,85 +1,128 @@
-#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <string.h>
 
-#define SYSCALL_PUTC    1
-#define SYSCALL_YIELD   2
-#define SYSCALL_EXIT    3
-#define SYSCALL_WRITE   4
-#define SYSCALL_READ    5
-#define SYSCALL_OPEN    8
-#define SYSCALL_CLOSE   9
-#define SYSCALL_FORK    14
-#define SYSCALL_EXECVE  15
-#define SYSCALL_WAITPID 16
-#define SYSCALL_CHDIR   17
-
-static int syscall(int num, int a, int b, int c, int d) {
-    int ret;
-    __asm__ __volatile__(
-        "int $0x80"
-        : "=a"(ret)
-        : "a"(num), "b"(a), "c"(b), "d"(c), "S"(d)
-        : "memory");
-    return ret;
-}
-
-static void putc(char c) {
-    syscall(SYSCALL_PUTC, c, 0, 0, 0);
-}
-
-static void puts(const char *s) {
-    while (*s) putc(*s++);
-}
+#define HISTORY_SIZE 16
 
 static int streq(const char *a, const char *b) {
     while (*a && *b && *a == *b) { a++; b++; }
     return *a == *b;
 }
 
-static char read_char(void) {
-    char c;
-    while (syscall(SYSCALL_READ, 0, (int)&c, 1, 0) <= 0)
-        syscall(SYSCALL_YIELD, 0, 0, 0, 0);
-    return c;
-}
-
-void _start(void) {
+int main(int argc, char **argv) {
+    (void)argc; (void)argv;
     char input[256];
-    char cmd[64];
-    char path[64];
+    char history[HISTORY_SIZE][256];
+    int history_count = 0;
+    int history_pos = -1;
 
     for (;;) {
-        puts("$ ");
+        printf("# ");
 
         int pos = 0;
+        input[0] = '\0';
+        history_pos = -1;
+        char saved_input[256];
+        saved_input[0] = '\0';
+
         for (;;) {
-            char c = read_char();
+            char c = getchar();
+
             if (c == '\n') {
-                putc('\n');
+                putchar('\n');
                 break;
             }
+
             if (c == '\b' || c == 0x7F) {
                 if (pos > 0) {
                     pos--;
-                    putc('\b');
-                    putc(' ');
-                    putc('\b');
+                    printf("\b \b");
                 }
                 continue;
             }
+
+            if (c == 0x1B) {
+                char bracket = getchar();
+                char arrow = getchar();
+                if (bracket != '[') continue;
+
+                if (arrow == 'A' && history_count > 0) {
+                    if (history_pos == -1) {
+                        strncpy(saved_input, input, 256);
+                        saved_input[255] = '\0';
+                        history_pos = history_count - 1;
+                    } else if (history_pos > 0) {
+                        history_pos--;
+                    } else {
+                        continue;
+                    }
+                    int idx = history_pos % HISTORY_SIZE;
+                    int new_len = strlen(history[idx]);
+                    if (new_len > 254) new_len = 254;
+                    printf("\r# ");
+                    for (int i = 0; i < pos; i++) printf(" ");
+                    printf("\r# ");
+                    for (int i = 0; i < new_len; i++) {
+                        putchar(history[idx][i]);
+                        input[i] = history[idx][i];
+                    }
+                    input[new_len] = '\0';
+                    pos = new_len;
+                } else if (arrow == 'B') {
+                    if (history_pos == -1) continue;
+                    history_pos++;
+                    if (history_pos >= history_count) {
+                        history_pos = -1;
+                        int new_len = strlen(saved_input);
+                        if (new_len > 254) new_len = 254;
+                        printf("\r# ");
+                        for (int i = 0; i < pos; i++) printf(" ");
+                        printf("\r# ");
+                        for (int i = 0; i < new_len; i++) {
+                            putchar(saved_input[i]);
+                            input[i] = saved_input[i];
+                        }
+                        input[new_len] = '\0';
+                        pos = new_len;
+                    } else {
+                        int idx = history_pos % HISTORY_SIZE;
+                        int new_len = strlen(history[idx]);
+                        if (new_len > 254) new_len = 254;
+                        printf("\r# ");
+                        for (int i = 0; i < pos; i++) printf(" ");
+                        printf("\r# ");
+                        for (int i = 0; i < new_len; i++) {
+                            putchar(history[idx][i]);
+                            input[i] = history[idx][i];
+                        }
+                        input[new_len] = '\0';
+                        pos = new_len;
+                    }
+                }
+                continue;
+            }
+
             if (pos < 254) {
-                putc(c);
+                putchar(c);
                 input[pos++] = c;
+                input[pos] = '\0';
             }
         }
-        input[pos] = '\0';
 
         const char *p = input;
         while (*p == ' ' || *p == '\t') p++;
         if (*p == '\0') continue;
 
+        if (history_count == 0 || !streq(history[(history_count - 1) % HISTORY_SIZE], input)) {
+            strncpy(history[history_count % HISTORY_SIZE], input, 256);
+            history[history_count % HISTORY_SIZE][255] = '\0';
+            history_count++;
+        }
+
+        char cmd[64];
         const char *cmd_start = p;
         while (*p && *p != ' ' && *p != '\t') p++;
-
         int cmd_len = p - cmd_start;
         if (cmd_len > 63) cmd_len = 63;
         int i;
@@ -90,51 +133,78 @@ void _start(void) {
         const char *args_start = p;
 
         if (streq(cmd, "exit")) {
-            syscall(SYSCALL_EXIT, 0, 0, 0, 0);
+            return 0;
         }
 
-        if (streq(cmd, "cd")) {
+        if (streq(cmd, "sleep")) {
             if (*args_start) {
-                if (syscall(SYSCALL_CHDIR, (int)args_start, 0, 0, 0) < 0) {
-                    puts("cd: ");
-                    puts(args_start);
-                    puts(": no such directory\n");
+                unsigned int secs = 0;
+                while (*args_start >= '0' && *args_start <= '9') {
+                    secs = secs * 10 + (*args_start - '0');
+                    args_start++;
                 }
+                if (secs > 0) sleep(secs);
             }
             continue;
         }
 
+        if (streq(cmd, "cd")) {
+            if (*args_start) {
+                if (chdir(args_start) < 0)
+                    printf("cd: %s: no such directory\n", args_start);
+            }
+            continue;
+        }
+
+        char path[64];
         int has_slash = 0;
         for (i = 0; cmd[i]; i++)
             if (cmd[i] == '/') { has_slash = 1; break; }
 
         if (has_slash) {
-            i = 0;
-            while (cmd[i] && i < 63) { path[i] = cmd[i]; i++; }
+            for (i = 0; cmd[i] && i < 63; i++) path[i] = cmd[i];
             path[i] = '\0';
         } else {
-            char *prefix = "/bin/";
-            int pi = 0;
-            while (*prefix) path[pi++] = *prefix++;
             i = 0;
-            while (cmd[i] && pi < 63) path[pi++] = cmd[i++];
-            path[pi] = '\0';
+            const char *prefix = "/bin/";
+            while (*prefix && i < 63) path[i++] = *prefix++;
+            int j = 0;
+            while (cmd[j] && i < 63) path[i++] = cmd[j++];
+            path[i] = '\0';
         }
 
-        int fd = syscall(SYSCALL_OPEN, (int)path, 0, 0, 0);
+        char *argv_child[16];
+        int ac = 0;
+        char argbuf[256];
+        int bi = 0;
+
+        for (int k = 0; cmd[k]; k++) argbuf[bi++] = cmd[k];
+        argbuf[bi++] = '\0';
+        argv_child[ac++] = argbuf + (bi - 1 - (int)strlen(cmd));
+
+        const char *ap = args_start;
+        while (*ap && ac < 15) {
+            while (*ap == ' ') ap++;
+            if (!*ap) break;
+            argv_child[ac++] = argbuf + bi;
+            while (*ap && *ap != ' ') argbuf[bi++] = *ap++;
+            argbuf[bi++] = '\0';
+        }
+        argv_child[ac] = NULL;
+
+        int fd = open(path, 0);
         if (fd < 0) {
-            puts(cmd);
-            puts(": not found\n");
+            printf("%s: not found\n", cmd);
             continue;
         }
-        syscall(SYSCALL_CLOSE, fd, 0, 0, 0);
+        close(fd);
 
-        int pid = syscall(SYSCALL_FORK, 0, 0, 0, 0);
+        int pid = fork();
         if (pid < 0) continue;
         if (pid == 0) {
-            syscall(SYSCALL_EXECVE, (int)path, (int)args_start, 0, 0);
-            syscall(SYSCALL_EXIT, 1, 0, 0, 0);
+            execve(path, argv_child, NULL);
+            exit(1);
         }
-        syscall(SYSCALL_WAITPID, pid, 0, 0, 0);
+        waitpid(pid, NULL, 0);
     }
 }

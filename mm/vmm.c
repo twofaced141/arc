@@ -110,16 +110,17 @@ void vmm_free_directory(page_directory_t *dir) {
     pmm_free_page(dir);
 }
 
-void vmm_map_page(page_directory_t *dir, uint32_t phys, uint32_t virt, uint32_t flags) {
+int vmm_map_page(page_directory_t *dir, uint32_t phys, uint32_t virt, uint32_t flags) {
     uint32_t pd_index = virt >> 22;
     uint32_t pt_index = (virt >> 12) & 0x3FF;
 
     page_table_t *table = get_table(dir, pd_index, 1);
     if (!table)
-        return;
+        return -1;
 
     table->entries[pt_index] = (phys & ~0xFFF) | flags;
     invlpg(virt);
+    return 0;
 }
 
 void vmm_unmap_page(page_directory_t *dir, uint32_t virt) {
@@ -222,6 +223,18 @@ static void page_fault_handler(registers_t *r) {
         }
     }
 
+    /* Lazy kernel PDE propagation: when the kernel heap grows into a new
+     * PDE range, heap_map_until creates page tables only in kernel_directory.
+     * Process directories created earlier lack the new PDE. Copy it here. */
+    if (fault_addr >= HEAP_START && fault_addr < HEAP_END && !(error_code & 0x1)) {
+        uint32_t pd_idx = fault_addr >> 22;
+        if ((kernel_directory->entries[pd_idx] & VMM_PRESENT) &&
+            !(current_directory->entries[pd_idx] & VMM_PRESENT)) {
+            current_directory->entries[pd_idx] = kernel_directory->entries[pd_idx];
+            return;
+        }
+    }
+
     if (fault_handler) {
         fault_handler(fault_addr, error_code);
         return;
@@ -274,19 +287,21 @@ static uint32_t heap_mapped_end;
 static uint32_t heap_brk;
 static spinlock_t heap_lock = SPINLOCK_INIT;
 
-static void heap_map_until(uint32_t addr) {
+static int heap_map_until(uint32_t addr) {
     while (heap_mapped_end < addr) {
         void *phys = pmm_alloc_page();
-        if (!phys) break;
-        vmm_map_page(kernel_directory, (uint32_t)phys,
-                     heap_mapped_end, VMM_PRESENT | VMM_WRITABLE);
+        if (!phys) return -1;
+        if (vmm_map_page(kernel_directory, (uint32_t)phys,
+                         heap_mapped_end, VMM_PRESENT | VMM_WRITABLE) < 0)
+            return -1;
         heap_mapped_end += PAGE_SIZE;
     }
+    return 0;
 }
 
 static void heap_coalesce(heap_block_t *b) {
     heap_block_t *next = (heap_block_t *)((uint8_t *)b + (b->size & HEAP_SIZE_MASK));
-    if ((uint32_t)next < heap_mapped_end && (next->size & HEAP_BLOCK_FREE)) {
+    if ((uint32_t)next < heap_brk && (next->size & HEAP_BLOCK_FREE)) {
         b->size = (b->size & HEAP_SIZE_MASK) + (next->size & HEAP_SIZE_MASK);
         b->next = next->next;
     }
@@ -350,7 +365,10 @@ void *kmalloc(uint32_t size) {
         return NULL;
     }
 
-    heap_map_until(new_brk);
+    if (heap_map_until(new_brk) < 0) {
+        spin_unlock_irqrestore(&heap_lock, flags);
+        return NULL;
+    }
     heap_brk = new_brk;
 
     heap_block_t *block = (heap_block_t *)addr;
@@ -405,7 +423,8 @@ void kfree(void *addr) {
 }
 
 void *vmm_temp_map(uint32_t phys) {
-    vmm_map_page(kernel_directory, phys, TEMP_VADDR, VMM_PRESENT | VMM_WRITABLE);
+    if (vmm_map_page(kernel_directory, phys, TEMP_VADDR, VMM_PRESENT | VMM_WRITABLE) < 0)
+        return NULL;
     return (void *)TEMP_VADDR;
 }
 
@@ -553,12 +572,12 @@ void vmm_init(void) {
 
     /* Identity map первые 64MB — чтобы page tables были доступны по физическим адресам */
     for (uint32_t virt = 0; virt < 0x04000000; virt += PAGE_SIZE) {
-        vmm_map_page(kernel_directory, virt, virt, VMM_PRESENT | VMM_WRITABLE);
+        (void)vmm_map_page(kernel_directory, virt, virt, VMM_PRESENT | VMM_WRITABLE);
     }
 
     /* Kernel higher half: физ 1MB+ -> виртуальный 0xC0000000+ */
     for (uint32_t offset = 0; offset < 0x400000; offset += PAGE_SIZE) {
-        vmm_map_page(kernel_directory, KERNEL_PHYS + offset,
+        (void)vmm_map_page(kernel_directory, KERNEL_PHYS + offset,
                       KERNEL_BASE + offset,
                       VMM_PRESENT | VMM_WRITABLE);
     }

@@ -11,9 +11,15 @@
 #define FD_STDERR      3
 #define FD_FILE        4
 #define FD_PIPE        5
+#define FD_NULL        6
+#define FD_ZERO        7
+#define FD_MEM         8
+#define FD_PROC        9
 
 #define FD_PIPE_READ   1
 #define FD_PIPE_WRITE  2
+
+#define O_CREAT        0x40
 
 typedef struct {
     uint8_t  buf[4096];
@@ -35,9 +41,41 @@ typedef struct {
     uint32_t pos;
 } fd_entry_t;
 
-typedef struct {
+typedef struct stat {
+    uint32_t st_dev;
+    uint32_t st_ino;
+    uint16_t st_mode;
+    uint16_t st_nlink;
+    uint16_t st_uid;
+    uint16_t st_gid;
+    uint32_t st_rdev;
     uint32_t st_size;
+    uint32_t st_atime;
+    uint32_t st_mtime;
+    uint32_t st_ctime;
+    uint32_t st_blksize;
+    uint32_t st_blocks;
 } stat_t;
+
+#define STAT_DIRENT_NAME_MAX 256
+
+typedef struct dirent {
+    uint32_t d_ino;
+    uint32_t d_off;
+    uint16_t d_reclen;
+    uint8_t  d_type;
+    uint8_t  d_name[STAT_DIRENT_NAME_MAX];
+} dirent_t;
+
+#define UTSNAME_LEN 65
+
+typedef struct {
+    char sysname[UTSNAME_LEN];
+    char nodename[UTSNAME_LEN];
+    char release[UTSNAME_LEN];
+    char version[UTSNAME_LEN];
+    char machine[UTSNAME_LEN];
+} utsname_t;
 
 /* ioctl requests */
 #define TIOCGWINSZ  0x5413

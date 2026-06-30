@@ -14,10 +14,20 @@ SRCS_C  = $(wildcard $(addsuffix /*.c,$(KERNEL_DIRS)))
 SRCS_S  = $(wildcard $(addsuffix /*.s,$(KERNEL_DIRS)))
 OBJS    = $(SRCS_C:.c=.o) $(SRCS_S:.s=.o)
 
-CMD_NAMES = pwd getpid clear ls kill cat date kmalloc_test
+CMD_NAMES = pwd getpid clear ls kill cat date sleep uname stat mkdir rm echo touch cp mv ps whoami id true false yes basename dirname wc seq head which test cmp hexdump hostname
 CMD_ELFS  = $(addsuffix .elf,$(addprefix cmd_,$(CMD_NAMES)))
 
-all: kernel.elf init.elf shell.elf $(CMD_ELFS)
+LIBC_DIR = user/libc
+LIBC     = $(LIBC_DIR)/libc.a
+CRT0     = $(LIBC_DIR)/crt0.o
+USER_CFLAGS = $(CFLAGS) -I $(LIBC_DIR)/include
+
+.PHONY: all clean mkdisk run libc
+
+all: libc kernel.elf init.elf shell.elf $(CMD_ELFS)
+
+libc:
+	$(MAKE) -C $(LIBC_DIR)
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -28,21 +38,22 @@ all: kernel.elf init.elf shell.elf $(CMD_ELFS)
 kernel.elf: $(OBJS) boot/linker.ld
 	$(LD) $(LDFLAGS) -o $@ $(OBJS)
 
-init.elf: user/init.c
-	$(CC) $(CFLAGS) -c -o init.o user/init.c
-	ld -Ttext=0x08000000 -nostdlib -m elf_i386 -o $@ init.o
+init.elf: user/init.c $(LIBC) $(CRT0)
+	$(CC) $(USER_CFLAGS) -c -o init.o user/init.c
+	ld -Ttext=0x08000000 -nostdlib -m elf_i386 -o $@ $(CRT0) init.o $(LIBC)
 
-shell.elf: user/shell.c
-	$(CC) $(CFLAGS) -c -o shell.o user/shell.c
-	ld -Ttext=0x08000000 -nostdlib -m elf_i386 -o $@ shell.o
+shell.elf: user/shell.c $(LIBC) $(CRT0)
+	$(CC) $(USER_CFLAGS) -c -o shell.o user/shell.c
+	ld -Ttext=0x08000000 -nostdlib -m elf_i386 -o $@ $(CRT0) shell.o $(LIBC)
 
-cmd_%.elf: user/cmd.c
-	$(CC) $(CFLAGS) -Wno-unused-function -DCMD_$(shell echo $* | tr a-z A-Z) -c -o cmd_$*.o user/cmd.c
-	ld -Ttext=0x08000000 -nostdlib -m elf_i386 -o $@ cmd_$*.o
+cmd_%.elf: user/cmd.c $(LIBC) $(CRT0)
+	$(CC) $(USER_CFLAGS) -Wno-unused-function -DCMD_$(shell echo $* | tr a-z A-Z) -c -o cmd_$*.o user/cmd.c
+	ld -Ttext=0x08000000 -nostdlib -m elf_i386 -o $@ $(CRT0) cmd_$*.o $(LIBC)
 
 clean:
 	rm -rf *.o *.elf *.bin iso_root os.iso cmd_*.o
 	find . -name '*.o' -type f -delete
+	$(MAKE) -C $(LIBC_DIR) clean
 
 check: kernel.elf
 	grub-file --is-x86-multiboot2 kernel.elf
@@ -66,5 +77,3 @@ run: kernel.elf $(TEST_FILES)
 	@echo '}' >> iso_root/boot/grub/grub.cfg
 	grub-mkrescue -o os.iso iso_root
 	qemu-system-i386 -cdrom os.iso -hda disk.img -serial stdio -no-reboot -m 64 -nic user
-
-.PHONY: all clean run check mkdisk

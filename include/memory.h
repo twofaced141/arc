@@ -11,4 +11,15 @@
 #define USER_SPACE_START 0x00400000
 #define USER_SPACE_END   0xC0000000
 
+#define USER_MMAP_START 0x20000000
+
+#define PROT_READ     0x1
+#define PROT_WRITE    0x2
+#define PROT_EXEC     0x4
+
+#define MAP_SHARED    0x01
+#define MAP_PRIVATE   0x02
+#define MAP_ANONYMOUS 0x20
+#define MAP_FAILED    ((void*)-1)
+
 #endif

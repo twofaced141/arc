@@ -31,6 +31,23 @@
 #define SYSCALL_SIGACTION 25u
 #define SYSCALL_SIGRETURN 26u
 #define SYSCALL_KMALLOC_TEST 27u
+#define SYSCALL_UNAME    28u
+#define SYSCALL_MMAP     29u
+#define SYSCALL_MUNMAP   30u
+#define SYSCALL_STAT     31u
+#define SYSCALL_LSTAT    32u
+#define SYSCALL_GETDENTS 33u
+#define SYSCALL_UNLINK   34u
+#define SYSCALL_RENAME   35u
+#define SYSCALL_MKDIR    36u
+#define SYSCALL_RMDIR    37u
+#define SYSCALL_CHMOD    38u
+#define SYSCALL_CHOWN    39u
+#define SYSCALL_ACCESS   40u
+#define SYSCALL_GETUID   41u
+#define SYSCALL_GETGID   42u
+#define SYSCALL_GETEUID  43u
+#define SYSCALL_GETEGID  44u
 
 typedef struct {
     uint32_t gs, fs, es, ds;

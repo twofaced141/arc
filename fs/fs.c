@@ -121,6 +121,43 @@ file_t *fs_open(const char *name, uint32_t cwd_inode) {
     return NULL;
 }
 
+int fs_write(file_t *f, const void *buf, uint32_t offset, uint32_t size) {
+    if (!f || !f->ext2_ino || !ext2_fs)
+        return -1;
+    return ext2_write_file(ext2_fs, f->ext2_ino, buf, offset, size);
+}
+
+int fs_create(const char *name, uint32_t cwd_inode, uint32_t *out_ino) {
+    if (!ext2_fs || !ext2_fs->present)
+        return -1;
+
+    uint32_t dir_ino;
+    uint8_t type;
+    const char *base_name = name;
+
+    const char *slash = name;
+    while (*slash) slash++;
+    while (slash > name && *slash != '/') slash--;
+
+    if (slash == name) {
+        dir_ino = cwd_inode;
+        base_name = name;
+        if (*base_name == '/') { dir_ino = EXT2_ROOT_INO; base_name++; }
+    } else {
+        char dir_path[256];
+        int len = slash - name;
+        for (int i = 0; i < len && i < 255; i++) dir_path[i] = name[i];
+        dir_path[len] = '\0';
+        if (ext2_resolve(ext2_fs, cwd_inode, dir_path, &dir_ino, &type) < 0 || type != EXT2_FT_DIR)
+            return -1;
+        base_name = slash + 1;
+    }
+
+    if (!*base_name) return -1;
+
+    return ext2_create(ext2_fs, base_name, dir_ino, EXT2_S_IFREG | 0644, out_ino);
+}
+
 void fs_read(file_t *f, void *buf, uint32_t offset, uint32_t size) {
     if (!f || offset >= f->size)
         return;

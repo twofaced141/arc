@@ -90,6 +90,17 @@ void terminal_putchar(char c) {
         terminal_update_cursor();
         return;
     }
+    if (c == '\b') {
+        if (terminal_column > 0)
+            terminal_column--;
+        terminal_update_cursor();
+        return;
+    }
+    if (c == '\r') {
+        terminal_column = 0;
+        terminal_update_cursor();
+        return;
+    }
     terminal_putentryat(c, terminal_color, terminal_column, terminal_row);
     if (++terminal_column == VGA_WIDTH) {
         terminal_column = 0;

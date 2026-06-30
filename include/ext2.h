@@ -3,6 +3,9 @@
 
 #include <stdint.h>
 
+struct stat;
+struct dirent;
+
 #define EXT2_MAGIC        0xEF53
 #define EXT2_ROOT_INO     2
 #define EXT2_SB_OFFSET    1024
@@ -132,5 +135,21 @@ int  ext2_resolve(ext2_fs_t *fs, uint32_t base_ino, const char *path, uint32_t *
 int  ext2_find_name(ext2_fs_t *fs, uint32_t dir_ino, uint32_t target_ino, char *name_out);
 int  ext2_read_names(ext2_fs_t *fs, uint32_t dir_ino, char *buf, uint32_t size, uint32_t *out_bytes);
 int  ext2_write_block(ext2_fs_t *fs, uint32_t block_addr, const void *buf);
+int  ext2_write_inode(ext2_fs_t *fs, uint32_t inum, ext2_inode_t *inode);
+int  ext2_write_data_block(ext2_fs_t *fs, ext2_inode_t *inode, uint32_t iblock, const void *buf);
+uint32_t ext2_alloc_block(ext2_fs_t *fs);
+uint32_t ext2_alloc_inode(ext2_fs_t *fs);
+int  ext2_write_file(ext2_fs_t *fs, uint32_t ino, const void *buf, uint32_t offset, uint32_t size);
+int  ext2_add_dirent(ext2_fs_t *fs, uint32_t dir_ino, uint32_t target_ino, const char *name, uint8_t file_type);
+int  ext2_create(ext2_fs_t *fs, const char *name, uint32_t parent_ino, uint32_t mode, uint32_t *out_ino);
+int  ext2_free_inode(ext2_fs_t *fs, uint32_t inum);
+int  ext2_free_block(ext2_fs_t *fs, uint32_t block_addr);
+int  ext2_truncate(ext2_fs_t *fs, uint32_t inum);
+int  ext2_unlink(ext2_fs_t *fs, uint32_t dir_ino, const char *name);
+int  ext2_rename(ext2_fs_t *fs, uint32_t old_dir_ino, const char *old_name, uint32_t new_dir_ino, const char *new_name);
+int  ext2_mkdir(ext2_fs_t *fs, const char *name, uint32_t parent_ino, uint32_t *out_ino);
+int  ext2_rmdir(ext2_fs_t *fs, uint32_t parent_ino, const char *name);
+int  ext2_stat(ext2_fs_t *fs, uint32_t ino, struct stat *st);
+int  ext2_getdents(ext2_fs_t *fs, uint32_t dir_ino, struct dirent *dirp, uint32_t count);
 
 #endif
