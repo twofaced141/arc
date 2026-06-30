@@ -5,7 +5,7 @@
 #define KERNEL_PHYS     0x00100000
 
 #define HEAP_START      0xD0000000
-#define HEAP_END        0xE0000000
+#define HEAP_END        0xFFBFFFFF
 #define HEAP_INITIAL_PAGES 16
 
 #define USER_SPACE_START 0x00400000
