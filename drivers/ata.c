@@ -1,9 +1,11 @@
 #include "ata.h"
+#include "ahci.h"
 #include "idt.h"
 #include "debug.h"
 #include "terminal.h"
 
 static ata_drive_t primary_master;
+static int use_ahci = 0;
 
 static int ata_wait_bsy(uint16_t alt_status) {
     for (int tries = 0; tries < 100000; tries++) {
@@ -89,6 +91,12 @@ static int ata_identify_master(void) {
 }
 
 int ata_init(void) {
+    if (ahci_init() == 0) {
+        use_ahci = 1;
+        return 0;
+    }
+    use_ahci = 0;
+
     primary_master.present = 0;
 
     if (ata_identify_master() == 0) {
@@ -103,6 +111,8 @@ int ata_init(void) {
 }
 
 int ata_read_sectors(uint32_t lba, int count, void *buf) {
+    if (use_ahci)
+        return ahci_read_sectors(lba, count, buf);
     if (!primary_master.present)
         return -1;
 
@@ -147,6 +157,8 @@ int ata_read_sectors(uint32_t lba, int count, void *buf) {
 }
 
 int ata_write_sectors(uint32_t lba, int count, const void *buf) {
+    if (use_ahci)
+        return ahci_write_sectors(lba, count, buf);
     if (!primary_master.present)
         return -1;
 
@@ -194,6 +206,8 @@ int ata_write_sectors(uint32_t lba, int count, const void *buf) {
 }
 
 int ata_flush_cache(void) {
+    if (use_ahci)
+        return ahci_flush_cache();
     if (!primary_master.present)
         return -1;
 

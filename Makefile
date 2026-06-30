@@ -76,4 +76,4 @@ run: kernel.elf $(TEST_FILES)
 	@echo '    boot' >> iso_root/boot/grub/grub.cfg
 	@echo '}' >> iso_root/boot/grub/grub.cfg
 	grub-mkrescue -o os.iso iso_root
-	qemu-system-i386 -cdrom os.iso -hda disk.img -serial stdio -no-reboot -m 64 -nic user
+	qemu-system-i386 -machine q35 -cdrom os.iso -drive file=disk.img,format=raw -serial stdio -no-reboot -m 64 -nic user
