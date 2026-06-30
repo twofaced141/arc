@@ -2,10 +2,12 @@
 #include "fs.h"
 #include "multiboot2.h"
 #include "debug.h"
+#include "spinlock.h"
 
 static file_t files[FS_MAX_FILES];
 static int file_count;
 static ext2_fs_t *ext2_fs;
+static spinlock_t fs_lock = SPINLOCK_INIT;
 
 void fs_set_ext2(ext2_fs_t *fs) {
     ext2_fs = fs;
@@ -53,28 +55,49 @@ void fs_init(void *mboot_info) {
 }
 
 int fs_count(void) {
-    return file_count;
+    uint32_t flags;
+    spin_lock_irqsave(&fs_lock, &flags);
+    int count = file_count;
+    spin_unlock_irqrestore(&fs_lock, flags);
+    return count;
 }
 
 file_t *fs_get(int index) {
-    if (index < 0 || index >= file_count)
+    uint32_t flags;
+    spin_lock_irqsave(&fs_lock, &flags);
+    if (index < 0 || index >= file_count) {
+        spin_unlock_irqrestore(&fs_lock, flags);
         return NULL;
-    return &files[index];
+    }
+    file_t *f = &files[index];
+    spin_unlock_irqrestore(&fs_lock, flags);
+    return f;
 }
 
 file_t *fs_open(const char *name, uint32_t cwd_inode) {
+    uint32_t flags;
+    spin_lock_irqsave(&fs_lock, &flags);
+
     for (int i = 0; i < file_count; i++) {
         const char *a = name;
         const char *b = files[i].name;
         while (*a && *b && *a == *b) { a++; b++; }
-        if (*a == '\0' && *b == '\0')
+        if (*a == '\0' && *b == '\0') {
+            spin_unlock_irqrestore(&fs_lock, flags);
             return &files[i];
+        }
     }
 
     if (ext2_fs && ext2_fs->present) {
         uint32_t ino;
         uint8_t type;
         if (ext2_resolve(ext2_fs, cwd_inode, name, &ino, &type) == 0 && type == EXT2_FT_REG_FILE) {
+            for (int i = 0; i < FS_MAX_FILES; i++) {
+                if (files[i].ext2_ino == ino) {
+                    spin_unlock_irqrestore(&fs_lock, flags);
+                    return &files[i];
+                }
+            }
             ext2_inode_t inode;
             if (ext2_read_inode(ext2_fs, ino, &inode) == 0) {
                 for (int i = 0; i < FS_MAX_FILES; i++) {
@@ -86,12 +109,15 @@ file_t *fs_open(const char *name, uint32_t cwd_inode) {
                         files[i].size = inode.size;
                         files[i].phys_start = 0;
                         files[i].ext2_ino = ino;
+                        spin_unlock_irqrestore(&fs_lock, flags);
                         return &files[i];
                     }
                 }
             }
         }
     }
+
+    spin_unlock_irqrestore(&fs_lock, flags);
     return NULL;
 }
 

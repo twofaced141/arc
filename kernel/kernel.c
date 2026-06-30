@@ -18,111 +18,9 @@
 #include "fd.h"
 #include "ata.h"
 #include "ext2.h"
+#include "rtc.h"
+#include "signal.h"
 
-#define VGA_BUFFER 0xB8000
-#define VGA_WIDTH  80
-#define VGA_HEIGHT 25
-
-enum vga_color {
-    VGA_BLACK         = 0,
-    VGA_BLUE          = 1,
-    VGA_GREEN         = 2,
-    VGA_CYAN          = 3,
-    VGA_RED           = 4,
-    VGA_MAGENTA       = 5,
-    VGA_BROWN         = 6,
-    VGA_LIGHT_GREY    = 7,
-    VGA_DARK_GREY     = 8,
-    VGA_LIGHT_BLUE    = 9,
-    VGA_LIGHT_GREEN   = 10,
-    VGA_LIGHT_CYAN    = 11,
-    VGA_LIGHT_RED     = 12,
-    VGA_LIGHT_MAGENTA = 13,
-    VGA_LIGHT_BROWN   = 14,
-    VGA_WHITE         = 15,
-};
-
-static inline uint8_t vga_entry_color(enum vga_color fg, enum vga_color bg) {
-    return fg | bg << 4;
-}
-
-static inline uint16_t vga_entry(unsigned char uc, uint8_t color) {
-    return (uint16_t)uc | (uint16_t)color << 8;
-}
-
-size_t terminal_row;
-size_t terminal_column;
-uint8_t terminal_color;
-static uint16_t *terminal_buffer;
-static void terminal_scroll(void) {
-    for (size_t y = 1; y < VGA_HEIGHT; y++) {
-        for (size_t x = 0; x < VGA_WIDTH; x++) {
-            terminal_buffer[(y - 1) * VGA_WIDTH + x] = terminal_buffer[y * VGA_WIDTH + x];
-        }
-    }
-    size_t last = (VGA_HEIGHT - 1) * VGA_WIDTH;
-    for (size_t x = 0; x < VGA_WIDTH; x++)
-        terminal_buffer[last + x] = vga_entry(' ', terminal_color);
-    terminal_row = VGA_HEIGHT - 1;
-}
-
-static void terminal_update_cursor(void) {
-    uint16_t pos = terminal_row * VGA_WIDTH + terminal_column;
-    outb(0x3D4, 0x0F);
-    outb(0x3D5, (uint8_t)(pos & 0xFF));
-    outb(0x3D4, 0x0E);
-    outb(0x3D5, (uint8_t)((pos >> 8) & 0xFF));
-}
-
-void terminal_init(void) {
-    terminal_row = 0;
-    terminal_column = 0;
-    terminal_color = vga_entry_color(VGA_LIGHT_GREY, VGA_BLACK);
-    terminal_buffer = (uint16_t *)VGA_BUFFER;
-    for (size_t y = 0; y < VGA_HEIGHT; y++) {
-        for (size_t x = 0; x < VGA_WIDTH; x++) {
-            const size_t index = y * VGA_WIDTH + x;
-            terminal_buffer[index] = vga_entry(' ', terminal_color);
-        }
-    }
-    terminal_update_cursor();
-}
-
-void terminal_setcolor(uint8_t color) {
-    terminal_color = color;
-}
-
-void terminal_putentryat(char c, uint8_t color, size_t x, size_t y) {
-    const size_t index = y * VGA_WIDTH + x;
-    terminal_buffer[index] = vga_entry(c, color);
-}
-
-void terminal_putchar(char c) {
-    if (c == '\n') {
-        terminal_column = 0;
-        if (++terminal_row == VGA_HEIGHT)
-            terminal_scroll();
-        terminal_update_cursor();
-        return;
-    }
-    terminal_putentryat(c, terminal_color, terminal_column, terminal_row);
-    if (++terminal_column == VGA_WIDTH) {
-        terminal_column = 0;
-        if (++terminal_row == VGA_HEIGHT)
-            terminal_scroll();
-    }
-    terminal_update_cursor();
-}
-
-void terminal_write(const char *data, size_t size) {
-    for (size_t i = 0; i < size; i++)
-        terminal_putchar(data[i]);
-}
-
-void terminal_print(const char *data) {
-    while (*data)
-        terminal_putchar(*data++);
-}
 
 extern void isr0(void);  extern void isr1(void);  extern void isr2(void);  extern void isr3(void);
 extern void isr4(void);  extern void isr5(void);  extern void isr6(void);  extern void isr7(void);
@@ -201,10 +99,26 @@ static void idt_install(void) {
 static const char *syscall_names[] = {
     "getpid", "putc", "yield", "exit", "write", "read",
     "sleep", "getticks", "open", "close", "lseek", "fstat", "brk", "sbrk",
-    "fork", "execve", "waitpid", "chdir", "getcwd", "listdir", "kill", "dup2"
+    "fork", "execve", "waitpid", "chdir", "getcwd", "listdir", "kill", "dup2",
+    "pipe", "ioctl", "gettime", "sigaction", "sigreturn"
 };
 
 extern uint32_t scheduler_syscall_no;
+
+static int user_range_ok(const void *addr, uint32_t size, int writable) {
+    if (size == 0) return 1;
+    uint32_t start = (uint32_t)addr;
+    if (start + size < start) return 0;
+    if (start + size > 0xC0000000) return 0;
+    page_directory_t *dir = vmm_get_current_directory();
+    uint32_t end_page = (start + size + PAGE_SIZE - 1) & ~0xFFF;
+    for (uint32_t page = start & ~0xFFF; page < end_page; page += PAGE_SIZE) {
+        int flags = vmm_get_page_flags(dir, page);
+        if (!(flags & VMM_PRESENT)) return 0;
+        if (writable && !(flags & VMM_WRITABLE) && !(flags & VMM_COW)) return 0;
+    }
+    return 1;
+}
 
 static void syscall_handler(registers_t *r) {
     process_t *cur = scheduler_current_process();
@@ -226,12 +140,23 @@ static void syscall_handler(registers_t *r) {
         break;
     }
     case SYSCALL_EXECVE: {
-        const char *path = (const char *)r->ebx;
-        if (cur && process_exec(cur, path, r, cur->cwd_inode) == 0) {
-            r->eax = 0;
-        } else {
-            r->eax = -1;
+        char kpath[256];
+        char *kargs = NULL;
+        int ok = 0;
+        if (cur && strncpy_from_user(kpath, (const char *)r->ebx, 256) > 0) {
+            if (r->ecx) {
+                kargs = (char *)kmalloc(4096);
+                if (kargs && strncpy_from_user(kargs, (const char *)r->ecx, 4096) > 0)
+                    ok = 1;
+            } else {
+                ok = 1;
+            }
         }
+        if (ok && process_exec(cur, kpath, (const char *)kargs, r, cur->cwd_inode) == 0)
+            r->eax = 0;
+        else
+            r->eax = -1;
+        if (kargs) kfree(kargs);
         break;
     }
     case SYSCALL_GETPID:
@@ -255,10 +180,16 @@ static void syscall_handler(registers_t *r) {
         }
         break;
     case SYSCALL_WRITE:
-        r->eax = fd_write(cur->fd_table, (int)r->ebx, (void *)r->ecx, r->edx);
+        if (user_range_ok((void *)r->ecx, r->edx, 0))
+            r->eax = fd_write(cur->fd_table, (int)r->ebx, (void *)r->ecx, r->edx);
+        else
+            r->eax = -1;
         break;
     case SYSCALL_READ:
-        r->eax = fd_read(cur->fd_table, (int)r->ebx, (void *)r->ecx, r->edx);
+        if (user_range_ok((void *)r->ecx, r->edx, 1))
+            r->eax = fd_read(cur->fd_table, (int)r->ebx, (void *)r->ecx, r->edx);
+        else
+            r->eax = -1;
         break;
     case SYSCALL_SLEEP: {
         uint32_t ms = r->ebx;
@@ -270,24 +201,39 @@ static void syscall_handler(registers_t *r) {
     case SYSCALL_GETTICKS:
         r->eax = pit_get_ticks();
         break;
-    case SYSCALL_OPEN:
-        r->eax = fd_open(cur->fd_table, (const char *)r->ebx, r->ecx, cur->cwd_inode);
+    case SYSCALL_OPEN: {
+        char kpath[256];
+        if (strncpy_from_user(kpath, (const char *)r->ebx, 256) > 0)
+            r->eax = fd_open(cur->fd_table, kpath, r->ecx, cur->cwd_inode);
+        else
+            r->eax = -1;
         break;
+    }
     case SYSCALL_CLOSE:
         r->eax = fd_close(cur->fd_table, (int)r->ebx);
         break;
     case SYSCALL_LSEEK:
         r->eax = fd_lseek(cur->fd_table, (int)r->ebx, (int32_t)r->ecx, (int)r->edx);
         break;
-    case SYSCALL_FSTAT:
-        r->eax = fd_fstat(cur->fd_table, (int)r->ebx, (stat_t *)r->ecx);
+    case SYSCALL_FSTAT: {
+        stat_t kst;
+        if (fd_fstat(cur->fd_table, (int)r->ebx, &kst) == 0 &&
+            copy_to_user((void *)r->ecx, &kst, sizeof(stat_t)) == 0)
+            r->eax = 0;
+        else
+            r->eax = -1;
         break;
+    }
     case SYSCALL_BRK: {
         uint32_t new_brk = r->ebx;
-        if (new_brk == 0 || (new_brk >= USER_HEAP_START && new_brk < 0xC0000000)) {
-            if (new_brk != 0) {
-                uint32_t new_mapped = (new_brk + PAGE_SIZE - 1) & ~0xFFF;
-                uint32_t old_mapped = cur->heap_mapped_end;
+        if (new_brk == 0) {
+            r->eax = cur->heap_break;
+            break;
+        }
+        if (new_brk >= USER_HEAP_START && new_brk < 0xC0000000) {
+            uint32_t new_mapped = (new_brk + PAGE_SIZE - 1) & ~0xFFF;
+            uint32_t old_mapped = cur->heap_mapped_end;
+            if (new_brk > cur->heap_break) {
                 for (uint32_t a = old_mapped; a < new_mapped; a += PAGE_SIZE) {
                     uint32_t phys = (uint32_t)pmm_alloc_page();
                     if (!phys) { r->eax = -1; break; }
@@ -295,8 +241,17 @@ static void syscall_handler(registers_t *r) {
                                 VMM_PRESENT | VMM_WRITABLE | VMM_USER);
                 }
                 cur->heap_mapped_end = new_mapped > old_mapped ? new_mapped : old_mapped;
-                cur->heap_break = new_brk;
+            } else if (new_brk < cur->heap_break && new_mapped < old_mapped) {
+                for (uint32_t a = new_mapped; a < old_mapped; a += PAGE_SIZE) {
+                    uint32_t phys = vmm_get_physical(cur->page_dir, a);
+                    if (phys) {
+                        pmm_refcount_dec(phys & ~0xFFF);
+                        vmm_unmap_page(cur->page_dir, a);
+                    }
+                }
+                cur->heap_mapped_end = new_mapped;
             }
+            cur->heap_break = new_brk;
         }
         r->eax = cur->heap_break;
         break;
@@ -308,13 +263,24 @@ static void syscall_handler(registers_t *r) {
         if (new_brk >= USER_HEAP_START && new_brk < 0xC0000000) {
             uint32_t new_mapped = (new_brk + PAGE_SIZE - 1) & ~0xFFF;
             uint32_t old_mapped = cur->heap_mapped_end;
-            for (uint32_t a = old_mapped; a < new_mapped; a += PAGE_SIZE) {
-                uint32_t phys = (uint32_t)pmm_alloc_page();
-                if (!phys) { r->eax = -1; break; }
-                vmm_map_page(cur->page_dir, phys, a,
-                            VMM_PRESENT | VMM_WRITABLE | VMM_USER);
+            if (new_brk > old) {
+                for (uint32_t a = old_mapped; a < new_mapped; a += PAGE_SIZE) {
+                    uint32_t phys = (uint32_t)pmm_alloc_page();
+                    if (!phys) { r->eax = -1; break; }
+                    vmm_map_page(cur->page_dir, phys, a,
+                                VMM_PRESENT | VMM_WRITABLE | VMM_USER);
+                }
+                cur->heap_mapped_end = new_mapped > old_mapped ? new_mapped : old_mapped;
+            } else if (new_brk < old && new_mapped < old_mapped) {
+                for (uint32_t a = new_mapped; a < old_mapped; a += PAGE_SIZE) {
+                    uint32_t phys = vmm_get_physical(cur->page_dir, a);
+                    if (phys) {
+                        pmm_refcount_dec(phys & ~0xFFF);
+                        vmm_unmap_page(cur->page_dir, a);
+                    }
+                }
+                cur->heap_mapped_end = new_mapped;
             }
-            cur->heap_mapped_end = new_mapped > old_mapped ? new_mapped : old_mapped;
             cur->heap_break = new_brk;
         }
         r->eax = old;
@@ -324,24 +290,32 @@ static void syscall_handler(registers_t *r) {
         int pid = (int)r->ebx;
         uint32_t *status = (uint32_t *)r->ecx;
         int options = (int)r->edx;
-        int result = process_waitpid(cur, pid, status, options);
+        uint32_t kstatus;
+        uint32_t *status_ptr = status ? &kstatus : NULL;
+        int result = process_waitpid(cur, pid, status_ptr, options);
         if (result == -2) {
             cur->kernel_esp = (uint32_t)r;
             cur->state = PROC_BLOCKED;
             r->eax = 0;
+        } else if (result >= 0) {
+            if (status_ptr && copy_to_user(status, &kstatus, sizeof(uint32_t)) < 0)
+                r->eax = -1;
+            else
+                r->eax = (uint32_t)result;
         } else {
-            r->eax = result >= 0 ? (uint32_t)result : -1;
+            r->eax = -1;
         }
         break;
     }
     case SYSCALL_CHDIR: {
-        const char *path = (const char *)r->ebx;
-        if (!path || !cur) { r->eax = -1; break; }
+        char kpath[256];
+        if (!cur || strncpy_from_user(kpath, (const char *)r->ebx, 256) <= 0)
+            { r->eax = -1; break; }
         ext2_fs_t *fs = fs_get_ext2();
         if (!fs || !fs->present) { r->eax = -1; break; }
         uint32_t ino;
         uint8_t type;
-        if (ext2_resolve(fs, cur->cwd_inode, path, &ino, &type) == 0 && type == EXT2_FT_DIR) {
+        if (ext2_resolve(fs, cur->cwd_inode, kpath, &ino, &type) == 0 && type == EXT2_FT_DIR) {
             cur->cwd_inode = ino;
             r->eax = 0;
         } else {
@@ -350,11 +324,12 @@ static void syscall_handler(registers_t *r) {
         break;
     }
     case SYSCALL_GETCWD: {
-        char *buf = (char *)r->ebx;
         uint32_t size = r->ecx;
-        if (!buf || size == 0 || !cur) { r->eax = -1; break; }
+        if (!cur || size == 0) { r->eax = -1; break; }
+        char *kbuf = (char *)kmalloc(size);
+        if (!kbuf) { r->eax = -1; break; }
         ext2_fs_t *fs = fs_get_ext2();
-        if (!fs || !fs->present) { r->eax = -1; break; }
+        if (!fs || !fs->present) { kfree(kbuf); r->eax = -1; break; }
 
         uint32_t ino_chain[256];
         int n = 0;
@@ -367,64 +342,104 @@ static void syscall_handler(registers_t *r) {
             if (ext2_lookup(fs, ino, "..", &parent, &t) < 0) { err = 1; break; }
             ino = parent;
         }
-        if (err) { r->eax = -1; break; }
+        if (err) { kfree(kbuf); r->eax = -1; break; }
 
         int pos = 0;
         if (n == 0) {
-            if (pos < (int)size) buf[pos++] = '/';
+            if (pos < (int)size) kbuf[pos++] = '/';
         } else {
-            buf[pos++] = '/';
+            kbuf[pos++] = '/';
             for (int i = n - 1; i >= 0; i--) {
                 uint32_t parent_ino = (i < n - 1) ? ino_chain[i + 1] : EXT2_ROOT_INO;
                 char name[EXT2_NAME_MAX + 1];
-                if (ext2_find_name(fs, parent_ino, ino_chain[i], name) < 0)
-                    { err = 1; break; }
+                if (ext2_find_name(fs, parent_ino, ino_chain[i], name) < 0) {
+                    char tmp[16];
+                    char *tp = tmp + 15;
+                    *tp = '\0';
+                    uint32_t nn = ino_chain[i];
+                    do { *--tp = '0' + (nn % 10); nn /= 10; } while (nn);
+                    char *np = name;
+                    *np++ = 'i'; *np++ = 'n'; *np++ = 'o'; *np++ = 'd';
+                    *np++ = 'e'; *np++ = '_';
+                    while (*tp && (uint32_t)(np - name) < EXT2_NAME_MAX)
+                        *np++ = *tp++;
+                    *np = '\0';
+                }
                 for (int k = 0; name[k] && pos < (int)size - 1; k++)
-                    buf[pos++] = name[k];
+                    kbuf[pos++] = name[k];
                 if (i > 0 && pos < (int)size - 1)
-                    buf[pos++] = '/';
+                    kbuf[pos++] = '/';
             }
         }
-        if (err) { r->eax = -1; break; }
-        if (pos < (int)size) buf[pos] = '\0';
-        r->eax = pos;
+        if (err) { kfree(kbuf); r->eax = -1; break; }
+        kbuf[pos] = '\0';
+        if (copy_to_user((void *)r->ebx, kbuf, pos + 1) == 0)
+            r->eax = pos;
+        else
+            r->eax = -1;
+        kfree(kbuf);
         break;
     }
     case SYSCALL_LISTDIR: {
-        const char *path = (const char *)r->ebx;
-        char *buf = (char *)r->ecx;
+        char kpath[256];
+        char *kpath_ptr = NULL;
         uint32_t size = r->edx;
-        if (!buf || !cur) { r->eax = -1; break; }
+        if (!cur || !r->ecx) { r->eax = -1; break; }
         ext2_fs_t *fs = fs_get_ext2();
         if (!fs || !fs->present) { r->eax = -1; break; }
 
+        if (r->ebx) {
+            if (strncpy_from_user(kpath, (const char *)r->ebx, 256) <= 0)
+                { r->eax = -1; break; }
+            kpath_ptr = kpath;
+        }
+
         uint32_t dir_ino;
         uint8_t type;
-        if (!path || path[0] == '\0') {
+        if (!kpath_ptr) {
             dir_ino = cur->cwd_inode;
         } else {
-            if (ext2_resolve(fs, cur->cwd_inode, path, &dir_ino, &type) < 0 ||
+            if (ext2_resolve(fs, cur->cwd_inode, kpath_ptr, &dir_ino, &type) < 0 ||
                 type != EXT2_FT_DIR) {
                 r->eax = -1; break;
             }
         }
 
+        char *kbuf = (char *)kmalloc(size);
+        if (!kbuf) { r->eax = -1; break; }
         uint32_t bytes = 0;
-        int count = ext2_read_names(fs, dir_ino, buf, size, &bytes);
-        if (count < 0) { r->eax = -1; break; }
-        r->eax = (int)bytes;
+        int count = ext2_read_names(fs, dir_ino, kbuf, size, &bytes);
+        if (count < 0) { kfree(kbuf); r->eax = -1; break; }
+        if (copy_to_user((void *)r->ecx, kbuf, bytes) == 0)
+            r->eax = (int)bytes;
+        else
+            r->eax = -1;
+        kfree(kbuf);
         break;
     }
     case SYSCALL_KILL: {
         int pid = (int)r->ebx;
-        if (cur && pid == (int)cur->pid) {
-            cur->exit_code = 0;
+        int sig = (int)r->ecx;
+        if (sig == 0) sig = SIGTERM;
+        if (cur && pid == (int)cur->pid && (sig == SIGKILL || sig == SIGTERM)) {
+            cur->exit_code = 128 + sig;
             cur->kernel_esp = (uint32_t)r;
             process_exit(cur);
             scheduler_syscall_no = 3;
         } else {
-            r->eax = process_kill(pid);
+            r->eax = sys_kill_sig(pid, sig);
         }
+        break;
+    }
+    case SYSCALL_SIGACTION: {
+        int signum = (int)r->ebx;
+        const sigaction_t *act = (const sigaction_t *)r->ecx;
+        sigaction_t *oldact = (sigaction_t *)r->edx;
+        r->eax = sys_sigaction(signum, act, oldact);
+        break;
+    }
+    case SYSCALL_SIGRETURN: {
+        r->eax = sys_sigreturn(r);
         break;
     }
     case SYSCALL_DUP2: {
@@ -434,16 +449,33 @@ static void syscall_handler(registers_t *r) {
         break;
     }
     case SYSCALL_PIPE: {
-        int *pipefd = (int *)r->ebx;
-        if (!pipefd) { r->eax = -1; break; }
+        if (!r->ebx) { r->eax = -1; break; }
         int fds[2];
         if (fd_pipe(cur->fd_table, fds) == 0) {
-            pipefd[0] = fds[0];
-            pipefd[1] = fds[1];
-            r->eax = 0;
+            if (copy_to_user((void *)r->ebx, fds, sizeof(fds)) == 0)
+                r->eax = 0;
+            else
+                r->eax = -1;
         } else {
             r->eax = -1;
         }
+        break;
+    }
+    case SYSCALL_IOCTL: {
+        int fd = (int)r->ebx;
+        int request = (int)r->ecx;
+        void *arg = (void *)r->edx;
+        r->eax = fd_ioctl(cur->fd_table, fd, request, arg);
+        break;
+    }
+    case SYSCALL_GETTIME: {
+        if (!r->ebx) { r->eax = -1; break; }
+        rtc_time_t ktime;
+        rtc_read_time(&ktime);
+        if (copy_to_user((void *)r->ebx, &ktime, sizeof(rtc_time_t)) == 0)
+            r->eax = 0;
+        else
+            r->eax = -1;
         break;
     }
     }
@@ -471,27 +503,28 @@ void kernel_main(uint32_t mboot_magic, multiboot2_info_t *mboot_info) {
         process_init();
         scheduler_init();
 
-        file_t *user_elf = fs_open("user_code.elf", EXT2_ROOT_INO);
-        if (user_elf) {
-            debug_printf("kernel: loading user_code.elf (%u bytes)\r\n", user_elf->size);
-            for (int i = 0; i < 1; i++) {
-                process_t *proc = process_create_elf(user_elf);
-                if (proc)
-                    scheduler_add_process(proc);
-            }
-        } else {
-            debug_printf("kernel: user_code.elf not found\r\n");
-        }
-
+        rtc_init();
         pci_scan();
         ata_init();
 
+
         ext2_fs_t ext2;
-        if (ext2_init(&ext2) == 0)
-            fs_set_ext2(&ext2);
-        } else {
-            debug_printf("kernel: not booted with Multiboot2\r\n");
-        }
+        if (ext2_init(&ext2) < 0)
+            panic_simple("ext2 init failed");
+        fs_set_ext2(&ext2);
+        debug_printf("kernel: ext2 mounted\r\n");
+
+        file_t *init_elf = fs_open("/bin/init", EXT2_ROOT_INO);
+        if (!init_elf)
+            panic_simple("/bin/init not found");
+
+        process_t *proc = process_create_elf(init_elf);
+        if (!proc)
+            panic_simple("process_create_elf failed");
+        scheduler_add_process(proc);
+    } else {
+        debug_printf("kernel: not booted with Multiboot2\r\n");
+    }
 
     __asm__ __volatile__("sti");
 

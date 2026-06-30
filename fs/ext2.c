@@ -4,46 +4,44 @@
 #include "terminal.h"
 #include "vmm.h"
 
-static uint8_t scratch[4096];
-
-static int disk_read(void *buf, uint32_t offset, uint32_t size) {
+static int disk_read(ext2_fs_t *fs, void *buf, uint32_t offset, uint32_t size) {
     uint32_t lba = offset / EXT2_SECTOR_SIZE;
     uint32_t off = offset % EXT2_SECTOR_SIZE;
     uint32_t end = offset + size;
     uint32_t sectors = ((end + EXT2_SECTOR_SIZE - 1) / EXT2_SECTOR_SIZE) - lba;
 
-    if (sectors > sizeof(scratch) / EXT2_SECTOR_SIZE)
+    if (sectors > sizeof(fs->scratch) / EXT2_SECTOR_SIZE)
         return -1;
 
-    if (ata_read_sectors(lba, sectors, scratch) < 0)
+    if (ata_read_sectors(lba, sectors, fs->scratch) < 0)
         return -1;
 
     for (uint32_t i = 0; i < size; i++)
-        ((uint8_t *)buf)[i] = scratch[off + i];
+        ((uint8_t *)buf)[i] = fs->scratch[off + i];
 
     return size;
 }
 
-static int disk_write(const void *buf, uint32_t offset, uint32_t size) {
+static int disk_write(ext2_fs_t *fs, const void *buf, uint32_t offset, uint32_t size) {
     uint32_t lba = offset / EXT2_SECTOR_SIZE;
     uint32_t off = offset % EXT2_SECTOR_SIZE;
     uint32_t end = offset + size;
     uint32_t sectors = ((end + EXT2_SECTOR_SIZE - 1) / EXT2_SECTOR_SIZE) - lba;
 
-    if (sectors > sizeof(scratch) / EXT2_SECTOR_SIZE)
+    if (sectors > sizeof(fs->scratch) / EXT2_SECTOR_SIZE)
         return -1;
 
     if (off == 0 && sectors * EXT2_SECTOR_SIZE == size) {
         if (ata_write_sectors(lba, sectors, buf) < 0)
             return -1;
     } else {
-        if (ata_read_sectors(lba, sectors, scratch) < 0)
+        if (ata_read_sectors(lba, sectors, fs->scratch) < 0)
             return -1;
 
         for (uint32_t i = 0; i < size; i++)
-            scratch[off + i] = ((const uint8_t *)buf)[i];
+            fs->scratch[off + i] = ((const uint8_t *)buf)[i];
 
-        if (ata_write_sectors(lba, sectors, scratch) < 0)
+        if (ata_write_sectors(lba, sectors, fs->scratch) < 0)
             return -1;
     }
 
@@ -51,7 +49,7 @@ static int disk_write(const void *buf, uint32_t offset, uint32_t size) {
 }
 
 int ext2_init(ext2_fs_t *fs) {
-    if (disk_read(&fs->sb, EXT2_SB_OFFSET, sizeof(ext2_superblock_t)) < 0)
+    if (disk_read(fs, &fs->sb, EXT2_SB_OFFSET, sizeof(ext2_superblock_t)) < 0)
         return -1;
 
     if (fs->sb.magic != EXT2_MAGIC) {
@@ -73,7 +71,7 @@ int ext2_init(ext2_fs_t *fs) {
     if (!fs->bgdt)
         return -1;
 
-    if (disk_read(fs->bgdt, bgdt_offset, bgdt_bytes) < 0) {
+    if (disk_read(fs, fs->bgdt, bgdt_offset, bgdt_bytes) < 0) {
         kfree(fs->bgdt);
         return -1;
     }
@@ -92,18 +90,18 @@ int ext2_read_inode(ext2_fs_t *fs, uint32_t inum, ext2_inode_t *inode) {
     uint32_t byte_off = fs->bgdt[group].inode_table * fs->block_size
                        + index * inode_size;
 
-    if (disk_read(inode, byte_off, sizeof(ext2_inode_t)) < 0)
+    if (disk_read(fs, inode, byte_off, sizeof(ext2_inode_t)) < 0)
         return -1;
 
     return 0;
 }
 
 int ext2_read_block(ext2_fs_t *fs, uint32_t block_addr, void *buf) {
-    return disk_read(buf, block_addr * fs->block_size, fs->block_size);
+    return disk_read(fs, buf, block_addr * fs->block_size, fs->block_size);
 }
 
 int ext2_write_block(ext2_fs_t *fs, uint32_t block_addr, const void *buf) {
-    return disk_write(buf, block_addr * fs->block_size, fs->block_size);
+    return disk_write(fs, buf, block_addr * fs->block_size, fs->block_size);
 }
 
 int ext2_read_data_block(ext2_fs_t *fs, ext2_inode_t *inode,
@@ -123,7 +121,7 @@ int ext2_read_data_block(ext2_fs_t *fs, ext2_inode_t *inode,
         uint32_t indirect = inode->block[12];
         if (indirect == 0) return -1;
 
-        uint32_t *ind_buf = (uint32_t *)scratch;
+        uint32_t *ind_buf = (uint32_t *)fs->scratch;
         if (ext2_read_block(fs, indirect, ind_buf) < 0) return -1;
 
         uint32_t block_addr = ind_buf[iblock];
@@ -137,13 +135,13 @@ int ext2_read_data_block(ext2_fs_t *fs, ext2_inode_t *inode,
         uint32_t dindirect = inode->block[13];
         if (dindirect == 0) return -1;
 
-        uint32_t *dind_buf = (uint32_t *)scratch;
+        uint32_t *dind_buf = (uint32_t *)fs->scratch;
         if (ext2_read_block(fs, dindirect, dind_buf) < 0) return -1;
 
         uint32_t ind_block = dind_buf[iblock / ptrs_per_block];
         if (ind_block == 0) return -1;
 
-        uint32_t *ind_buf = (uint32_t *)scratch;
+        uint32_t *ind_buf = (uint32_t *)fs->scratch;
         if (ext2_read_block(fs, ind_block, ind_buf) < 0) return -1;
 
         uint32_t block_addr = ind_buf[iblock % ptrs_per_block];
@@ -263,6 +261,9 @@ int ext2_read_file(ext2_fs_t *fs, uint32_t ino, void *buf,
     uint32_t end_block = (offset + size - 1) / block_size;
     uint32_t total = 0;
 
+    uint8_t *tmp = (uint8_t *)kmalloc(block_size);
+    if (!tmp) return -1;
+
     for (uint32_t iblock = start_block; iblock <= end_block; iblock++) {
         uint32_t buf_off = total;
         uint32_t copy_off = (iblock == start_block) ? start_off : 0;
@@ -270,8 +271,8 @@ int ext2_read_file(ext2_fs_t *fs, uint32_t ino, void *buf,
         if (total + copy_len > size)
             copy_len = size - total;
 
-        uint8_t tmp[4096];
         if (ext2_read_data_block(fs, &inode, iblock, tmp) < 0) {
+            kfree(tmp);
             if (total > 0) return (int)total;
             return -1;
         }
@@ -282,6 +283,7 @@ int ext2_read_file(ext2_fs_t *fs, uint32_t ino, void *buf,
         total += copy_len;
     }
 
+    kfree(tmp);
     return (int)total;
 }
 

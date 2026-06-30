@@ -28,6 +28,48 @@ static void print_register(const char *name, uint32_t value) {
     panic_print("\r\n");
 }
 
+static void panic_stack_trace(const registers_t *r) {
+    panic_print("\r\nStack trace:\r\n");
+    panic_print("  eip: 0x");
+    panic_print_hex32(r->eip);
+
+    if (r->cs & 3) {
+        panic_print(" (user mode)\r\n");
+        return;
+    }
+    panic_print("\r\n");
+
+    uint32_t *ebp = (uint32_t *)r->ebp;
+    for (int frame = 0; frame < 16 && (uint32_t)ebp >= 0xC0000000; frame++) {
+        uint32_t ret = ebp[1];
+        panic_print("  0x");
+        panic_print_hex32(ret);
+        panic_print("\r\n");
+        ebp = (uint32_t *)ebp[0];
+    }
+}
+
+void panic_simple(const char *reason) {
+    panic_print("Panic!\r\n");
+    panic_print("Reason: ");
+    panic_print(reason);
+    panic_print("\r\n");
+
+    uint32_t ebp;
+    __asm__ __volatile__("mov %%ebp, %0" : "=r"(ebp));
+    panic_print("\r\nStack trace:\r\n");
+    uint32_t *fp = (uint32_t *)ebp;
+    for (int frame = 0; frame < 16 && (uint32_t)fp >= 0xC0000000; frame++) {
+        panic_print("  0x");
+        panic_print_hex32(fp[1]);
+        panic_print("\r\n");
+        fp = (uint32_t *)fp[0];
+    }
+
+    for (;;)
+        __asm__ __volatile__("cli; hlt");
+}
+
 void panic(const char *reason, const registers_t *r) {
     panic_print("Panic!\r\n");
     panic_print("Reason: ");
@@ -53,6 +95,8 @@ void panic(const char *reason, const registers_t *r) {
     print_register("USERESP", r->useresp);
     print_register("INT_NO", r->int_no);
     print_register("ERR_CODE", r->err_code);
+
+    panic_stack_trace(r);
 
     for (;;)
         __asm__ __volatile__("cli; hlt");

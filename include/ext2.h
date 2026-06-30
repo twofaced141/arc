@@ -118,6 +118,7 @@ typedef struct {
     uint32_t groups_count;
     ext2_bgdesc_t *bgdt;
     int present;
+    uint8_t scratch[4096];
 } ext2_fs_t;
 
 int  ext2_init(ext2_fs_t *fs);

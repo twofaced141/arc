@@ -13,11 +13,18 @@ static inline uint32_t inl(uint16_t port) {
     return ret;
 }
 
-static uint32_t pci_read(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset) {
+uint32_t pci_config_read(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset) {
     uint32_t address = 0x80000000 | ((uint32_t)bus << 16) | ((uint32_t)slot << 11)
                      | ((uint32_t)func << 8) | (offset & 0xFC);
     outl(0xCF8, address);
     return inl(0xCFC);
+}
+
+void pci_config_write(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset, uint32_t val) {
+    uint32_t address = 0x80000000 | ((uint32_t)bus << 16) | ((uint32_t)slot << 11)
+                     | ((uint32_t)func << 8) | (offset & 0xFC);
+    outl(0xCF8, address);
+    outl(0xCFC, val);
 }
 
 struct pci_class {
@@ -42,21 +49,21 @@ static const char *class_name(uint8_t c) {
 
 static void pci_scan_bus(uint16_t pbus) {
     for (uint8_t slot = 0; slot < 32; slot++) {
-        uint32_t id0 = pci_read(pbus, slot, 0, 0);
+        uint32_t id0 = pci_config_read(pbus, slot, 0, 0);
         if ((id0 & 0xFFFF) == 0xFFFF)
             continue;
 
-        uint32_t hdr = pci_read(pbus, slot, 0, 0x0C);
+        uint32_t hdr = pci_config_read(pbus, slot, 0, 0x0C);
         uint8_t max_func = (hdr & 0x800000) ? 8 : 1;
 
         for (uint8_t func = 0; func < max_func; func++) {
-            uint32_t id = pci_read(pbus, slot, func, 0);
+            uint32_t id = pci_config_read(pbus, slot, func, 0);
             uint16_t vendor = id & 0xFFFF;
             uint16_t device = id >> 16;
             if (vendor == 0xFFFF)
                 continue;
 
-            uint32_t class_rev = pci_read(pbus, slot, func, 8);
+            uint32_t class_rev = pci_config_read(pbus, slot, func, 8);
             uint8_t cls = class_rev >> 24;
             uint8_t sub = (class_rev >> 16) & 0xFF;
             uint8_t prog_if = (class_rev >> 8) & 0xFF;
@@ -67,7 +74,7 @@ static void pci_scan_bus(uint16_t pbus) {
                 class_name(cls), cls, sub, prog_if, rev);
 
             if (cls == 0x06 && sub == 0x04) {
-                uint32_t bus_reg = pci_read(pbus, slot, func, 0x18);
+                uint32_t bus_reg = pci_config_read(pbus, slot, func, 0x18);
                 uint8_t secondary = (bus_reg >> 8) & 0xFF;
                 if (secondary != pbus && secondary != 0) {
                     debug_printf("PCI: scanning secondary bus %x\r\n", secondary);

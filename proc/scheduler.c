@@ -4,14 +4,18 @@
 #include "debug.h"
 #include "vmm.h"
 #include "terminal.h"
+#include "spinlock.h"
+#include "signal.h"
 
 static process_t *process_list[MAX_PROCESSES];
 static int process_count;
 static int current_index;
 static process_t *idle_process;
 static uint32_t ticks;
+static spinlock_t sched_lock = SPINLOCK_INIT;
 
 uint32_t scheduler_syscall_no;
+uint32_t scheduler_signal_pending;
 
 static void idle_entry(void) {
     while (1) {
@@ -65,11 +69,16 @@ void scheduler_init(void) {
 }
 
 void scheduler_add_process(process_t *proc) {
-    if (process_count >= MAX_PROCESSES) return;
+    uint32_t flags;
+    spin_lock_irqsave(&sched_lock, &flags);
+    if (process_count >= MAX_PROCESSES) { spin_unlock_irqrestore(&sched_lock, flags); return; }
     process_list[process_count++] = proc;
+    spin_unlock_irqrestore(&sched_lock, flags);
 }
 
 void scheduler_remove_process(process_t *proc) {
+    uint32_t flags;
+    spin_lock_irqsave(&sched_lock, &flags);
     for (int i = 0; i < process_count; i++) {
         if (process_list[i] != proc) continue;
         if (current_index == i)
@@ -79,8 +88,10 @@ void scheduler_remove_process(process_t *proc) {
         process_list[i] = process_list[--process_count];
         if (current_index >= process_count)
             current_index = -1;
+        spin_unlock_irqrestore(&sched_lock, flags);
         return;
     }
+    spin_unlock_irqrestore(&sched_lock, flags);
 }
 
 
@@ -122,6 +133,7 @@ void *scheduler_switch(registers_t *r) {
 
         if (current_index >= 0 && current_index < process_count) {
             process_t *cur = process_list[current_index];
+            scheduler_check_signals(r);
             if (cur->state == PROC_RUNNING) {
                 cur->kernel_esp = (uint32_t)r;
                 if (cur->time_slice > 0)
@@ -138,24 +150,40 @@ void *scheduler_switch(registers_t *r) {
     }
 
     if (int_no == 128) {
+        uint32_t flags;
+        spin_lock_irqsave(&sched_lock, &flags);
         switch (scheduler_syscall_no) {
         case 2:
             if (current_index >= 0 && current_index < process_count) {
                 process_t *cur = process_list[current_index];
+                scheduler_check_signals(r);
                 cur->kernel_esp = (uint32_t)r;
                 cur->state = PROC_READY;
             }
-            return context_switch(r);
+            {
+                void *next = context_switch(r);
+                spin_unlock_irqrestore(&sched_lock, flags);
+                return next;
+            }
         case 3: {
+            scheduler_check_signals(r);
             void *next = context_switch(r);
             if (next == (void *)r)
                 next = (void *)idle_process->kernel_esp;
+            spin_unlock_irqrestore(&sched_lock, flags);
             return next;
         }
         case 6:
         case 16:
-            return context_switch(r);
+            {
+                scheduler_check_signals(r);
+                void *next = context_switch(r);
+                spin_unlock_irqrestore(&sched_lock, flags);
+                return next;
+            }
         }
+        scheduler_check_signals(r);
+        spin_unlock_irqrestore(&sched_lock, flags);
         return (void *)r;
     }
 
@@ -165,7 +193,22 @@ void *scheduler_switch(registers_t *r) {
             cur->kernel_esp = (uint32_t)r;
     }
 
+    if (current_index < 0 && process_count > 0)
+        return context_switch(r);
+    if (current_index < 0)
+        return (void *)idle_process->kernel_esp;
+
+    scheduler_check_signals(r);
     return (void *)r;
+}
+
+void scheduler_check_signals(registers_t *r) {
+    if (!scheduler_signal_pending) return;
+    process_t *proc = scheduler_current_process();
+    if (!proc) return;
+    if (r->cs != 0x1B) return;
+    scheduler_signal_pending = 0;
+    deliver_signal(r);
 }
 
 process_t *scheduler_current_process(void) {

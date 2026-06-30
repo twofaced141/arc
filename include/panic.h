@@ -4,5 +4,6 @@
 #include "isr.h"
 
 void panic(const char *reason, const registers_t *r);
+void panic_simple(const char *reason);
 
 #endif

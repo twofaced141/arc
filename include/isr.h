@@ -26,6 +26,10 @@
 #define SYSCALL_KILL     20u
 #define SYSCALL_DUP2     21u
 #define SYSCALL_PIPE     22u
+#define SYSCALL_IOCTL    23u
+#define SYSCALL_GETTIME  24u
+#define SYSCALL_SIGACTION 25u
+#define SYSCALL_SIGRETURN 26u
 
 typedef struct {
     uint32_t gs, fs, es, ds;

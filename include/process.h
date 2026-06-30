@@ -6,6 +6,8 @@
 #include "fd.h"
 #include "fs.h"
 #include "isr.h"
+#include "spinlock.h"
+#include "signal.h"
 
 #define PROC_UNUSED   0
 #define PROC_READY    1
@@ -35,13 +37,20 @@ typedef struct process {
     uint32_t parent_pid;
     uint32_t wait_child_pid;
     uint32_t cwd_inode;
+    sigaction_t sigactions[32];
+    uint32_t signal_pending;
+    uint32_t signal_blocked;
 } process_t;
+
+extern process_t processes[];
+extern spinlock_t proc_lock;
+void signal_init_process(process_t *proc);
 
 void process_init(void);
 process_t *process_create_user(uint32_t eip, const void *code, uint32_t code_size);
 process_t *process_create_elf(file_t *file);
 process_t *process_fork(process_t *parent, registers_t *r);
-int process_exec(process_t *proc, const char *path, registers_t *r, uint32_t cwd_inode);
+int process_exec(process_t *proc, const char *path, const char *args, registers_t *r, uint32_t cwd_inode);
 void process_exit(process_t *proc);
 int process_waitpid(process_t *proc, int pid, uint32_t *status, int options);
 int process_kill(int pid);

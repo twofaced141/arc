@@ -39,6 +39,25 @@ typedef struct {
     uint32_t st_size;
 } stat_t;
 
+/* ioctl requests */
+#define TIOCGWINSZ  0x5413
+#define TIOCSWINSZ  0x5414
+#define TCGETS      0x5401
+#define TCSETS      0x5402
+#define FIONREAD    0x541B
+
+struct winsize {
+    unsigned short ws_row;
+    unsigned short ws_col;
+};
+
+struct termios {
+    uint32_t c_iflag;
+    uint32_t c_oflag;
+    uint32_t c_cflag;
+    uint32_t c_lflag;
+};
+
 void fd_init_table(fd_entry_t *table);
 int  fd_open(fd_entry_t *table, const char *name, uint32_t flags, uint32_t cwd_inode);
 int  fd_close(fd_entry_t *table, int fd);
@@ -48,5 +67,6 @@ int  fd_lseek(fd_entry_t *table, int fd, int32_t offset, int whence);
 int  fd_fstat(fd_entry_t *table, int fd, stat_t *st);
 int  fd_dup2(fd_entry_t *table, int oldfd, int newfd);
 int  fd_pipe(fd_entry_t *table, int fds[2]);
+int  fd_ioctl(fd_entry_t *table, int fd, int request, void *arg);
 
 #endif

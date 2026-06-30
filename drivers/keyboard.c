@@ -1,6 +1,7 @@
 #include "keyboard.h"
 #include "idt.h"
 #include "isr.h"
+#include "spinlock.h"
 
 #define LSHIFT_MAKE  0x2A
 #define RSHIFT_MAKE  0x36
@@ -27,6 +28,7 @@ static volatile char key_buffer[256];
 static volatile uint8_t key_buffer_head;
 static volatile uint8_t key_buffer_tail;
 static volatile uint8_t shift_pressed;
+static spinlock_t keyboard_lock = SPINLOCK_INIT;
 
 static void ps2_wait_input(void) {
     while (inb(0x64) & 0x02);
@@ -102,20 +104,27 @@ void keyboard_init(void) {
 
 uint32_t keyboard_read(char *buf, uint32_t max) {
     uint32_t count = 0;
+    uint32_t flags;
+    spin_lock_irqsave(&keyboard_lock, &flags);
     while (count < max && key_buffer_head != key_buffer_tail) {
         buf[count++] = key_buffer[key_buffer_head];
         key_buffer_head = (uint8_t)(key_buffer_head + 1);
     }
+    spin_unlock_irqrestore(&keyboard_lock, flags);
     return count;
 }
 
 char keyboard_getchar(void) {
-    while (key_buffer_head == key_buffer_tail)
+    for (;;) {
+        uint32_t flags;
+        spin_lock_irqsave(&keyboard_lock, &flags);
+        if (key_buffer_head != key_buffer_tail) {
+            char c = key_buffer[key_buffer_head];
+            key_buffer_head = (uint8_t)(key_buffer_head + 1);
+            spin_unlock_irqrestore(&keyboard_lock, flags);
+            return c;
+        }
+        spin_unlock_irqrestore(&keyboard_lock, flags);
         __asm__ __volatile__("hlt");
-
-    {
-        char c = key_buffer[key_buffer_head];
-        key_buffer_head = (uint8_t)(key_buffer_head + 1);
-        return c;
     }
 }

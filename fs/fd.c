@@ -172,6 +172,55 @@ int fd_dup2(fd_entry_t *table, int oldfd, int newfd) {
     return newfd;
 }
 
+int fd_ioctl(fd_entry_t *table, int fd, int request, void *arg) {
+    if (fd < 0 || fd >= FD_MAX || table[fd].type == FD_NONE)
+        return -1;
+
+    switch (request) {
+    case TIOCGWINSZ: {
+        if (!arg) return -1;
+        struct winsize ws;
+        ws.ws_row = 25;
+        ws.ws_col = 80;
+        if (copy_to_user(arg, &ws, sizeof(ws)) < 0)
+            return -1;
+        return 0;
+    }
+    case TIOCSWINSZ: {
+        return 0;
+    }
+    case TCGETS: {
+        if (!arg) return -1;
+        struct termios t;
+        t.c_iflag = 0;
+        t.c_oflag = 0;
+        t.c_cflag = 0;
+        t.c_lflag = 0;
+        if (copy_to_user(arg, &t, sizeof(t)) < 0)
+            return -1;
+        return 0;
+    }
+    case TCSETS: {
+        return 0;
+    }
+    case FIONREAD: {
+        if (!arg) return -1;
+        uint32_t avail = 0;
+        if (table[fd].type == FD_PIPE) {
+            pipe_t *p = (pipe_t *)table[fd].file;
+            avail = p->head - p->tail;
+        } else if (table[fd].type == FD_FILE) {
+            avail = table[fd].file->size - table[fd].pos;
+        }
+        if (copy_to_user(arg, &avail, sizeof(avail)) < 0)
+            return -1;
+        return 0;
+    }
+    default:
+        return -1;
+    }
+}
+
 int fd_pipe(fd_entry_t *table, int fds[2]) {
     pipe_t *p = (pipe_t *)kmalloc(sizeof(pipe_t));
     if (!p) return -1;

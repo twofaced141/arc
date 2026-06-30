@@ -68,4 +68,8 @@ void  kfree(void *addr);
 void *vmm_temp_map(uint32_t phys);
 void  vmm_temp_unmap(void);
 
+int copy_from_user(void *dst, const void *user_src, uint32_t size);
+int copy_to_user(void *user_dst, const void *src, uint32_t size);
+int strncpy_from_user(char *dst, const char *user_src, uint32_t max_len);
+
 #endif

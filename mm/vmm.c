@@ -2,6 +2,9 @@
 #include "terminal.h"
 #include "debug.h"
 #include "panic.h"
+#include "spinlock.h"
+#include "process.h"
+#include "scheduler.h"
 
 static page_directory_t *kernel_directory;
 static page_directory_t *current_directory;
@@ -176,8 +179,10 @@ static void page_fault_handler(registers_t *r) {
     uint32_t fault_addr = read_cr2();
     uint32_t error_code = r->err_code;
 
-    /* COW: user-mode write to a present page with VMM_COW flag */
-    if ((error_code & 0x7) == 0x7) {
+    /* COW: supervisor (ring0) or user write to a present COW page.
+     * error_code & 0xB == 0x3 means: present=1, write=1, reserved=0.
+     * Matches both ring3 (0x7) and ring0 (0x3) COW faults. */
+    if ((error_code & 0xB) == 0x3) {
         uint32_t pd_idx = fault_addr >> 22;
         uint32_t pt_idx = (fault_addr >> 12) & 0x3FF;
 
@@ -191,7 +196,10 @@ static void page_fault_handler(registers_t *r) {
                 if (!new_phys)
                     panic("COW: OOM", r);
 
-                uint8_t tmp[4096];
+                uint8_t *tmp = (uint8_t *)kmalloc(4096);
+                if (!tmp)
+                    panic("COW: kmalloc OOM", r);
+
                 uint8_t *src = (uint8_t *)vmm_temp_map(old_phys);
                 for (uint32_t i = 0; i < 4096; i++) tmp[i] = src[i];
                 vmm_temp_unmap();
@@ -199,6 +207,8 @@ static void page_fault_handler(registers_t *r) {
                 uint8_t *dst = (uint8_t *)vmm_temp_map(new_phys);
                 for (uint32_t i = 0; i < 4096; i++) dst[i] = tmp[i];
                 vmm_temp_unmap();
+
+                kfree(tmp);
 
                 pmm_refcount_dec(old_phys);
 
@@ -215,6 +225,25 @@ static void page_fault_handler(registers_t *r) {
     if (fault_handler) {
         fault_handler(fault_addr, error_code);
         return;
+    }
+
+    /* SIGSEGV: unhandled page fault in user mode */
+    if (error_code & 0x4) {
+        process_t *cur = scheduler_current_process();
+        if (cur) {
+            debug_print("SIGSEGV: pid=");
+            debug_print_hex32(cur->pid);
+            debug_print(" addr=");
+            debug_print_hex32(fault_addr);
+            debug_print(" eip=");
+            debug_print_hex32(r->eip);
+            debug_print(" err=");
+            debug_print_hex32(error_code);
+            debug_print("\r\n");
+            cur->signal_pending |= (1 << SIGSEGV);
+            scheduler_signal_pending = 1;
+            return;
+        }
     }
 
     debug_print("PAGE FAULT at 0x");
@@ -243,6 +272,7 @@ typedef struct heap_block {
 static heap_block_t *heap_free_list;
 static uint32_t heap_mapped_end;
 static uint32_t heap_brk;
+static spinlock_t heap_lock = SPINLOCK_INIT;
 
 static void heap_map_until(uint32_t addr) {
     while (heap_mapped_end < addr) {
@@ -276,6 +306,9 @@ void *kmalloc(uint32_t size) {
     if (size == 0)
         return NULL;
 
+    uint32_t flags;
+    spin_lock_irqsave(&heap_lock, &flags);
+
     uint32_t need = HEAP_HEADER_SIZE + HEAP_ALIGN(size);
     if (need < HEAP_MIN_BLOCK)
         need = HEAP_MIN_BLOCK;
@@ -303,6 +336,7 @@ void *kmalloc(uint32_t size) {
                 else
                     heap_free_list = b->next;
             }
+            spin_unlock_irqrestore(&heap_lock, flags);
             return (void *)((uint8_t *)b + HEAP_HEADER_SIZE);
         }
         prev = b;
@@ -311,8 +345,10 @@ void *kmalloc(uint32_t size) {
 
     uint32_t addr = heap_brk;
     uint32_t new_brk = addr + need;
-    if (new_brk >= HEAP_END)
+    if (new_brk >= HEAP_END) {
+        spin_unlock_irqrestore(&heap_lock, flags);
         return NULL;
+    }
 
     heap_map_until(new_brk);
     heap_brk = new_brk;
@@ -320,6 +356,7 @@ void *kmalloc(uint32_t size) {
     heap_block_t *block = (heap_block_t *)addr;
     block->size = need | 0;
     block->next = NULL;
+    spin_unlock_irqrestore(&heap_lock, flags);
     return (void *)((uint8_t *)block + HEAP_HEADER_SIZE);
 }
 
@@ -337,6 +374,9 @@ void *kcalloc(uint32_t count, uint32_t size) {
 void kfree(void *addr) {
     if (!addr)
         return;
+
+    uint32_t flags;
+    spin_lock_irqsave(&heap_lock, &flags);
 
     heap_block_t *b = (heap_block_t *)((uint8_t *)addr - HEAP_HEADER_SIZE);
     uint32_t block_size = b->size & HEAP_SIZE_MASK;
@@ -360,6 +400,8 @@ void kfree(void *addr) {
     heap_coalesce(b);
     if (prev && (uint32_t)prev + (prev->size & HEAP_SIZE_MASK) == (uint32_t)b)
         heap_coalesce(prev);
+
+    spin_unlock_irqrestore(&heap_lock, flags);
 }
 
 void *vmm_temp_map(uint32_t phys) {
@@ -370,6 +412,64 @@ void *vmm_temp_map(uint32_t phys) {
 void vmm_temp_unmap(void) {
     vmm_unmap_page(kernel_directory, TEMP_VADDR);
     invlpg(TEMP_VADDR);
+}
+
+int copy_from_user(void *dst, const void *user_src, uint32_t size) {
+    if (size == 0) return 0;
+    uint32_t addr = (uint32_t)user_src;
+    if (addr + size < addr) return -1;
+    if (addr + size > 0xC0000000) return -1;
+
+    page_directory_t *dir = vmm_get_current_directory();
+    uint32_t end_page = (addr + size + PAGE_SIZE - 1) & ~0xFFF;
+    for (uint32_t page = addr & ~0xFFF; page < end_page; page += PAGE_SIZE) {
+        if (!vmm_is_page_present(dir, page)) return -1;
+    }
+
+    for (uint32_t i = 0; i < size; i++)
+        ((uint8_t *)dst)[i] = ((const uint8_t *)user_src)[i];
+    return 0;
+}
+
+int copy_to_user(void *user_dst, const void *src, uint32_t size) {
+    if (size == 0) return 0;
+    uint32_t addr = (uint32_t)user_dst;
+    if (addr + size < addr) return -1;
+    if (addr + size > 0xC0000000) return -1;
+
+    page_directory_t *dir = vmm_get_current_directory();
+    uint32_t end_page = (addr + size + PAGE_SIZE - 1) & ~0xFFF;
+    for (uint32_t page = addr & ~0xFFF; page < end_page; page += PAGE_SIZE) {
+        int flags = vmm_get_page_flags(dir, page);
+        if (!(flags & VMM_PRESENT)) return -1;
+        if (!(flags & VMM_WRITABLE) && !(flags & VMM_COW)) return -1;
+    }
+
+    for (uint32_t i = 0; i < size; i++)
+        ((uint8_t *)user_dst)[i] = ((const uint8_t *)src)[i];
+    return 0;
+}
+
+int strncpy_from_user(char *dst, const char *user_src, uint32_t max_len) {
+    if (max_len == 0) return -1;
+    uint32_t addr = (uint32_t)user_src;
+    if (addr >= 0xC0000000) return -1;
+    uint32_t avail = 0xC0000000 - addr;
+    if (max_len > avail) max_len = avail;
+    if (max_len == 0) return -1;
+
+    page_directory_t *dir = vmm_get_current_directory();
+    uint32_t end_page = (addr + max_len + PAGE_SIZE - 1) & ~0xFFF;
+    for (uint32_t page = addr & ~0xFFF; page < end_page; page += PAGE_SIZE) {
+        if (!vmm_is_page_present(dir, page)) return -1;
+    }
+
+    for (uint32_t i = 0; i < max_len; i++) {
+        char c = ((const char *)user_src)[i];
+        dst[i] = c;
+        if (c == '\0') return (int)(i + 1);
+    }
+    return -1;
 }
 
 void vmm_fork_cow_pages(page_directory_t *parent_dir, page_directory_t *child_dir) {

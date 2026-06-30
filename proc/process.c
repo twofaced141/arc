@@ -9,9 +9,11 @@
 #include "fs.h"
 #include "elf32.h"
 #include "scheduler.h"
+#include "signal.h"
 
-static process_t processes[MAX_PROCESSES];
+process_t processes[MAX_PROCESSES];
 static uint32_t next_pid = 1;
+spinlock_t proc_lock = SPINLOCK_INIT;
 
 void process_init(void) {
     for (int i = 0; i < MAX_PROCESSES; i++) {
@@ -24,16 +26,22 @@ void process_init(void) {
 
 process_t *process_create_user(uint32_t eip, const void *code, uint32_t code_size) {
     process_t *proc = NULL;
+
+    uint32_t flags;
+    spin_lock_irqsave(&proc_lock, &flags);
+
     for (int i = 0; i < MAX_PROCESSES; i++) {
         if (processes[i].state == PROC_UNUSED) {
             proc = &processes[i];
             break;
         }
     }
-    if (!proc) return NULL;
+    if (!proc) { spin_unlock_irqrestore(&proc_lock, flags); return NULL; }
 
     proc->pid = next_pid++;
     proc->state = PROC_READY;
+
+    spin_unlock_irqrestore(&proc_lock, flags);
     proc->time_slice = 5;
     proc->sleep_until = 0;
 
@@ -142,22 +150,27 @@ process_t *process_create_elf(file_t *file) {
     fs_read(file, phdrs, ehdr.e_phoff, phdr_bytes);
 
     process_t *proc = NULL;
+
+    uint32_t sflags;
+    spin_lock_irqsave(&proc_lock, &sflags);
     for (int i = 0; i < MAX_PROCESSES; i++) {
         if (processes[i].state == PROC_UNUSED) {
             proc = &processes[i];
             break;
         }
     }
-    if (!proc) { kfree(phdrs); return NULL; }
+    if (!proc) { spin_unlock_irqrestore(&proc_lock, sflags); kfree(phdrs); return NULL; }
 
     proc->pid = next_pid++;
     proc->state = PROC_READY;
+    spin_unlock_irqrestore(&proc_lock, sflags);
     proc->time_slice = 5;
     proc->sleep_until = 0;
     proc->exit_code = 0;
     proc->parent_pid = 0;
     proc->wait_child_pid = 0;
     proc->cwd_inode = EXT2_ROOT_INO;
+    signal_init_process(proc);
 
     proc->kernel_stack = (uint8_t *)pmm_alloc_pages(PROC_KSTACK_SIZE / PAGE_SIZE);
     if (!proc->kernel_stack) { proc->state = PROC_UNUSED; kfree(phdrs); return NULL; }
@@ -257,7 +270,7 @@ err_cleanup:
     return NULL;
 }
 
-int process_exec(process_t *proc, const char *path, registers_t *r, uint32_t cwd_inode) {
+int process_exec(process_t *proc, const char *path, const char *args, registers_t *r, uint32_t cwd_inode) {
     file_t *file = fs_open(path, cwd_inode);
     if (!file) {
         return -1;
@@ -324,9 +337,21 @@ int process_exec(process_t *proc, const char *path, registers_t *r, uint32_t cwd
     vmm_map_page(proc->page_dir, user_stack_phys, user_stack_top - PAGE_SIZE,
                  VMM_PRESENT | VMM_WRITABLE | VMM_USER);
 
+    uint8_t *stack_page = (uint8_t *)vmm_temp_map(user_stack_phys);
+    stack_page[0] = '\0';
+    if (args) {
+        uint32_t i = 0;
+        while (args[i] && i < PAGE_SIZE - 1) {
+            stack_page[i] = args[i];
+            i++;
+        }
+        stack_page[i] = '\0';
+    }
+    vmm_temp_unmap();
+
     r->eax = 0;
     r->ebx = 0;
-    r->ecx = 0;
+    r->ecx = 0xBFFFF000;
     r->edx = 0;
     r->esi = 0;
     r->edi = 0;
@@ -342,32 +367,46 @@ int process_exec(process_t *proc, const char *path, registers_t *r, uint32_t cwd
     for (int i = 0; i < FD_MAX; i++)
         fd_close(proc->fd_table, i);
     fd_init_table(proc->fd_table);
+    signal_init_process(proc);
 
     return 0;
 }
 
 process_t *process_fork(process_t *parent, registers_t *r) {
     process_t *child = NULL;
+
+    uint32_t flags;
+    spin_lock_irqsave(&proc_lock, &flags);
     for (int i = 0; i < MAX_PROCESSES; i++) {
         if (processes[i].state == PROC_UNUSED) {
             child = &processes[i];
             break;
         }
     }
-    if (!child) return NULL;
+    if (!child) { spin_unlock_irqrestore(&proc_lock, flags); return NULL; }
 
     child->pid = next_pid++;
     child->state = PROC_READY;
+    spin_unlock_irqrestore(&proc_lock, flags);
     child->time_slice = 5;
     child->sleep_until = 0;
     child->exit_code = 0;
     child->parent_pid = parent->pid;
     child->wait_child_pid = 0;
     child->cwd_inode = parent->cwd_inode;
+    for (int i = 0; i < 32; i++)
+        child->sigactions[i] = parent->sigactions[i];
+    child->signal_pending = 0;
+    child->signal_blocked = parent->signal_blocked;
     child->eip = parent->eip;
 
     child->kernel_stack = (uint8_t *)pmm_alloc_pages(PROC_KSTACK_SIZE / PAGE_SIZE);
-    if (!child->kernel_stack) { child->state = PROC_UNUSED; return NULL; }
+    if (!child->kernel_stack) {
+        uint32_t f2; spin_lock_irqsave(&proc_lock, &f2);
+        child->state = PROC_UNUSED;
+        spin_unlock_irqrestore(&proc_lock, f2);
+        return NULL;
+    }
     child->kernel_stack_top = (uint32_t)child->kernel_stack + PROC_KSTACK_SIZE;
 
     fd_init_table(child->fd_table);
@@ -385,7 +424,9 @@ process_t *process_fork(process_t *parent, registers_t *r) {
     child->page_dir = vmm_create_directory();
     if (!child->page_dir) {
         pmm_free_pages(child->kernel_stack, PROC_KSTACK_SIZE / PAGE_SIZE);
+        uint32_t f2; spin_lock_irqsave(&proc_lock, &f2);
         child->state = PROC_UNUSED;
+        spin_unlock_irqrestore(&proc_lock, f2);
         return NULL;
     }
 
@@ -409,28 +450,35 @@ process_t *process_fork(process_t *parent, registers_t *r) {
 int process_waitpid(process_t *proc, int pid, uint32_t *status, int options) {
     if (!proc) return -1;
 
-    while (1) {
-        for (int i = 0; i < MAX_PROCESSES; i++) {
-            process_t *child = &processes[i];
-            if (child->state == PROC_UNUSED) continue;
-            if ((int)child->parent_pid != (int)proc->pid) continue;
-            if (pid != -1 && (int)child->pid != pid) continue;
+    uint32_t flags;
+    spin_lock_irqsave(&proc_lock, &flags);
 
-            if (child->state == PROC_ZOMBIE) {
-                if (status) *status = child->exit_code;
-                child->state = PROC_UNUSED;
-                return child->pid;
-            }
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        process_t *child = &processes[i];
+        if (child->state == PROC_UNUSED) continue;
+        if ((int)child->parent_pid != (int)proc->pid) continue;
+        if (pid != -1 && (int)child->pid != pid) continue;
 
-            if (options & 1) return 0;
-            proc->wait_child_pid = pid == -1 ? 0xFFFFFFFF : (uint32_t)pid;
-            return -2;
+        if (child->state == PROC_ZOMBIE) {
+            if (status) *status = child->exit_code;
+            child->state = PROC_UNUSED;
+            spin_unlock_irqrestore(&proc_lock, flags);
+            return child->pid;
         }
-        return -1;
+
+        if (options & 1) { spin_unlock_irqrestore(&proc_lock, flags); return 0; }
+        proc->wait_child_pid = pid == -1 ? 0xFFFFFFFF : (uint32_t)pid;
+        spin_unlock_irqrestore(&proc_lock, flags);
+        return -2;
     }
+
+    spin_unlock_irqrestore(&proc_lock, flags);
+    return -1;
 }
 
 int process_kill(int pid) {
+    uint32_t flags;
+    spin_lock_irqsave(&proc_lock, &flags);
     for (int i = 0; i < MAX_PROCESSES; i++) {
         process_t *p = &processes[i];
         if (p->state == PROC_UNUSED || p->state == PROC_ZOMBIE) continue;
@@ -445,8 +493,9 @@ int process_kill(int pid) {
         }
 
         if (p->page_dir) {
-            vmm_clear_user_pages(p->page_dir);
-            pmm_free_page(p->page_dir);
+            if (p->page_dir == vmm_get_current_directory())
+                vmm_switch_directory(vmm_get_kernel_directory());
+            vmm_free_directory(p->page_dir);
             p->page_dir = NULL;
         }
 
@@ -465,8 +514,10 @@ int process_kill(int pid) {
         }
 
         scheduler_remove_process(p);
+        spin_unlock_irqrestore(&proc_lock, flags);
         return 0;
     }
+    spin_unlock_irqrestore(&proc_lock, flags);
     return -1;
 }
 
@@ -481,22 +532,27 @@ void process_exit(process_t *proc) {
     }
 
     if (proc->page_dir) {
-        vmm_clear_user_pages(proc->page_dir);
-        pmm_free_page(proc->page_dir);
+        vmm_switch_directory(vmm_get_kernel_directory());
+        vmm_free_directory(proc->page_dir);
         proc->page_dir = NULL;
     }
 
-    proc->state = PROC_ZOMBIE;
+    {
+        uint32_t flags;
+        spin_lock_irqsave(&proc_lock, &flags);
+        proc->state = PROC_ZOMBIE;
 
-    for (int i = 0; i < MAX_PROCESSES; i++) {
-        process_t *p = &processes[i];
-        if (p->state == PROC_UNUSED) continue;
-        if (p->pid != proc->parent_pid) continue;
-        if (p->state == PROC_BLOCKED &&
-            (p->wait_child_pid == proc->pid || p->wait_child_pid == 0xFFFFFFFF)) {
-            p->state = PROC_READY;
-            p->wait_child_pid = 0;
+        for (int i = 0; i < MAX_PROCESSES; i++) {
+            process_t *p = &processes[i];
+            if (p->state == PROC_UNUSED) continue;
+            if (p->pid != proc->parent_pid) continue;
+            if (p->state == PROC_BLOCKED &&
+                (p->wait_child_pid == proc->pid || p->wait_child_pid == 0xFFFFFFFF)) {
+                p->state = PROC_READY;
+                p->wait_child_pid = 0;
+            }
+            break;
         }
-        break;
+        spin_unlock_irqrestore(&proc_lock, flags);
     }
 }
