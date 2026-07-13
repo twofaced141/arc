@@ -6,7 +6,15 @@ header_start:
     .long header_end - header_start
     .long 0x100000000 - (0xE85250D6 + 0 + (header_end - header_start))
 
-    .align 8
+    .balign 8
+    .word 5                             # Тип тега: 5 (Framebuffer request)
+    .word 0                             # Флаги: 0 (необязательный, GRUB загрузит ОС даже если режим не поддерживается)
+    .long 20                            # Размер тега: 20 байт
+    .long 1024                          # Предпочтительная ширина (Width)
+    .long 768                           # Предпочтительная высота (Height)
+    .long 32                            # Глубина цвета (BPP - Bits Per Pixel)
+
+    .balign 8
     .word 0
     .word 0
     .long 8

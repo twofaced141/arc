@@ -18,6 +18,13 @@ void debug_putchar(char c) {
     outb(0x3F8, c);
 }
 
+void debug_write(const char *buf, unsigned int count) {
+    for (unsigned int i = 0; i < count; i++) {
+        while (!(inb(0x3F8 + 5) & 0x20));
+        outb(0x3F8, buf[i]);
+    }
+}
+
 void debug_print(const char *s) {
     while (*s)
         debug_putchar(*s++);

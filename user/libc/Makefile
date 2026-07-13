@@ -8,7 +8,7 @@ CFLAGS   = -ffreestanding -nostdlib -nostartfiles -nodefaultlibs \
 AR       = ar
 ARFLAGS  = rcs
 
-SRCS   = string.c stdio.c stdlib.c ctype.c errno.c unistd.c
+SRCS   = string.c stdio.c stdlib.c ctype.c errno.c unistd.c dirent.c setjmp.c time.c
 OBJS   = $(SRCS:.c=.o)
 LIBC   = libc.a
 CRT0_O = crt0.o

@@ -10,12 +10,56 @@
 #include "elf32.h"
 #include "scheduler.h"
 #include "signal.h"
+#include "fpu.h"
 
-process_t processes[MAX_PROCESSES];
+static int setup_tls(page_directory_t *dir) {
+    uint32_t tls_phys = (uint32_t)pmm_alloc_page();
+    if (!tls_phys) return -1;
+    uint8_t *page = (uint8_t *)vmm_temp_map(tls_phys);
+    for (int i = 0; i < 4096; i++) page[i] = 0;
+    /* GLIBC/i386 TLS layout (tcbhead_t):
+     *   0x00: tcb (self ptr)
+     *   0x08: dtv (dynamic thread vec)
+     *   0x10: sysinfo (vsyscall addr)
+     *   0x14: stack_guard (canary)
+     *   0x18: multiple_threads
+     *   0x78: cleanup level
+     *   0x100: int $0x80; ret trampoline */
+    uint32_t tls_self = USER_TLS_VADDR;
+    /* tcb */
+    page[0x00] = tls_self & 0xFF; page[0x01] = (tls_self >> 8) & 0xFF;
+    page[0x02] = (tls_self >> 16) & 0xFF; page[0x03] = (tls_self >> 24) & 0xFF;
+    /* dtv - point to TLS page itself (zeroed, acts as minimal dtv) */
+    page[0x08] = tls_self & 0xFF; page[0x09] = (tls_self >> 8) & 0xFF;
+    page[0x0A] = (tls_self >> 16) & 0xFF; page[0x0B] = (tls_self >> 24) & 0xFF;
+    /* sysinfo - address of int $0x80; ret trampoline at offset 0x100 */
+    uint32_t sysinfo = USER_TLS_VADDR + 0x100;
+    page[0x10] = sysinfo & 0xFF; page[0x11] = (sysinfo >> 8) & 0xFF;
+    page[0x12] = (sysinfo >> 16) & 0xFF; page[0x13] = (sysinfo >> 24) & 0xFF;
+    /* stack canary */
+    page[0x14] = 0xDE;
+    page[0x15] = 0xAD;
+    page[0x16] = 0xBE;
+    page[0x17] = 0xEF;
+    /* int $0x80; ret trampoline at offset 0x100 */
+    page[0x100] = 0xCD;
+    page[0x101] = 0x80;
+    page[0x102] = 0xC3;
+    vmm_temp_unmap();
+    vmm_map_page(dir, tls_phys, USER_TLS_VADDR, VMM_PRESENT | VMM_WRITABLE | VMM_USER);
+    return 0;
+}
+
+process_t *processes;
 static uint32_t next_pid = 1;
 spinlock_t proc_lock = SPINLOCK_INIT;
 
 void process_init(void) {
+    processes = (process_t *)kmalloc(sizeof(process_t) * MAX_PROCESSES);
+    if (!processes) {
+        debug_print("process: failed to allocate process table\r\n");
+        return;
+    }
     for (int i = 0; i < MAX_PROCESSES; i++) {
         processes[i].pid = 0;
         processes[i].state = PROC_UNUSED;
@@ -40,6 +84,12 @@ process_t *process_create_user(uint32_t eip, const void *code, uint32_t code_siz
 
     proc->pid = next_pid++;
     proc->state = PROC_READY;
+    {
+        const char *d = "user_prog";
+        int ni = 0;
+        while (d[ni] && ni < 63) { proc->name[ni] = d[ni]; ni++; }
+        proc->name[ni] = '\0';
+    }
 
     spin_unlock_irqrestore(&proc_lock, flags);
     proc->time_slice = 5;
@@ -50,13 +100,20 @@ process_t *process_create_user(uint32_t eip, const void *code, uint32_t code_siz
     proc->kernel_stack_top = (uint32_t)proc->kernel_stack + PROC_KSTACK_SIZE;
 
     fd_init_table(proc->fd_table);
+    proc->heap_initial = USER_HEAP_START;
     proc->heap_break = USER_HEAP_START;
     proc->heap_mapped_end = USER_HEAP_START;
     proc->mmap_brk = USER_MMAP_START;
+    proc->alarm_ticks = 0;
+    proc->alarm_remaining = 0;
     proc->uid = 0;
     proc->gid = 0;
     proc->euid = 0;
     proc->egid = 0;
+    proc->umask = 0022;
+    proc->nice = 0;
+    proc->is_linux_syscall = 0;
+    fpu_init_state(proc->fpu_state);
 
     proc->page_dir = vmm_create_directory();
     if (!proc->page_dir) { pmm_free_pages(proc->kernel_stack, PROC_KSTACK_SIZE / PAGE_SIZE); proc->state = PROC_UNUSED; return NULL; }
@@ -100,11 +157,13 @@ process_t *process_create_user(uint32_t eip, const void *code, uint32_t code_siz
         vmm_map_page(proc->page_dir, phys, user_stack_top - (si + 1) * PAGE_SIZE,
                      VMM_PRESENT | VMM_WRITABLE | VMM_USER);
     }
+    if (setup_tls(proc->page_dir) < 0)
+        goto err_code_pages;
     proc->user_esp = user_stack_top;
     proc->eip = eip;
 
     registers_t *frame = (registers_t *)(proc->kernel_stack_top - sizeof(registers_t));
-    frame->gs = 0x23;
+    frame->gs = TLS_SEL;
     frame->fs = 0x23;
     frame->es = 0x23;
     frame->ds = 0x23;
@@ -171,6 +230,15 @@ process_t *process_create_elf(file_t *file) {
     proc->pid = next_pid++;
     proc->state = PROC_READY;
     spin_unlock_irqrestore(&proc_lock, sflags);
+    {
+        int ni = 0;
+        int last = 0;
+        for (int fi = 0; file->name[fi] && fi < 63; fi++) {
+            if (file->name[fi] == '/') last = fi + 1;
+        }
+        while (file->name[last] && ni < 63) proc->name[ni++] = file->name[last++];
+        proc->name[ni] = '\0';
+    }
     proc->time_slice = 5;
     proc->sleep_until = 0;
     proc->exit_code = 0;
@@ -178,17 +246,25 @@ process_t *process_create_elf(file_t *file) {
     proc->wait_child_pid = 0;
     proc->cwd_inode = EXT2_ROOT_INO;
     proc->mmap_brk = USER_MMAP_START;
+    proc->alarm_ticks = 0;
+    proc->alarm_remaining = 0;
     proc->uid = 0;
     proc->gid = 0;
     proc->euid = 0;
     proc->egid = 0;
+    proc->umask = 0022;
+    proc->nice = 0;
+    proc->pgid = proc->pid;
+    proc->is_linux_syscall = 0;
     signal_init_process(proc);
+    fpu_init_state(proc->fpu_state);
 
     proc->kernel_stack = (uint8_t *)pmm_alloc_pages(PROC_KSTACK_SIZE / PAGE_SIZE);
     if (!proc->kernel_stack) { proc->state = PROC_UNUSED; kfree(phdrs); return NULL; }
     proc->kernel_stack_top = (uint32_t)proc->kernel_stack + PROC_KSTACK_SIZE;
 
     fd_init_table(proc->fd_table);
+    proc->heap_initial = USER_HEAP_START;
     proc->heap_break = USER_HEAP_START;
     proc->heap_mapped_end = USER_HEAP_START;
 
@@ -247,11 +323,13 @@ process_t *process_create_elf(file_t *file) {
         vmm_map_page(proc->page_dir, phys, user_stack_top - (si + 1) * PAGE_SIZE,
                      VMM_PRESENT | VMM_WRITABLE | VMM_USER);
     }
+    if (setup_tls(proc->page_dir) < 0)
+        goto err_cleanup;
     proc->user_esp = user_stack_top;
     proc->eip = entry;
 
     registers_t *frame = (registers_t *)(proc->kernel_stack_top - sizeof(registers_t));
-    frame->gs = 0x23;
+    frame->gs = TLS_SEL;
     frame->fs = 0x23;
     frame->es = 0x23;
     frame->ds = 0x23;
@@ -303,8 +381,39 @@ int process_exec(process_t *proc, const char *path, const char *args, registers_
     Elf32_Phdr *phdrs = (Elf32_Phdr *)kmalloc(phdr_bytes);
     if (!phdrs) return -1;
     fs_read(file, phdrs, ehdr.e_phoff, phdr_bytes);
+
+    uint32_t total_pages = 1 + USER_STACK_PAGES;
+    uint32_t max_seg_end = 0;
+    for (uint32_t i = 0; i < ehdr.e_phnum; i++) {
+        if (phdrs[i].p_type != PT_LOAD) continue;
+        uint32_t seg_end_mem = phdrs[i].p_vaddr + phdrs[i].p_memsz;
+        /* Check for 32-bit overflow */
+        if (seg_end_mem < phdrs[i].p_vaddr) { kfree(phdrs); return -1; }
+        /* Must not overlap kernel space */
+        if (seg_end_mem > 0xC0000000) { kfree(phdrs); return -1; }
+        uint32_t page_start = phdrs[i].p_vaddr & ~0xFFF;
+        uint32_t page_end = (seg_end_mem + PAGE_SIZE - 1) & ~0xFFF;
+        total_pages += (page_end - page_start) / PAGE_SIZE;
+        if (seg_end_mem > max_seg_end) max_seg_end = seg_end_mem;
+    }
+
+    uint32_t *pages = (uint32_t *)kmalloc(total_pages * sizeof(uint32_t));
+    if (!pages) { kfree(phdrs); return -1; }
+    uint32_t np = 0;
+    for (; np < total_pages; np++) {
+        uint32_t phys = (uint32_t)pmm_alloc_page();
+        if (!phys) {
+            for (uint32_t j = 0; j < np; j++)
+                pmm_free_page((void *)pages[j]);
+            kfree(pages); kfree(phdrs);
+            return -1;
+        }
+        pages[np] = phys;
+    }
+
     vmm_clear_user_pages(proc->page_dir);
 
+    uint32_t page_idx = 0;
     uint32_t entry = ehdr.e_entry;
 
     for (uint32_t i = 0; i < ehdr.e_phnum; i++) {
@@ -320,9 +429,7 @@ int process_exec(process_t *proc, const char *path, const char *args, registers_
         if (phdrs[i].p_flags & PF_W) page_flags |= VMM_WRITABLE;
 
         for (uint32_t vaddr = page_start; vaddr < page_end; vaddr += PAGE_SIZE) {
-            uint32_t phys = (uint32_t)pmm_alloc_page();
-            if (!phys) { kfree(phdrs); return -1; }
-
+            uint32_t phys = pages[page_idx++];
             (void)vmm_map_page(proc->page_dir, phys, vaddr, page_flags);
 
             uint8_t *page = (uint8_t *)vmm_temp_map(phys);
@@ -348,11 +455,46 @@ int process_exec(process_t *proc, const char *path, const char *args, registers_
     uint32_t user_stack_top = 0xC0000000;
     uint32_t stack_top_phys = 0;
     for (int si = 0; si < USER_STACK_PAGES; si++) {
-        uint32_t phys = (uint32_t)pmm_alloc_page();
-        if (!phys) return -1;
+        uint32_t phys = pages[page_idx++];
         vmm_map_page(proc->page_dir, phys, user_stack_top - (si + 1) * PAGE_SIZE,
                      VMM_PRESENT | VMM_WRITABLE | VMM_USER);
         if (si == 0) stack_top_phys = phys;
+    }
+
+    {
+        uint32_t tls_phys = pages[page_idx++];
+        uint8_t *tpage = (uint8_t *)vmm_temp_map(tls_phys);
+        for (int i = 0; i < 4096; i++) tpage[i] = 0;
+        uint32_t tls_self = USER_TLS_VADDR;
+        /* tcb at offset 0x00 */
+        tpage[0x00] = tls_self & 0xFF; tpage[0x01] = (tls_self >> 8) & 0xFF;
+        tpage[0x02] = (tls_self >> 16) & 0xFF; tpage[0x03] = (tls_self >> 24) & 0xFF;
+        /* dtv at offset 0x08 */
+        tpage[0x08] = tls_self & 0xFF; tpage[0x09] = (tls_self >> 8) & 0xFF;
+        tpage[0x0A] = (tls_self >> 16) & 0xFF; tpage[0x0B] = (tls_self >> 24) & 0xFF;
+        /* sysinfo at offset 0x10 - address of int $0x80; ret trampoline */
+        uint32_t sysinfo = USER_TLS_VADDR + 0x100;
+        tpage[0x10] = sysinfo & 0xFF; tpage[0x11] = (sysinfo >> 8) & 0xFF;
+        tpage[0x12] = (sysinfo >> 16) & 0xFF; tpage[0x13] = (sysinfo >> 24) & 0xFF;
+        /* stack canary at offset 0x14 */
+        tpage[0x14] = 0xDE; tpage[0x15] = 0xAD; tpage[0x16] = 0xBE; tpage[0x17] = 0xEF;
+        /* int $0x80; ret trampoline at offset 0x100 */
+        tpage[0x100] = 0xCD; tpage[0x101] = 0x80; tpage[0x102] = 0xC3;
+        vmm_temp_unmap();
+        int tls_ret = vmm_map_page(proc->page_dir, tls_phys, USER_TLS_VADDR, VMM_PRESENT | VMM_WRITABLE | VMM_USER);
+
+    }
+
+    kfree(pages);
+
+    {
+        int ni = 0;
+        int last = 0;
+        for (int pi = 0; path[pi] && pi < 63; pi++) {
+            if (path[pi] == '/') last = pi + 1;
+        }
+        while (path[last] && ni < 63) proc->name[ni++] = path[last++];
+        proc->name[ni] = '\0';
     }
 
     uint8_t *stack_page = (uint8_t *)vmm_temp_map(stack_top_phys);
@@ -367,6 +509,7 @@ int process_exec(process_t *proc, const char *path, const char *args, registers_
     }
     vmm_temp_unmap();
 
+    r->gs = TLS_SEL;
     r->eax = 0;
     r->ebx = 0;
     r->ecx = 0xBFFFF000;
@@ -380,13 +523,16 @@ int process_exec(process_t *proc, const char *path, const char *args, registers_
 
     proc->eip = entry;
     proc->user_esp = user_stack_top;
-    proc->heap_break = USER_HEAP_START;
-    proc->heap_mapped_end = USER_HEAP_START;
+    proc->is_linux_syscall = (entry != 0x08000000) ? 1 : 0;
+    {
+        uint32_t heap_start = max_seg_end ? ((max_seg_end + PAGE_SIZE - 1) & ~0xFFF) : USER_HEAP_START;
+        proc->heap_initial = heap_start;
+        proc->heap_break = heap_start;
+        proc->heap_mapped_end = heap_start;
+    }
     proc->mmap_brk = USER_MMAP_START;
-    for (int i = 0; i < FD_MAX; i++)
-        fd_close(proc->fd_table, i);
-    fd_init_table(proc->fd_table);
     signal_init_process(proc);
+    fpu_init_state(proc->fpu_state);
 
     return 0;
 }
@@ -414,12 +560,25 @@ process_t *process_fork(process_t *parent, registers_t *r) {
     child->wait_child_pid = 0;
     child->cwd_inode = parent->cwd_inode;
     child->mmap_brk = parent->mmap_brk;
+    {
+        int ni = 0;
+        while (parent->name[ni] && ni < 63) { child->name[ni] = parent->name[ni]; ni++; }
+        child->name[ni] = '\0';
+    }
+    child->alarm_ticks = 0;
+    child->alarm_remaining = 0;
     child->uid = parent->uid;
     child->gid = parent->gid;
     child->euid = parent->euid;
     child->egid = parent->egid;
+    child->umask = parent->umask;
+    child->nice = parent->nice;
+    child->pgid = parent->pgid;
+    child->is_linux_syscall = parent->is_linux_syscall;
     for (int i = 0; i < 32; i++)
         child->sigactions[i] = parent->sigactions[i];
+    for (int fi = 0; fi < FPU_STATE_SIZE; fi++)
+        child->fpu_state[fi] = parent->fpu_state[fi];
     child->signal_pending = 0;
     child->signal_blocked = parent->signal_blocked;
     child->eip = parent->eip;
@@ -442,6 +601,7 @@ process_t *process_fork(process_t *parent, registers_t *r) {
         }
     }
 
+    child->heap_initial = parent->heap_initial;
     child->heap_break = parent->heap_break;
     child->heap_mapped_end = parent->heap_mapped_end;
 
@@ -485,6 +645,15 @@ int process_waitpid(process_t *proc, int pid, uint32_t *status, int options) {
 
         if (child->state == PROC_ZOMBIE) {
             if (status) *status = child->exit_code;
+            if (child->kernel_stack) {
+                pmm_free_pages(child->kernel_stack, PROC_KSTACK_SIZE / PAGE_SIZE);
+                child->kernel_stack = NULL;
+            }
+            if (child->page_dir) {
+                vmm_free_directory(child->page_dir);
+                child->page_dir = NULL;
+            }
+            scheduler_remove_process(child);
             child->state = PROC_UNUSED;
             spin_unlock_irqrestore(&proc_lock, flags);
             return child->pid;
@@ -501,6 +670,7 @@ int process_waitpid(process_t *proc, int pid, uint32_t *status, int options) {
 }
 
 int process_kill(int pid) {
+    if (pid == 1) return -1;
     uint32_t flags;
     spin_lock_irqsave(&proc_lock, &flags);
     for (int i = 0; i < MAX_PROCESSES; i++) {
@@ -508,6 +678,7 @@ int process_kill(int pid) {
         if (p->state == PROC_UNUSED || p->state == PROC_ZOMBIE) continue;
         if ((int)p->pid != pid) continue;
 
+        fpu_clear_owner(p);
         for (int f = 0; f < FD_MAX; f++)
             fd_close(p->fd_table, f);
 
@@ -531,6 +702,11 @@ int process_kill(int pid) {
             if (parent->pid != p->parent_pid) continue;
             if (parent->state == PROC_BLOCKED &&
                 (parent->wait_child_pid == (uint32_t)p->pid || parent->wait_child_pid == 0xFFFFFFFF)) {
+                registers_t *parent_regs = (registers_t *)parent->kernel_esp;
+                if (parent_regs && parent_regs->eip >= 2) {
+                    parent_regs->eip -= 2;
+                    parent_regs->eax = 16;
+                }
                 parent->state = PROC_READY;
                 parent->wait_child_pid = 0;
             }
@@ -547,36 +723,40 @@ int process_kill(int pid) {
 
 void process_exit(process_t *proc) {
     if (!proc) return;
+    fpu_clear_owner(proc);
     for (int i = 0; i < FD_MAX; i++)
         fd_close(proc->fd_table, i);
 
-    if (proc->kernel_stack) {
-        pmm_free_pages(proc->kernel_stack, PROC_KSTACK_SIZE / PAGE_SIZE);
-        proc->kernel_stack = NULL;
-    }
+    /* Don't free kernel_stack or page_dir here — the reaper
+       (waitpid / process_kill) does that.  Freeing the stack while
+       executing on it is a use-after-free. */
 
-    if (proc->page_dir) {
-        vmm_switch_directory(vmm_get_kernel_directory());
-        vmm_free_directory(proc->page_dir);
-        proc->page_dir = NULL;
-    }
+    uint32_t flags;
+    spin_lock_irqsave(&proc_lock, &flags);
+    proc->state = PROC_ZOMBIE;
 
-    {
-        uint32_t flags;
-        spin_lock_irqsave(&proc_lock, &flags);
-        proc->state = PROC_ZOMBIE;
-
-        for (int i = 0; i < MAX_PROCESSES; i++) {
-            process_t *p = &processes[i];
-            if (p->state == PROC_UNUSED) continue;
-            if (p->pid != proc->parent_pid) continue;
-            if (p->state == PROC_BLOCKED &&
-                (p->wait_child_pid == proc->pid || p->wait_child_pid == 0xFFFFFFFF)) {
-                p->state = PROC_READY;
-                p->wait_child_pid = 0;
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        process_t *p = &processes[i];
+        if (p->state == PROC_UNUSED) continue;
+        if (p->pid != proc->parent_pid) continue;
+        p->signal_pending |= (1 << SIGCHLD);
+        scheduler_signal_pending = 1;
+        if (p->state == PROC_BLOCKED &&
+            (p->wait_child_pid == proc->pid || p->wait_child_pid == 0xFFFFFFFF)) {
+            /* Restart the waitpid syscall: the parent blocked inside
+               waitpid (returned -2) but the child just became a zombie.
+               Point saved EIP back to the `int $0x80` instruction and
+               restore EAX to the syscall number so the kernel re-enters
+               syscall_handler and process_waitpid can reap this child. */
+            registers_t *parent_regs = (registers_t *)p->kernel_esp;
+            if (parent_regs->eip >= 2) {
+                parent_regs->eip -= 2;   /* re-execute int $0x80 */
+                parent_regs->eax = 16;   /* SYSCALL_WAITPID */
             }
-            break;
+            p->state = PROC_READY;
+            p->wait_child_pid = 0;
         }
-        spin_unlock_irqrestore(&proc_lock, flags);
+        break;
     }
+    spin_unlock_irqrestore(&proc_lock, flags);
 }

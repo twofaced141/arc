@@ -1,4 +1,5 @@
 #include "ahci.h"
+#include "block.h"
 #include "pci.h"
 #include "vmm.h"
 #include "pmm.h"
@@ -181,6 +182,7 @@ typedef struct {
     int active_port;
     uint64_t total_sectors;
     char model[41];
+    block_device_t bdev;
 } ahci_device_t;
 
 static ahci_device_t ahci_dev;
@@ -512,6 +514,9 @@ static int ahci_dma_transfer(uint32_t lba, int count, uint32_t buf_phys, int is_
     return count * AHCI_SECTOR_SIZE;
 }
 
+static int ahci_block_read(block_device_t *dev, void *buf, uint32_t lba, int count);
+static int ahci_block_write(block_device_t *dev, const void *buf, uint32_t lba, int count);
+
 int ahci_init(void) {
     ahci_dev.present = 0;
 
@@ -586,8 +591,25 @@ int ahci_init(void) {
         return -1;
     }
 
+    ahci_dev.bdev.name = "ahci0";
+    ahci_dev.bdev.lba_count = (uint32_t)ahci_dev.total_sectors;
+    ahci_dev.bdev.read = ahci_block_read;
+    ahci_dev.bdev.write = ahci_block_write;
+    ahci_dev.bdev.priv = &ahci_dev;
+    block_device_register(&ahci_dev.bdev);
+
     debug_print("ahci: init OK\r\n");
     return 0;
+}
+
+static int ahci_block_read(block_device_t *dev, void *buf, uint32_t lba, int count) {
+    (void)dev;
+    return ahci_read_sectors(lba, count, buf);
+}
+
+static int ahci_block_write(block_device_t *dev, const void *buf, uint32_t lba, int count) {
+    (void)dev;
+    return ahci_write_sectors(lba, count, buf);
 }
 
 int ahci_read_sectors(uint32_t lba, int count, void *buf) {

@@ -1,9 +1,12 @@
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
+#include "block.h"
 #include "terminal.h"
 #include "idt.h"
 #include "isr.h"
 #include "keyboard.h"
+#include "tty.h"
 #include "debug.h"
 #include "panic.h"
 #include "gdt.h"
@@ -21,7 +24,17 @@
 #include "rtc.h"
 #include "signal.h"
 #include "syscalls.h"
-
+#include "mouse.h"
+#include "apic.h"
+#include "cpuid.h"
+#include "acpi.h"
+#include "fpu.h"
+#include "e1000.h"
+#include "net.h"
+#include "ramfs.h"
+extern char _binary_initramfs_init_elf_start[];
+extern char _binary_initramfs_init_elf_end[];
+extern process_t *initramfs_run(void);
 extern void isr0(void);  extern void isr1(void);  extern void isr2(void);  extern void isr3(void);
 extern void isr4(void);  extern void isr5(void);  extern void isr6(void);  extern void isr7(void);
 extern void isr8(void);  extern void isr9(void);  extern void isr10(void); extern void isr11(void);
@@ -74,8 +87,6 @@ static void idt_install(void) {
     idt_set_gate(29, (uint32_t)isr29, code_selector, 0x8E);
     idt_set_gate(30, (uint32_t)isr30, code_selector, 0x8E);
     idt_set_gate(31, (uint32_t)isr31, code_selector, 0x8E);
-    idt_set_gate(128, (uint32_t)isr128, code_selector, 0xEE);
-
     idt_set_gate(32, (uint32_t)irq0,  code_selector, 0x8E);
     idt_set_gate(33, (uint32_t)irq1,  code_selector, 0x8E);
     idt_set_gate(34, (uint32_t)irq2,  code_selector, 0x8E);
@@ -93,56 +104,189 @@ static void idt_install(void) {
     idt_set_gate(46, (uint32_t)irq14, code_selector, 0x8E);
     idt_set_gate(47, (uint32_t)irq15, code_selector, 0x8E);
 
+    /* Set up IDT entries for vectors 48-255 with default IRQ stubs */
+    extern uint32_t irq_default_stubs[];
+    for (int i = 0; i < 208; i++)
+        if (48 + i != 128)
+            idt_set_gate(48 + i, irq_default_stubs[i], code_selector, 0x8E);
+    /* Syscall gate must be DPL=3 for ring-3 access */
+    idt_set_gate(128, (uint32_t)isr128, code_selector, 0xEE);
+
     pic_remap();
 }
 
 void kernel_main(uint32_t mboot_magic, multiboot2_info_t *mboot_info) {
     debug_init();
     terminal_init();
-    terminal_print("opencodeOS\n");
+    terminal_print("arc\n");
 
     isr_init();
     idt_install();
+    tty_init();
     keyboard_init();
-    pit_init();
+    mouse_init();
     register_interrupt_handler(128, syscall_handler);
+    register_interrupt_handler(7, fpu_nm_handler);
 
     if (mboot_magic == MULTIBOOT2_MAGIC) {
         pmm_init(mboot_info);
+        {
+            uint32_t cr0;
+            __asm__ __volatile__("mov %%cr0, %0" : "=r"(cr0));
+            cr0 |= (1 << 1) | (1 << 5);
+            cr0 &= ~(1 << 2);
+            __asm__ __volatile__("mov %0, %%cr0" : : "r"(cr0));
+        }
+        {
+            uint32_t cr4;
+            __asm__ __volatile__("mov %%cr4, %0" : "=r"(cr4));
+            cr4 |= (1 << 9) | (1 << 10);
+            __asm__ __volatile__("mov %0, %%cr4" : : "r"(cr4));
+        }
+
         vmm_init();
         vmm_init_heap();
+
+        {
+            multiboot2_tag_t *tag = multiboot2_first_tag(mboot_info);
+            while (tag->type != 0) {
+                if (tag->type == MULTIBOOT_TAG_FRAMEBUFFER) {
+                    multiboot2_tag_framebuffer_t *fb_tag = (multiboot2_tag_framebuffer_t *)tag;
+                    debug_printf("fb: tag found addr=0x%x %ux%u pitch=%u bpp=%u type=%u\r\n",
+                                 fb_tag->fb_addr, fb_tag->fb_width, fb_tag->fb_height,
+                                 fb_tag->fb_pitch, fb_tag->fb_bpp, fb_tag->fb_type);
+                    if (fb_tag->fb_bpp >= 8) {
+                        fb_info_t fb_info;
+                        fb_info.addr   = fb_tag->fb_addr;
+                        fb_info.pitch  = fb_tag->fb_pitch;
+                        fb_info.width  = fb_tag->fb_width;
+                        fb_info.height = fb_tag->fb_height;
+                        fb_info.bpp    = fb_tag->fb_bpp;
+                        fb_info.type   = fb_tag->fb_type;
+                        terminal_init_fb(&fb_info);
+                    }
+                    break;
+                }
+                tag = multiboot2_next_tag(tag);
+            }
+        }
+
         fs_init(mboot_info);
 
         pmm_refcount_init();
 
-        process_init();
-        scheduler_init();
+        if (cpuid_has_apic()) {
+            debug_printf("apic: supported, enabling...\r\n");
+            lapic_init();
+            ioapic_init();
+            ioapic_mask_pic();
+            lapic_timer_init();
+            pit_init();
+        } else {
+            debug_printf("apic: not supported, using PIC+PIT\r\n");
+            pit_init();
+        }
+
+        block_devices_init();
 
         rtc_init();
         pci_scan();
+        e1000_probe();
         ata_init();
+        acpi_init();
+        fpu_init();
+        net_init();
 
+        process_init();
+        scheduler_init();
 
-        ext2_fs_t ext2;
-        if (ext2_init(&ext2) < 0)
-            panic_simple("ext2 init failed");
-        fs_set_ext2(&ext2);
-        debug_printf("kernel: ext2 mounted\r\n");
+        block_device_t *root_dev = NULL;
+        uint32_t root_lba = 0;
+        for (int i = 0; i < block_device_count(); i++) {
+            block_device_t *dev = block_device_get(i);
+            debug_printf("kernel: probing %s (%u sectors)\r\n", dev->name, dev->lba_count);
+            if (ext2_probe(dev, 0) == 0) { root_dev = dev; root_lba = 0; break; }
+            mbr_t mbr;
+            if (mbr_parse(dev, &mbr) == 0) {
+                for (int p = 0; p < 4; p++) {
+                    if (mbr.partitions[p].type && ext2_probe(dev, mbr.partitions[p].lba_start) == 0) {
+                        root_dev = dev; root_lba = mbr.partitions[p].lba_start; break;
+                    }
+                }
+                if (root_dev) break;
+            }
+        }
+        if (!root_dev) panic_simple("no ext2 filesystem found");
+        if (fs_mount("/", root_dev, root_lba) < 0) panic_simple("fs_mount / failed");
+        debug_printf("kernel: / mounted from %s lba=%u\r\n", root_dev->name, root_lba);
 
-        file_t *init_elf = fs_open("/bin/init", EXT2_ROOT_INO);
-        if (!init_elf)
-            panic_simple("/bin/init not found");
+        /* Try to mount second ext2 at /mnt */
+        for (int i = 0; i < block_device_count(); i++) {
+            block_device_t *d = block_device_get(i);
+            if (d == root_dev) continue;
+            if (ext2_probe(d, 0) == 0) { fs_mount("/mnt", d, 0); break; }
+            mbr_t mbr;
+            if (mbr_parse(d, &mbr) == 0) {
+                for (int p = 0; p < 4; p++) {
+                    if (mbr.partitions[p].type && ext2_probe(d, mbr.partitions[p].lba_start) == 0) {
+                        fs_mount("/mnt", d, mbr.partitions[p].lba_start); goto mnt_done;
+                    }
+                }
+            }
+        }
+        mnt_done:;
 
-        process_t *proc = process_create_elf(init_elf);
-        if (!proc)
-            panic_simple("process_create_elf failed");
+        /* Probe for FAT32 filesystems on remaining devices */
+        for (int i = 0; i < block_device_count(); i++) {
+            block_device_t *d = block_device_get(i);
+            if (d == root_dev) continue;
+            if (fat_probe(d, 0) == 0) {
+                debug_printf("kernel: FAT32 on %s lba=0\r\n", d->name);
+                fs_mount_fat(d, 0);
+                break;
+            }
+            mbr_t fmbr;
+            if (mbr_parse(d, &fmbr) == 0) {
+                for (int p = 0; p < 4; p++) {
+                    if (fmbr.partitions[p].type == 0x0B || fmbr.partitions[p].type == 0x0C) {
+                        if (fat_probe(d, fmbr.partitions[p].lba_start) == 0) {
+                            debug_printf("kernel: FAT32 on %s lba=%u\r\n", d->name, fmbr.partitions[p].lba_start);
+                            fs_mount_fat(d, fmbr.partitions[p].lba_start);
+                            goto fat_done;
+                        }
+                    }
+                }
+            }
+        }
+        fat_done:;
+
+        process_t *proc = NULL;
+        int initramfs_size_val = (int)(_binary_initramfs_init_elf_end - _binary_initramfs_init_elf_start);
+        if (initramfs_size_val > 0) {
+            debug_printf("initramfs: loading /init (%d bytes)\r\n", initramfs_size_val);
+            proc = initramfs_run();
+        }
+
+        if (!proc) {
+            static const char *paths[] = {"/sbin/init","/etc/init","/bin/init","/bin/sh"};
+            file_t *f = NULL;
+            for (int i = 0; i < 4; i++) { f = fs_open(paths[i], EXT2_ROOT_INO); if (f) break; }
+            if (!f) panic_simple("no init found");
+            proc = process_create_elf(f);
+            if (!proc) panic_simple("process_create_elf failed");
+        }
+
         scheduler_add_process(proc);
+        debug_print("kernel: about to enable interrupts\r\n");
     } else {
         debug_printf("kernel: not booted with Multiboot2\r\n");
     }
 
     __asm__ __volatile__("sti");
+    debug_print("kernel: sti done, entering idle loop\r\n");
 
-    for (;;)
+    for (;;) {
+        terminal_flush();
         __asm__ __volatile__("hlt");
+    }
 }

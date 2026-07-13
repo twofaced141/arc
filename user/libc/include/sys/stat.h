@@ -3,6 +3,7 @@
 
 #include <sys/types.h>
 #include <stdint.h>
+#include <time.h>
 
 #define S_IFMT   0xF000
 #define S_IFSOCK 0xC000
@@ -29,6 +30,9 @@
 #define S_ISUID  04000
 #define S_ISGID  02000
 
+#define UTIME_NOW   ((1 << 30) - 1)
+#define UTIME_OMIT  ((1 << 30) - 2)
+
 #define S_ISBLK(m)  (((m) & S_IFMT) == S_IFBLK)
 #define S_ISCHR(m)  (((m) & S_IFMT) == S_IFCHR)
 #define S_ISDIR(m)  (((m) & S_IFMT) == S_IFDIR)
@@ -46,17 +50,22 @@ struct stat {
     uint16_t st_gid;
     uint32_t st_rdev;
     uint32_t st_size;
-    uint32_t st_atime;
-    uint32_t st_mtime;
-    uint32_t st_ctime;
+    struct timespec st_atim;
+    struct timespec st_mtim;
+    struct timespec st_ctim;
     uint32_t st_blksize;
     uint32_t st_blocks;
 };
+#define st_atime st_atim.tv_sec
+#define st_mtime st_mtim.tv_sec
+#define st_ctime st_ctim.tv_sec
 
 int fstat(int fd, struct stat *buf);
+int fstatat(int dirfd, const char *pathname, struct stat *buf, int flags);
 int stat(const char *path, struct stat *buf);
 int lstat(const char *path, struct stat *buf);
 int chmod(const char *path, mode_t mode);
+int fchmodat(int dirfd, const char *pathname, mode_t mode, int flags);
 int chown(const char *path, unsigned int owner, unsigned int group);
 int access(const char *path, int mode);
 

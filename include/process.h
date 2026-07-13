@@ -14,11 +14,15 @@
 #define PROC_RUNNING  2
 #define PROC_BLOCKED  3
 #define PROC_ZOMBIE   4
+#define PROC_STOPPED  5
 
-#define MAX_PROCESSES    64
+#define MAX_PROCESSES    4096
 #define PROC_KSTACK_SIZE   8192
 #define USER_HEAP_START    0x40000000
-#define USER_STACK_PAGES   4
+#define USER_STACK_PAGES   32
+#define USER_TLS_VADDR    0xBFFFB000
+#define TLS_CANARY_OFFSET 0x14
+#define FPU_STATE_SIZE 512
 
 typedef struct process {
     uint32_t pid;
@@ -31,6 +35,7 @@ typedef struct process {
     uint32_t eip;
     uint32_t user_esp;
     fd_entry_t fd_table[FD_MAX];
+    uint32_t heap_initial;
     uint32_t heap_break;
     uint32_t heap_mapped_end;
     uint32_t sleep_until;
@@ -42,13 +47,21 @@ typedef struct process {
     uint32_t signal_pending;
     uint32_t signal_blocked;
     uint32_t mmap_brk;
+    uint32_t alarm_ticks;
+    uint32_t alarm_remaining;
     uint16_t uid;
     uint16_t gid;
     uint16_t euid;
     uint16_t egid;
+    uint32_t umask;
+    uint32_t nice;
+    uint32_t pgid;
+    uint32_t is_linux_syscall;
+    char name[64];
+    uint8_t fpu_state[FPU_STATE_SIZE] __attribute__((aligned(16)));
 } process_t;
 
-extern process_t processes[];
+extern process_t *processes;
 extern spinlock_t proc_lock;
 void signal_init_process(process_t *proc);
 

@@ -1,5 +1,6 @@
 #include "rtc.h"
 #include "idt.h"
+#include "apic.h"
 #include "debug.h"
 #include "isr.h"
 
@@ -64,11 +65,11 @@ void rtc_read_time(rtc_time_t *time) {
         }
     }
 
-    time->second = sec;
-    time->minute = min;
-    time->hour   = hour;
-    time->day    = day;
-    time->month  = month;
+    time->tm_sec  = sec;
+    time->tm_min  = min;
+    time->tm_hour = hour;
+    time->tm_mday = day;
+    time->tm_mon  = month - 1;
 
     uint16_t full_year;
     if (year >= 80) {
@@ -77,7 +78,10 @@ void rtc_read_time(rtc_time_t *time) {
         full_year = 2000 + year;
     }
 
-    time->year = full_year;
+    time->tm_year = full_year - 1900;
+    time->tm_wday = 0;
+    time->tm_yday = 0;
+    time->tm_isdst = 0;
 }
 
 static volatile uint32_t rtc_ticks;
@@ -86,7 +90,8 @@ void rtc_irq_handler(registers_t *r) {
     (void)r;
     cmos_read(CMOS_REG_STAT_C);
     rtc_ticks++;
-    pic_send_eoi(RTC_IRQ);
+    if (!apic_enabled)
+        pic_send_eoi(RTC_IRQ);
 }
 
 uint32_t rtc_get_ticks(void) {

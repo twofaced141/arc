@@ -134,8 +134,8 @@ static int generate_status(char *buf, int max, uint32_t pid) {
         uint32_t heap_kb = (p->heap_break - USER_HEAP_START) / 1024;
 
         int pos = 0;
-        pos = append(buf, pos, max, "Name:   process_");
-        pos = append_dec(buf, pos, max, p->pid);
+        pos = append(buf, pos, max, "Name:   ");
+        pos = append(buf, pos, max, p->name);
         pos = append_nl(buf, pos, max);
 
         pos = append(buf, pos, max, "Pid:    ");

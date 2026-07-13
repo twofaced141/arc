@@ -6,6 +6,8 @@
 #include <sys/stat.h>
 #include <dirent.h>
 #include <fcntl.h>
+#include <sys/utsname.h>
+#include <sys/socket.h>
 
 #ifdef CMD_PWD
 int main(int argc, char **argv) {
@@ -40,8 +42,8 @@ int main(void) {
         return 1;
     }
     printf("%u-%02u-%02u %02u:%02u:%02u\n",
-           t.year, t.month, t.day,
-           t.hour, t.minute, t.second);
+           (unsigned)(t.tm_year + 1900), (unsigned)(t.tm_mon + 1), (unsigned)t.tm_mday,
+           (unsigned)t.tm_hour, (unsigned)t.tm_min, (unsigned)t.tm_sec);
     return 0;
 }
 #endif
@@ -94,15 +96,6 @@ int main(int argc, char **argv) {
 #endif
 
 #ifdef CMD_UNAME
-#define UTSNAME_LEN 65
-typedef struct {
-    char sysname[UTSNAME_LEN];
-    char nodename[UTSNAME_LEN];
-    char release[UTSNAME_LEN];
-    char version[UTSNAME_LEN];
-    char machine[UTSNAME_LEN];
-} utsname_t;
-
 int main(int argc, char **argv) {
     int flags = 0;
     for (int i = 1; i < argc; i++) {
@@ -119,7 +112,7 @@ int main(int argc, char **argv) {
     }
     if (flags == 0) flags = 2 | 4 | 8 | 16 | 32;
 
-    utsname_t uts;
+    struct utsname uts;
     uname(&uts);
 
     if (flags & 2) { printf("%s ", uts.sysname); }
@@ -642,11 +635,25 @@ int main(int argc, char **argv) {
     }
     char buf[1024];
     int n, lines = 0;
-    while ((n = read(fd, buf, sizeof(buf))) > 0 && (unsigned int)lines < nlines) {
-        for (int i = 0; i < n && (unsigned int)lines < nlines; i++) {
-            if (buf[i] == '\n') lines++;
+    int retries = 100;
+    while ((unsigned int)lines < nlines) {
+        n = read(fd, buf, sizeof(buf));
+        if (n < 0) break;
+        if (n == 0) {
+            if (--retries <= 0) break;
+            yield();
+            continue;
         }
-        write(1, buf, n);
+        int trunc = n;
+        for (int i = 0; i < n && (unsigned int)lines < nlines; i++) {
+            if (buf[i] == '\n') {
+                lines++;
+                if ((unsigned int)lines == nlines)
+                    trunc = i + 1;
+            }
+        }
+        write(1, buf, trunc);
+        if (trunc < n) break;
     }
     if (fd != 0) close(fd);
     return 0;
@@ -783,3 +790,407 @@ int main(void) {
     return 0;
 }
 #endif
+
+#ifdef CMD_LN
+int main(int argc, char **argv) {
+    int sym = 0;
+    int optind = 1;
+    if (argc > 1 && strcmp(argv[1], "-s") == 0) { sym = 1; optind = 2; }
+    if (argc - optind < 2) { printf("Usage: ln [-s] <target> <link>\n"); return 1; }
+    int r = sym ? symlink(argv[optind], argv[optind + 1])
+                : link(argv[optind], argv[optind + 1]);
+    if (r < 0) { printf("ln: error\n"); return 1; }
+    return 0;
+}
+#endif
+
+#ifdef CMD_CHMOD
+int main(int argc, char **argv) {
+    if (argc < 3) { printf("Usage: chmod <mode> <file>\n"); return 1; }
+    unsigned int mode = 0;
+    for (const char *p = argv[1]; *p; p++)
+        mode = mode * 8 + (unsigned int)(*p - '0');
+    if (chmod(argv[2], mode) < 0) { printf("chmod: error\n"); return 1; }
+    return 0;
+}
+#endif
+
+#ifdef CMD_CHOWN
+int main(int argc, char **argv) {
+    if (argc < 3) { printf("Usage: chown <owner>[:group] <file>\n"); return 1; }
+    unsigned int uid = (unsigned int)atoi(argv[1]);
+    unsigned int gid = (unsigned int)-1;
+    const char *sep = strchr(argv[1], ':');
+    if (sep) {
+        uid = (unsigned int)atoi(argv[1]);
+        gid = (unsigned int)atoi(sep + 1);
+    }
+    if (chown(argv[2], uid, gid) < 0) { printf("chown: error\n"); return 1; }
+    return 0;
+}
+#endif
+
+#ifdef CMD_FREE
+int main(void) {
+    int fd = open("/proc/meminfo", 0);
+    if (fd < 0) { printf("free: cannot open /proc/meminfo\n"); return 1; }
+    char buf[256];
+    int n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return 1;
+    buf[n] = '\0';
+    unsigned int total = 0, mem_free = 0, used = 0;
+    sscanf(buf, "MemTotal:   %u kB\nMemFree:    %u kB\nMemUsed:    %u kB\n",
+           &total, &mem_free, &used);
+    printf("              total        used        free\n");
+    printf("Mem:       %10u kB %10u kB %10u kB\n", total, used, mem_free);
+    return 0;
+}
+#endif
+
+#ifdef CMD_POWEROFF
+int main(void) {
+    printf("poweroff: shutting down...\n");
+    poweroff();
+    printf("poweroff: failed\n");
+    return 1;
+}
+#endif
+
+#ifdef CMD_REBOOT
+int main(void) {
+    printf("reboot: restarting...\n");
+    reboot(0);
+    printf("reboot: failed\n");
+    return 1;
+}
+#endif
+
+#ifdef CMD_CHGRP
+int main(int argc, char **argv) {
+    if (argc < 3) { printf("Usage: chgrp <group> <file>\n"); return 1; }
+    if (chown(argv[2], (unsigned int)-1, (unsigned int)atoi(argv[1])) < 0) { printf("chgrp: error\n"); return 1; }
+    return 0;
+}
+#endif
+
+#ifdef CMD_SOCKET_TEST
+
+struct st_sockaddr_in {
+    unsigned char sin_len;
+    unsigned char sin_family;
+    unsigned short sin_port;
+    unsigned int sin_addr;
+    char sin_zero[8];
+} __attribute__((packed));
+
+static int socket_test_basic(void) {
+    printf("  Creating TCP socket...\n");
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) { printf("  FAIL: socket() returned %d\n", fd); return 1; }
+    printf("  OK: fd=%d\n", fd);
+
+    printf("  Closing socket...\n");
+    if (close(fd) < 0) { printf("  FAIL: close() failed\n"); return 1; }
+    printf("  OK: closed\n");
+
+    printf("  Double close (should safely fail)...\n");
+    if (close(fd) == 0) { printf("  WARN: double close returned 0\n"); }
+    else { printf("  OK: double close returned error as expected\n"); }
+
+    return 0;
+}
+
+static int socket_test_fd_exhaustion(void) {
+    printf("  Opening sockets until FD exhaustion...\n");
+    int count = 0;
+    int fds[64];
+    for (int i = 0; i < 64; i++) {
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) {
+            printf("  OK: exhausted at %d sockets (expected)\n", count);
+            for (int j = 0; j < count; j++) close(fds[j]);
+            return 0;
+        }
+        fds[count++] = fd;
+    }
+    printf("  WARN: no exhaustion after 64 sockets\n");
+    for (int j = 0; j < count; j++) close(fds[j]);
+    return 0;
+}
+
+static int socket_test_api_misuse(void) {
+    printf("  Testing API misuse...\n");
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) { printf("  FAIL: socket() failed\n"); return 1; }
+
+    char buf[16];
+    int r;
+
+    printf("  send() on unconnected socket (should fail)...\n");
+    r = send(fd, "hello", 5, 0);
+    if (r < 0) { printf("  OK: send returned %d (expected)\n", r); }
+    else { printf("  WARN: send on unconnected returned %d\n", r); }
+
+    printf("  recv() on unconnected socket (should fail or block)...\n");
+    r = recv(fd, buf, 16, 0);
+    if (r < 0) { printf("  OK: recv returned %d (expected)\n", r); }
+    else { printf("  WARN: recv on unconnected returned %d\n", r); }
+
+    printf("  bind() on unconnected socket without address (should fail)...\n");
+    r = bind(fd, (const void *)0, 0);
+    if (r < 0) { printf("  OK: bind returned %d (expected)\n", r); }
+    else { printf("  WARN: bind with NULL returned %d\n", r); }
+
+    printf("  listen() on non-listening socket (should work)...\n");
+    r = listen(fd, 1);
+    if (r == 0) { printf("  OK: listen succeeded\n"); }
+    else { printf("  FAIL: listen returned %d\n", r); close(fd); return 1; }
+
+    printf("  accept() on listening with no connections (should block)...\n");
+    r = accept(fd, 0, 0);
+    if (r == -2) { printf("  OK: accept returned -2 (would block, expected)\n"); }
+    else { printf("  WARN: accept returned %d\n", r); }
+
+    printf("  send() on listening socket (should fail)...\n");
+    r = send(fd, "hello", 5, 0);
+    if (r < 0) { printf("  OK: send on listening returned %d (expected)\n", r); }
+    else { printf("  WARN: send on listening returned %d\n", r); }
+
+    close(fd);
+    return 0;
+}
+
+static int socket_test_connect_invalid(void) {
+    printf("  Connecting to 0.0.0.0:1234 (should fail)...\n");
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) { printf("  FAIL: socket() failed\n"); return 1; }
+
+    struct st_sockaddr_in sa;
+    sa.sin_len = 16;
+    sa.sin_family = AF_INET;
+    sa.sin_port = ((1234 & 0xFF) << 8) | ((1234 >> 8) & 0xFF);
+    sa.sin_addr = 0;
+    for (int i = 0; i < 8; i++) sa.sin_zero[i] = 0;
+
+    int r = connect(fd, (const void *)&sa, sizeof(sa));
+    if (r == 0) { printf("  WARN: connect to 0.0.0.0 succeeded?!\n"); close(fd); return 0; }
+    if (r == -2) { printf("  OK: connect returned -2 (would block, expected)\n"); }
+    else { printf("  OK: connect returned %d\n", r); }
+
+    printf("  Waiting up to 300 ticks for timeout/error...\n");
+    unsigned int deadline = getticks() + 300;
+    char buf[16];
+    while (getticks() < deadline) {
+        r = recv(fd, buf, 16, 0);
+        if (r < 0 && r != -2) { printf("  OK: recv returned %d (connection failed)\n", r); break; }
+        if (r > 0) { printf("  WARN: got unexpected data\n"); break; }
+        yield();
+    }
+    if (getticks() >= deadline) printf("  OK: timed out (expected)\n");
+
+    printf("  Closing socket after failed connect...\n");
+    close(fd);
+    return 0;
+}
+
+int main(void) {
+    printf("Socket Stress Test\n");
+    printf("==================\n\n");
+
+    printf("[1] Basic socket create/close:\n");
+    if (socket_test_basic()) return 1;
+
+    printf("\n[2] FD exhaustion:\n");
+    if (socket_test_fd_exhaustion()) return 1;
+
+    printf("\n[3] API misuse:\n");
+    if (socket_test_api_misuse()) return 1;
+
+    printf("\n[4] Connect to invalid address:\n");
+    if (socket_test_connect_invalid()) return 1;
+
+    printf("\nAll socket stress tests passed!\n");
+    return 0;
+}
+#endif
+
+#ifdef CMD_CURL
+
+struct curl_sockaddr {
+    unsigned char sin_len;
+    unsigned char sin_family;
+    unsigned short sin_port;
+    unsigned int sin_addr;
+    char sin_zero[8];
+} __attribute__((packed));
+
+static unsigned short curl_htons(unsigned short h) {
+    return ((h & 0xFF) << 8) | ((h >> 8) & 0xFF);
+}
+
+static unsigned int curl_htonl(unsigned int h) {
+    return ((h & 0xFF) << 24) | ((h & 0xFF00) << 8) |
+           ((h & 0xFF0000) >> 8) | ((h >> 24) & 0xFF);
+}
+
+static unsigned int parse_ip(const char *s) {
+    unsigned int ip = 0;
+    int octet = 0;
+    int shift = 24;
+    while (*s) {
+        if (*s >= '0' && *s <= '9') {
+            octet = octet * 10 + (*s - '0');
+        } else if (*s == '.') {
+            if (octet > 255) return 0;
+            ip |= (octet & 0xFF) << shift;
+            shift -= 8;
+            octet = 0;
+        } else {
+            return 0;
+        }
+        s++;
+    }
+    if (octet > 255) return 0;
+    ip |= (octet & 0xFF) << shift;
+    return curl_htonl(ip);
+}
+
+int main(int argc, char **argv) {
+    if (argc < 2) {
+        printf("Usage: curl http://IP[:PORT][/PATH]\n");
+        return 1;
+    }
+
+    const char *url = argv[1];
+    const char *host = url;
+    int port = 80;
+    const char *path = "/";
+
+    if (host[0] == 'h' && host[1] == 't' && host[2] == 't' &&
+        host[3] == 'p' && host[4] == ':' &&
+        host[5] == '/' && host[6] == '/')
+        host += 7;
+
+    const char *p = host;
+    const char *colon = 0;
+    while (*p && *p != '/' && *p != ':') {
+        if (*p == ':') colon = p;
+        p++;
+    }
+
+    char host_str[64];
+    int host_len;
+    if (colon) {
+        host_len = colon - host;
+        const char *ps = colon + 1;
+        port = 0;
+        while (*ps >= '0' && *ps <= '9') {
+            port = port * 10 + (*ps - '0');
+            ps++;
+        }
+    } else {
+        host_len = p - host;
+    }
+
+    if (host_len > 63) host_len = 63;
+    int i;
+    for (i = 0; i < host_len; i++) host_str[i] = host[i];
+    host_str[i] = '\0';
+
+    if (*p == '/') path = p;
+
+    unsigned int ip = parse_ip(host_str);
+    if (ip == 0) {
+        printf("curl: cannot resolve '%s' (use IP address)\n", host_str);
+        return 1;
+    }
+
+    int fd = socket(2, 1, 0);
+    if (fd < 0) {
+        printf("curl: socket failed\n");
+        return 1;
+    }
+
+    struct curl_sockaddr sa;
+    sa.sin_len = 16;
+    sa.sin_family = 2;
+    sa.sin_port = curl_htons(port);
+    sa.sin_addr = ip;
+    for (i = 0; i < 8; i++) sa.sin_zero[i] = 0;
+
+    connect(fd, (const void *)&sa, sizeof(sa));
+
+    char req[512];
+    int rl = 0;
+    {
+        const char *_g = "GET ";
+        while (*_g) req[rl++] = *_g++;
+        const char *_pa = path;
+        while (*_pa) req[rl++] = *_pa++;
+        const char *_hdr = " HTTP/1.0\r\nHost: ";
+        while (*_hdr) req[rl++] = *_hdr++;
+        const char *_hst = host_str;
+        while (*_hst) req[rl++] = *_hst++;
+        const char *_eoh = "\r\n\r\n";
+        while (*_eoh) req[rl++] = *_eoh++;
+    }
+
+    unsigned int deadline = getticks() + 300;
+    int sent = 0;
+    for (i = 0; i < 5000; i++) {
+        int sr = send(fd, req, rl, 0);
+        if (sr > 0) { sent = 1; break; }
+        if (getticks() > deadline) break;
+        yield();
+    }
+    if (!sent) {
+        printf("curl: connection timeout\n");
+        close(fd);
+        return 1;
+    }
+
+    char buf[4096];
+    unsigned int rdeadline = getticks() + 500;
+    int empty = 0;
+    for (;;) {
+        int n = recv(fd, buf, sizeof(buf), 0);
+        if (n > 0) {
+            write(1, buf, n);
+            empty = 0;
+            rdeadline = getticks() + 200;
+        } else if (n == 0) {
+            if (getticks() > rdeadline || empty > 1000) break;
+            empty++;
+            yield();
+        } else {
+            break;
+        }
+    }
+
+    close(fd);
+    return 0;
+}
+#endif
+
+#ifdef CMD_BENCH
+int main(int argc, char **argv) {
+    int n = 1000;
+    if (argc > 1) {
+        n = atoi(argv[1]);
+        if (n < 1) n = 1;
+    }
+    unsigned int t1 = getticks();
+    for (int i = 1; i <= n; i++) {
+        printf("%d hello world this is a test line to measure scroll speed\n", i);
+    }
+    unsigned int t2 = getticks();
+    unsigned int dt = (t2 - t1) * 10;
+    if (dt == 0) dt = 1;
+    unsigned int lps = (unsigned int)((unsigned long)n * 1000UL / dt);
+    printf("\n--- bench: %d lines in %u ms (%u lines/sec) ---\n", n, dt, lps);
+    return 0;
+}
+#endif
+
+

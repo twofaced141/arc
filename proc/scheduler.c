@@ -7,7 +7,9 @@
 #include "spinlock.h"
 #include "signal.h"
 
-static process_t *process_list[MAX_PROCESSES];
+extern void net_poll(void);
+
+static process_t **process_list;
 static int process_count;
 static int current_index;
 static process_t *idle_process;
@@ -19,7 +21,7 @@ uint32_t scheduler_signal_pending;
 
 static void idle_entry(void) {
     while (1) {
-        __asm__ __volatile__("hlt");
+        __asm__ __volatile__("sti; hlt");
     }
 }
 
@@ -64,6 +66,12 @@ void scheduler_init(void) {
     process_count = 0;
     current_index = -1;
 
+    process_list = (process_t **)kmalloc(sizeof(process_t *) * MAX_PROCESSES);
+    if (!process_list) {
+        debug_print("scheduler: failed to allocate process list\r\n");
+        return;
+    }
+
     if (setup_idle() < 0)
         return;
     scheduler_add_process(idle_process);
@@ -96,9 +104,19 @@ void scheduler_remove_process(process_t *proc) {
 }
 
 
+void scheduler_unblock_process(process_t *proc) {
+    uint32_t flags;
+    spin_lock_irqsave(&sched_lock, &flags);
+    if (proc->state == PROC_BLOCKED) {
+        proc->state = PROC_READY;
+    }
+    spin_unlock_irqrestore(&sched_lock, flags);
+}
+
 static void *context_switch(registers_t *r) {
     int start = (current_index >= 0) ? current_index + 1 : 0;
     if (start >= process_count) start = 0;
+restart:
     for (int i = 0; i < process_count; i++) {
         int idx = (start + i) % process_count;
         process_t *p = process_list[idx];
@@ -108,12 +126,27 @@ static void *context_switch(registers_t *r) {
             current_index = idx;
             p->state = PROC_RUNNING;
             p->time_slice = 5;
+            {
+                uint32_t cr0;
+                __asm__ __volatile__("mov %%cr0, %0" : "=r"(cr0));
+                cr0 |= (1 << 3);
+                __asm__ __volatile__("mov %0, %%cr0" : : "r"(cr0));
+            }
             if (p->page_dir)
                 vmm_switch_directory(p->page_dir);
             tss_set_kernel_stack(p->kernel_stack_top);
+            if (scheduler_signal_pending && p->signal_pending) {
+                registers_t *target_r = (registers_t *)p->kernel_esp;
+                if (target_r->cs == 0x1B) {
+                    scheduler_signal_pending = 0;
+                    if (scheduler_check_pending_signals())
+                        goto restart;
+                }
+            }
             return (void *)p->kernel_esp;
         }
     }
+    debug_printf("DBG: ctx_sw none found pcnt=%d start=%d\r\n", process_count, start);
     current_index = -1;
     return (void *)r;
 }
@@ -122,6 +155,7 @@ void *scheduler_switch(registers_t *r) {
     uint32_t int_no = r->int_no;
 
     if (int_no == 32) {
+        net_poll();
         ticks++;
 
         for (int i = 0; i < process_count; i++) {
@@ -129,6 +163,14 @@ void *scheduler_switch(registers_t *r) {
             if (p->state == PROC_BLOCKED && p->sleep_until && p->sleep_until <= ticks) {
                 p->state = PROC_READY;
                 p->sleep_until = 0;
+            }
+            if (p->alarm_remaining && p->state != PROC_UNUSED && p->state != PROC_ZOMBIE) {
+                p->alarm_remaining--;
+                if (p->alarm_remaining == 0) {
+                    p->alarm_ticks = 0;
+                    p->signal_pending |= (1 << SIGALRM);
+                    scheduler_signal_pending = 1;
+                }
             }
         }
 
@@ -184,6 +226,14 @@ void *scheduler_switch(registers_t *r) {
             }
         }
         scheduler_check_signals(r);
+        if (current_index >= 0 && current_index < process_count) {
+            process_t *cur = process_list[current_index];
+            if (cur->state != PROC_RUNNING) {
+                void *next = context_switch(r);
+                spin_unlock_irqrestore(&sched_lock, flags);
+                return next;
+            }
+        }
         spin_unlock_irqrestore(&sched_lock, flags);
         return (void *)r;
     }
@@ -196,10 +246,21 @@ void *scheduler_switch(registers_t *r) {
 
     if (current_index < 0 && process_count > 0)
         return context_switch(r);
-    if (current_index < 0)
-        return (void *)idle_process->kernel_esp;
+    if (current_index < 0) {
+        if (idle_process)
+            return (void *)idle_process->kernel_esp;
+        return (void *)r;
+    }
 
     scheduler_check_signals(r);
+    process_t *cur = scheduler_current_process();
+    if (!cur || cur->state != PROC_RUNNING) {
+        if (process_count > 0)
+            return context_switch(r);
+        if (idle_process)
+            return (void *)idle_process->kernel_esp;
+        return (void *)r;
+    }
     return (void *)r;
 }
 

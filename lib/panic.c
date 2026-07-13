@@ -1,6 +1,7 @@
 #include "panic.h"
 #include "debug.h"
 #include "terminal.h"
+#include "kallsyms.h"
 
 static void panic_putchar(char c) {
     debug_putchar(c);
@@ -28,6 +29,18 @@ static void print_register(const char *name, uint32_t value) {
     panic_print("\r\n");
 }
 
+static void panic_print_addr(uint32_t addr) {
+    panic_print("  0x");
+    panic_print_hex32(addr);
+    const char *sym = kallsyms_lookup(addr);
+    if (sym) {
+        panic_print(" <");
+        panic_print(sym);
+        panic_print(">");
+    }
+    panic_print("\r\n");
+}
+
 static void panic_stack_trace(const registers_t *r) {
     panic_print("\r\nStack trace:\r\n");
     panic_print("  eip: 0x");
@@ -37,14 +50,21 @@ static void panic_stack_trace(const registers_t *r) {
         panic_print(" (user mode)\r\n");
         return;
     }
+
+    {
+        const char *sym = kallsyms_lookup(r->eip);
+        if (sym) {
+            panic_print(" <");
+            panic_print(sym);
+            panic_print(">");
+        }
+    }
     panic_print("\r\n");
 
     uint32_t *ebp = (uint32_t *)r->ebp;
-    for (int frame = 0; frame < 16 && (uint32_t)ebp >= 0xC0000000; frame++) {
+    for (int frame = 0; frame < 16 && (uint32_t)ebp >= 0x100000; frame++) {
         uint32_t ret = ebp[1];
-        panic_print("  0x");
-        panic_print_hex32(ret);
-        panic_print("\r\n");
+        panic_print_addr(ret);
         ebp = (uint32_t *)ebp[0];
     }
 }
@@ -55,14 +75,13 @@ void panic_simple(const char *reason) {
     panic_print(reason);
     panic_print("\r\n");
 
-    uint32_t ebp;
-    __asm__ __volatile__("mov %%ebp, %0" : "=r"(ebp));
+    uint32_t ebp_val;
+    __asm__ __volatile__("mov %%ebp, %0" : "=r"(ebp_val));
     panic_print("\r\nStack trace:\r\n");
-    uint32_t *fp = (uint32_t *)ebp;
-    for (int frame = 0; frame < 16 && (uint32_t)fp >= 0xC0000000; frame++) {
-        panic_print("  0x");
-        panic_print_hex32(fp[1]);
-        panic_print("\r\n");
+    uint32_t *fp = (uint32_t *)ebp_val;
+    for (int frame = 0; frame < 16 && (uint32_t)fp >= 0x100000; frame++) {
+        uint32_t ret = fp[1];
+        panic_print_addr(ret);
         fp = (uint32_t *)fp[0];
     }
 

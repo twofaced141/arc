@@ -5,6 +5,7 @@
 #include "spinlock.h"
 #include "process.h"
 #include "scheduler.h"
+#include "oom.h"
 
 static page_directory_t *kernel_directory;
 static page_directory_t *current_directory;
@@ -194,8 +195,12 @@ static void page_fault_handler(registers_t *r) {
             if ((pte & VMM_COW) && !(pte & VMM_WRITABLE)) {
                 uint32_t old_phys = pte & ~0xFFF;
                 uint32_t new_phys = (uint32_t)pmm_alloc_page();
-                if (!new_phys)
-                    panic("COW: OOM", r);
+                if (!new_phys) {
+                    if (oom_kill_victim() == 0)
+                        new_phys = (uint32_t)pmm_alloc_page();
+                    if (!new_phys)
+                        panic("COW: OOM", r);
+                }
 
                 uint8_t *tmp = (uint8_t *)kmalloc(4096);
                 if (!tmp)
@@ -246,13 +251,90 @@ static void page_fault_handler(registers_t *r) {
         if (cur) {
             debug_print("SIGSEGV: pid=");
             debug_print_hex32(cur->pid);
+            debug_print(" gs=0x");
+            debug_print_hex32(r->gs);
+            /* read TLS[0x10] via current page directory */
+            if (current_directory && (current_directory->entries[0x2FF] & VMM_PRESENT)) {
+                page_table_t *pt = (page_table_t *)(current_directory->entries[0x2FF] & ~0xFFF);
+                uint32_t pte = pt->entries[0x3FB];
+                if (pte & VMM_PRESENT) {
+                    uint8_t *v = (uint8_t *)vmm_temp_map(pte & ~0xFFF);
+                    uint32_t tls_val = *(uint32_t *)(v + 0x10);
+                    debug_print(" tls[0x10]=");
+                    debug_print_hex32(tls_val);
+                    vmm_temp_unmap();
+                } else { debug_print(" tls_pte=0"); }
+            } else { debug_print(" tls_pde=0"); }
+            /* read GDTR and GDT entry 6 base */
+            {
+                struct {
+                    uint16_t limit;
+                    uint32_t base;
+                } __attribute__((packed)) gdtp;
+                __asm__ __volatile__("sgdt %0" : "=m"(gdtp));
+                debug_print(" gdt_base=");
+                debug_print_hex32(gdtp.base);
+                if (gdtp.limit >= 6*8+7) {
+                    uint8_t *gdt_bytes = (uint8_t *)(uint32_t)gdtp.base;
+                    uint32_t e6_base = (uint32_t)gdt_bytes[6*8+2] |
+                                      ((uint32_t)gdt_bytes[6*8+3] << 8) |
+                                      ((uint32_t)gdt_bytes[6*8+4] << 16) |
+                                      ((uint32_t)gdt_bytes[6*8+7] << 24);
+                    uint8_t e6_access = gdt_bytes[6*8+5];
+                    uint8_t e6_flags = gdt_bytes[6*8+6];
+                    debug_print(" e6_base=");
+                    debug_print_hex32(e6_base);
+                    debug_print(" e6_acc=");
+                    debug_print_hex32(e6_access);
+                    debug_print(" e6_flg=");
+                    debug_print_hex32(e6_flags);
+                } else { debug_print(" gdt_lim="); debug_print_hex32(gdtp.limit); }
+            }
+            /* read CR3 and compare page_dir */
+            {
+                uint32_t cr3;
+                __asm__ __volatile__("mov %%cr3, %0" : "=r"(cr3));
+                debug_print(" cr3=");
+                debug_print_hex32(cr3);
+                debug_print(" cur_pgdir=");
+                debug_print_hex32((uint32_t)current_directory);
+                debug_print(" proc_pgdir=");
+                debug_print_hex32((uint32_t)cur->page_dir);
+                if (current_directory == cur->page_dir)
+                    debug_print(" pgdir_OK");
+                else
+                    debug_print(" pgdir_MISMATCH");
+            }
             debug_print(" addr=");
             debug_print_hex32(fault_addr);
             debug_print(" eip=");
             debug_print_hex32(r->eip);
+            debug_print(" cs=");
+            debug_print_hex32(r->cs);
             debug_print(" err=");
             debug_print_hex32(error_code);
+            debug_print(" useresp=");
+            debug_print_hex32(r->useresp);
+            debug_print(" ebp=");
+            debug_print_hex32(r->ebp);
+            debug_print(" eax=");
+            debug_print_hex32(r->eax);
+            debug_print(" ebx=");
+            debug_print_hex32(r->ebx);
+            debug_print(" ecx=");
+            debug_print_hex32(r->ecx);
             debug_print("\r\n");
+            /* Walk user EBP chain */
+            uint32_t *ebp_ptr = (uint32_t *)r->ebp;
+            for (int fi = 0; fi < 16; fi++) {
+                if ((uint32_t)ebp_ptr < 0xBFFE0000 || (uint32_t)ebp_ptr >= 0xC0000000)
+                    break;
+                uint32_t ret_addr = ebp_ptr[1];
+                debug_printf("  [%d] 0x%x\r\n", fi, ret_addr);
+                ebp_ptr = (uint32_t *)*ebp_ptr;
+                if ((uint32_t)ebp_ptr == 0)
+                    break;
+            }
             cur->signal_pending |= (1 << SIGSEGV);
             scheduler_signal_pending = 1;
             return;

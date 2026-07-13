@@ -1,5 +1,6 @@
 #include "isr.h"
 #include "idt.h"
+#include "apic.h"
 #include "panic.h"
 #include "debug.h"
 #include "terminal.h"
@@ -62,10 +63,20 @@ void irq_handler(registers_t *r) {
                      r->int_no - 32, r->eip, r->cs);
     }
 
+    //if (r->int_no == 32)
+        //debug_print("irq32\r\n");
+
     if (interrupt_handlers[r->int_no])
         interrupt_handlers[r->int_no](r);
 
-    pic_send_eoi((unsigned char)(r->int_no - 32));
+    if (apic_enabled) {
+        /* With ExtINT delivery for IRQ0 (PIC→LINT0), send EOI to both */
+        lapic_eoi();
+        if (r->int_no >= 32 && r->int_no < 48)
+            pic_send_eoi((unsigned char)(r->int_no - 32));
+    } else {
+        pic_send_eoi((unsigned char)(r->int_no - 32));
+    }
 }
 
 void register_interrupt_handler(uint8_t n, isr_t handler) {

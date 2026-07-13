@@ -3,6 +3,9 @@
 #include "scheduler.h"
 #include "vmm.h"
 #include "panic.h"
+#include "debug.h"
+
+uint32_t foreground_pgid;
 
 void signal_init_process(process_t *proc) {
     for (int i = 0; i < 32; i++)
@@ -23,7 +26,16 @@ static int signal_default_action(int signum) {
     case SIGBUS:
     case SIGFPE:
     case SIGILL:
+    case SIGSTKFLT:
+    case SIGSYS:
         return 1; /* terminate */
+    case SIGSTOP:
+    case SIGTSTP:
+    case SIGTTIN:
+    case SIGTTOU:
+        return 2; /* stop */
+    case SIGCONT:
+        return 3; /* continue */
     default:
         return 0; /* ignore */
     }
@@ -40,7 +52,7 @@ static int find_pending_signal(process_t *proc) {
 }
 
 int sys_sigaction(int signum, const sigaction_t *act, sigaction_t *oldact) {
-    if (signum < 1 || signum >= 32 || signum == SIGKILL)
+    if (signum < 1 || signum >= 32 || signum == SIGKILL || signum == SIGSTOP)
         return -1;
 
     process_t *cur = scheduler_current_process();
@@ -74,10 +86,20 @@ void deliver_signal(registers_t *r) {
     void (*handler)(int) = proc->sigactions[signum].sa_handler;
 
     if (handler == SIG_DFL) {
-        if (signal_default_action(signum)) {
+        int action = signal_default_action(signum);
+        if (action == 1) {
             proc->exit_code = 128 + signum;
             proc->kernel_esp = (uint32_t)r;
             process_exit(proc);
+            return;
+        }
+        if (action == 2) {
+            proc->state = PROC_STOPPED;
+            return;
+        }
+        if (action == 3) {
+            if (proc->state == PROC_STOPPED)
+                proc->state = PROC_READY;
             return;
         }
         return;
@@ -129,7 +151,9 @@ void deliver_signal(registers_t *r) {
 }
 
 int sys_sigreturn(registers_t *r) {
-    uint32_t *frame = (uint32_t *)r->useresp;
+    uint32_t frame[5];
+    if (copy_from_user(frame, (const void *)r->useresp, sizeof(frame)) < 0)
+        return -1;
     r->eip = frame[3];    /* saved_eip */
     r->useresp = frame[4]; /* saved_esp */
     /* eax already holds the return value (0 from sigreturn) */
@@ -153,7 +177,25 @@ int sys_kill_sig(int pid, int signum) {
             return process_kill(pid);
         }
 
+        if (signum == SIGSTOP || signum == SIGTSTP || signum == SIGTTIN || signum == SIGTTOU) {
+            if (p->state == PROC_READY || p->state == PROC_RUNNING) {
+                p->state = PROC_STOPPED;
+            }
+            spin_unlock_irqrestore(&proc_lock, flags);
+            return 0;
+        }
+
+        if (signum == SIGCONT) {
+            if (p->state == PROC_STOPPED) {
+                p->state = PROC_READY;
+            }
+            p->signal_pending &= ~(1 << SIGSTOP);
+            spin_unlock_irqrestore(&proc_lock, flags);
+            return 0;
+        }
+
         p->signal_pending |= (1 << signum);
+        scheduler_signal_pending = 1;
         if (p->state == PROC_BLOCKED) {
             p->state = PROC_READY;
         }
@@ -163,4 +205,148 @@ int sys_kill_sig(int pid, int signum) {
 
     spin_unlock_irqrestore(&proc_lock, flags);
     return -1;
+}
+
+int sys_kill_pgid(int pgid, int signum) {
+    if (signum < 1 || signum >= 32)
+        return -1;
+
+    uint32_t flags;
+    spin_lock_irqsave(&proc_lock, &flags);
+    int found = 0;
+
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        process_t *p = &processes[i];
+        if (p->state == PROC_UNUSED || p->state == PROC_ZOMBIE) continue;
+        if ((int)p->pgid != pgid) continue;
+        found = 1;
+
+        if (signum == SIGKILL) {
+            spin_unlock_irqrestore(&proc_lock, flags);
+            return process_kill(p->pid);
+        }
+
+        if (signum == SIGSTOP || signum == SIGTSTP || signum == SIGTTIN || signum == SIGTTOU) {
+            if (p->state == PROC_READY || p->state == PROC_RUNNING)
+                p->state = PROC_STOPPED;
+            continue;
+        }
+
+        if (signum == SIGCONT) {
+            if (p->state == PROC_STOPPED)
+                p->state = PROC_READY;
+            p->signal_pending &= ~(1 << SIGSTOP);
+            continue;
+        }
+
+        p->signal_pending |= (1 << signum);
+        scheduler_signal_pending = 1;
+        if (p->state == PROC_BLOCKED)
+            p->state = PROC_READY;
+    }
+
+    spin_unlock_irqrestore(&proc_lock, flags);
+    return found ? 0 : -1;
+}
+
+int sys_sigprocmask(int how, const uint32_t *set, uint32_t *oldset) {
+    process_t *cur = scheduler_current_process();
+    if (!cur) return -1;
+
+    uint32_t kset;
+    if (set) {
+        if (copy_from_user(&kset, set, sizeof(uint32_t)) < 0)
+            return -1;
+    }
+
+    if (oldset) {
+        if (copy_to_user(oldset, &cur->signal_blocked, sizeof(uint32_t)) < 0)
+            return -1;
+    }
+
+    if (set) {
+        switch (how) {
+        case SIG_BLOCK:
+            cur->signal_blocked |= kset;
+            break;
+        case SIG_UNBLOCK:
+            cur->signal_blocked &= ~kset;
+            break;
+        case SIG_SETMASK:
+            cur->signal_blocked = kset;
+            break;
+        default:
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+int sys_sigpending(uint32_t *set) {
+    process_t *cur = scheduler_current_process();
+    if (!cur) return -1;
+    return copy_to_user(set, &cur->signal_pending, sizeof(uint32_t));
+}
+
+int sys_sigsuspend(registers_t *r, const uint32_t *mask) {
+    process_t *cur = scheduler_current_process();
+    if (!cur) return -1;
+
+    uint32_t kmask;
+    if (copy_from_user(&kmask, mask, sizeof(uint32_t)) < 0)
+        return -1;
+
+    cur->signal_blocked = kmask;
+    cur->kernel_esp = (uint32_t)r;
+    cur->state = PROC_BLOCKED;
+    cur->sleep_until = 0;
+    return 0;
+}
+
+int scheduler_check_pending_signals(void) {
+    process_t *proc = scheduler_current_process();
+    if (!proc) return 0;
+    if (!proc->signal_pending) return 0;
+
+    uint32_t flags;
+    spin_lock_irqsave(&proc_lock, &flags);
+    uint32_t pending = proc->signal_pending & ~proc->signal_blocked;
+    if (pending == 0) { spin_unlock_irqrestore(&proc_lock, flags); return 0; }
+    spin_unlock_irqrestore(&proc_lock, flags);
+
+    int signum = 0;
+    for (int i = 1; i < 32; i++) {
+        if (pending & (1 << i)) { signum = i; break; }
+    }
+    if (!signum) return 0;
+
+    proc->signal_pending &= ~(1 << signum);
+
+    void (*handler)(int) = proc->sigactions[signum].sa_handler;
+    if (handler == SIG_DFL) {
+        switch (signum) {
+        case SIGKILL: case SIGTERM: case SIGINT: case SIGQUIT:
+        case SIGABRT: case SIGSEGV: case SIGBUS: case SIGFPE:
+        case SIGILL: case SIGSTKFLT: case SIGSYS:
+            proc->exit_code = 128 + signum;
+            process_exit(proc);
+            return 1;
+        case SIGSTOP: case SIGTSTP: case SIGTTIN: case SIGTTOU:
+            if (proc->state == PROC_READY || proc->state == PROC_RUNNING)
+                proc->state = PROC_STOPPED;
+            return 0;
+        case SIGCONT:
+            if (proc->state == PROC_STOPPED)
+                proc->state = PROC_READY;
+            return 0;
+        default:
+            return 0;
+        }
+    }
+
+    if (handler == SIG_IGN)
+        return 0;
+
+    return 0;
 }

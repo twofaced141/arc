@@ -8,6 +8,7 @@
 #define USER_CS   0x18
 #define USER_DS   0x20
 #define TSS_SEL   0x28
+#define TLS_SEL   0x33   /* index 6 (6*8+3), RPL=3 user TLS */
 
 struct tss {
     uint32_t prev_tss;

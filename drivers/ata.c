@@ -1,24 +1,45 @@
 #include "ata.h"
-#include "ahci.h"
 #include "idt.h"
 #include "debug.h"
-#include "terminal.h"
+#include "string.h"
 
-static ata_drive_t primary_master;
-static int use_ahci = 0;
+static ata_channel_ports_t primary_chan = {
+    .data    = ATA_PRIMARY_DATA,
+    .scount  = ATA_PRIMARY_SCOUNT,
+    .lba0    = ATA_PRIMARY_LBA0,
+    .lba1    = ATA_PRIMARY_LBA1,
+    .lba2    = ATA_PRIMARY_LBA2,
+    .drive   = ATA_PRIMARY_DRIVE,
+    .cmd     = ATA_PRIMARY_CMD,
+    .altstat = ATA_PRIMARY_ALTSTAT,
+};
 
-static int ata_wait_bsy(uint16_t alt_status) {
+static ata_channel_ports_t secondary_chan = {
+    .data    = ATA_SECONDARY_DATA,
+    .scount  = ATA_SECONDARY_SCOUNT,
+    .lba0    = ATA_SECONDARY_LBA0,
+    .lba1    = ATA_SECONDARY_LBA1,
+    .lba2    = ATA_SECONDARY_LBA2,
+    .drive   = ATA_SECONDARY_DRIVE,
+    .cmd     = ATA_SECONDARY_CMD,
+    .altstat = ATA_SECONDARY_ALTSTAT,
+};
+
+static ata_drive_t ata_drives[ATA_DRIVES_MAX];
+static int ata_count;
+
+static int ata_wait_bsy(ata_channel_ports_t *chan) {
     for (int tries = 0; tries < 100000; tries++) {
-        if (!(inb(alt_status) & ATA_STATUS_BSY))
+        if (!(inb(chan->altstat) & ATA_STATUS_BSY))
             return 0;
     }
     return -1;
 }
 
-static int ata_wait_drq(uint16_t alt_status) {
+static int ata_wait_drq(ata_channel_ports_t *chan) {
     uint8_t st;
     for (int tries = 0; tries < 100000; tries++) {
-        st = inb(alt_status);
+        st = inb(chan->altstat);
         if (st & ATA_STATUS_DRQ)
             return 0;
         if (st & ATA_STATUS_ERR)
@@ -29,42 +50,44 @@ static int ata_wait_drq(uint16_t alt_status) {
     return -1;
 }
 
-static void ata_io_wait(void) {
-    inb(ATA_PRIMARY_ALTSTAT);
-    inb(ATA_PRIMARY_ALTSTAT);
-    inb(ATA_PRIMARY_ALTSTAT);
-    inb(ATA_PRIMARY_ALTSTAT);
+static void ata_io_wait(ata_channel_ports_t *chan) {
+    inb(chan->altstat);
+    inb(chan->altstat);
+    inb(chan->altstat);
+    inb(chan->altstat);
 }
 
-static int ata_identify_master(void) {
-    if (ata_wait_bsy(ATA_PRIMARY_ALTSTAT) < 0)
+static int ata_identify(ata_drive_t *drive) {
+    ata_channel_ports_t *chan = drive->chan;
+
+    if (ata_wait_bsy(chan) < 0)
         return -1;
 
-    outb(ATA_PRIMARY_DRIVE, ATA_DRIVE_MASTER);
-    ata_io_wait();
+    outb(chan->drive, drive->drive_sel);
+    ata_io_wait(chan);
 
-    outb(ATA_PRIMARY_SCOUNT, 0);
-    outb(ATA_PRIMARY_LBA0, 0);
-    outb(ATA_PRIMARY_LBA1, 0);
-    outb(ATA_PRIMARY_LBA2, 0);
+    outb(chan->scount, 0);
+    outb(chan->lba0, 0);
+    outb(chan->lba1, 0);
+    outb(chan->lba2, 0);
 
-    outb(ATA_PRIMARY_CMD, ATA_CMD_IDENTIFY);
-    ata_io_wait();
+    outb(chan->cmd, ATA_CMD_IDENTIFY);
+    ata_io_wait(chan);
 
-    uint8_t st = inb(ATA_PRIMARY_CMD);
+    uint8_t st = inb(chan->cmd);
     if (st == 0)
         return -1;
 
-    if (ata_wait_bsy(ATA_PRIMARY_ALTSTAT) < 0)
+    if (ata_wait_bsy(chan) < 0)
         return -1;
 
-    st = inb(ATA_PRIMARY_CMD);
+    st = inb(chan->cmd);
     if (st & ATA_STATUS_ERR)
         return -1;
 
     if (!(st & ATA_STATUS_DRQ)) {
         for (int tries = 0; tries < 100000; tries++) {
-            st = inb(ATA_PRIMARY_CMD);
+            st = inb(chan->cmd);
             if (st & ATA_STATUS_DRQ) break;
             if (st & ATA_STATUS_ERR) return -1;
         }
@@ -74,151 +97,187 @@ static int ata_identify_master(void) {
 
     uint16_t buf[256];
     for (int i = 0; i < 256; i++)
-        buf[i] = inw(ATA_PRIMARY_DATA);
+        buf[i] = inw(chan->data);
 
-    primary_master.lba28_sectors = (uint32_t)buf[61] << 16 | buf[60];
-    primary_master.lba48_sectors = (uint64_t)buf[101] << 48 | (uint64_t)buf[100] << 32 |
-                                  (uint64_t)buf[103] << 16 | buf[102];
+    drive->lba28_sectors = (uint32_t)buf[61] << 16 | buf[60];
+    drive->lba48_sectors = (uint64_t)buf[101] << 48 | (uint64_t)buf[100] << 32 |
+                           (uint64_t)buf[103] << 16 | buf[102];
 
     for (int i = 0; i < 40; i += 2) {
-        primary_master.model[i] = buf[27 + i/2] >> 8;
-        primary_master.model[i + 1] = buf[27 + i/2] & 0xFF;
+        drive->model[i] = buf[27 + i/2] >> 8;
+        drive->model[i + 1] = buf[27 + i/2] & 0xFF;
     }
-    primary_master.model[40] = '\0';
+    drive->model[40] = '\0';
 
-    primary_master.present = 1;
+    drive->present = 1;
     return 0;
 }
 
-int ata_init(void) {
-    if (ahci_init() == 0) {
-        use_ahci = 1;
-        return 0;
-    }
-    use_ahci = 0;
+static int ata_drive_read(block_device_t *bdev, void *buf, uint32_t lba, int count) {
+    ata_drive_t *drive = (ata_drive_t *)bdev->priv;
+    ata_channel_ports_t *chan = drive->chan;
 
-    primary_master.present = 0;
-
-    if (ata_identify_master() == 0) {
-        debug_printf("ata: master model='%s' lba28=%u lba48=", primary_master.model, primary_master.lba28_sectors);
-        debug_printf("%u", (uint32_t)(primary_master.lba48_sectors >> 32));
-        debug_printf("%u\r\n", (uint32_t)primary_master.lba48_sectors);
-    } else {
-        debug_print("ata: no master drive\r\n");
-    }
-
-    return primary_master.present ? 0 : -1;
-}
-
-int ata_read_sectors(uint32_t lba, int count, void *buf) {
-    if (use_ahci)
-        return ahci_read_sectors(lba, count, buf);
-    if (!primary_master.present)
+    if (!drive->present)
         return -1;
-
     if (count <= 0 || count > 256)
         return -1;
 
     uint8_t scount = count == 256 ? 0 : (uint8_t)count;
 
-    if (ata_wait_bsy(ATA_PRIMARY_ALTSTAT) < 0)
+    if (ata_wait_bsy(chan) < 0)
         return -1;
 
-    outb(ATA_PRIMARY_DRIVE, ATA_DRIVE_MASTER | ATA_LBA_BIT | ((lba >> 24) & 0x0F));
-    ata_io_wait();
+    outb(chan->drive, drive->drive_sel | ATA_LBA_BIT | ((lba >> 24) & 0x0F));
+    ata_io_wait(chan);
 
-    outb(ATA_PRIMARY_SCOUNT, scount);
-    outb(ATA_PRIMARY_LBA0, lba & 0xFF);
-    outb(ATA_PRIMARY_LBA1, (lba >> 8) & 0xFF);
-    outb(ATA_PRIMARY_LBA2, (lba >> 16) & 0xFF);
+    outb(chan->scount, scount);
+    outb(chan->lba0, lba & 0xFF);
+    outb(chan->lba1, (lba >> 8) & 0xFF);
+    outb(chan->lba2, (lba >> 16) & 0xFF);
 
-    outb(ATA_PRIMARY_CMD, ATA_CMD_READ_PIO);
-    ata_io_wait();
+    outb(chan->cmd, ATA_CMD_READ_PIO);
+    ata_io_wait(chan);
 
     uint16_t *ptr = (uint16_t *)buf;
     for (int s = 0; s < count; s++) {
-        if (ata_wait_bsy(ATA_PRIMARY_ALTSTAT) < 0)
+        if (ata_wait_bsy(chan) < 0)
             return -1;
 
-        uint8_t st = inb(ATA_PRIMARY_CMD);
+        uint8_t st = inb(chan->cmd);
         if (st & ATA_STATUS_ERR)
             return -1;
 
         if (!(st & ATA_STATUS_DRQ)) {
-            if (ata_wait_drq(ATA_PRIMARY_ALTSTAT) < 0)
+            if (ata_wait_drq(chan) < 0)
                 return -1;
         }
 
         for (int i = 0; i < 256; i++)
-            ptr[s * 256 + i] = inw(ATA_PRIMARY_DATA);
+            ptr[s * 256 + i] = inw(chan->data);
     }
 
     return count * SECTOR_SIZE;
 }
 
-int ata_write_sectors(uint32_t lba, int count, const void *buf) {
-    if (use_ahci)
-        return ahci_write_sectors(lba, count, buf);
-    if (!primary_master.present)
-        return -1;
+static int ata_drive_write(block_device_t *bdev, const void *buf, uint32_t lba, int count) {
+    ata_drive_t *drive = (ata_drive_t *)bdev->priv;
+    ata_channel_ports_t *chan = drive->chan;
 
+    if (!drive->present)
+        return -1;
     if (count <= 0 || count > 256)
         return -1;
 
     uint8_t scount = count == 256 ? 0 : (uint8_t)count;
 
-    if (ata_wait_bsy(ATA_PRIMARY_ALTSTAT) < 0)
+    if (ata_wait_bsy(chan) < 0)
         return -1;
 
-    outb(ATA_PRIMARY_DRIVE, ATA_DRIVE_MASTER | ATA_LBA_BIT | ((lba >> 24) & 0x0F));
-    ata_io_wait();
+    outb(chan->drive, drive->drive_sel | ATA_LBA_BIT | ((lba >> 24) & 0x0F));
+    ata_io_wait(chan);
 
-    outb(ATA_PRIMARY_SCOUNT, scount);
-    outb(ATA_PRIMARY_LBA0, lba & 0xFF);
-    outb(ATA_PRIMARY_LBA1, (lba >> 8) & 0xFF);
-    outb(ATA_PRIMARY_LBA2, (lba >> 16) & 0xFF);
+    outb(chan->scount, scount);
+    outb(chan->lba0, lba & 0xFF);
+    outb(chan->lba1, (lba >> 8) & 0xFF);
+    outb(chan->lba2, (lba >> 16) & 0xFF);
 
-    outb(ATA_PRIMARY_CMD, ATA_CMD_WRITE_PIO);
-    ata_io_wait();
+    outb(chan->cmd, ATA_CMD_WRITE_PIO);
+    ata_io_wait(chan);
 
     const uint16_t *ptr = (const uint16_t *)buf;
     for (int s = 0; s < count; s++) {
-        if (ata_wait_bsy(ATA_PRIMARY_ALTSTAT) < 0)
+        if (ata_wait_bsy(chan) < 0)
             return -1;
 
-        uint8_t st = inb(ATA_PRIMARY_CMD);
+        uint8_t st = inb(chan->cmd);
         if (st & ATA_STATUS_ERR)
             return -1;
 
         if (!(st & ATA_STATUS_DRQ)) {
-            if (ata_wait_drq(ATA_PRIMARY_ALTSTAT) < 0)
+            if (ata_wait_drq(chan) < 0)
                 return -1;
         }
 
         for (int i = 0; i < 256; i++)
-            outw(ATA_PRIMARY_DATA, ptr[s * 256 + i]);
+            outw(chan->data, ptr[s * 256 + i]);
     }
 
-    if (ata_wait_bsy(ATA_PRIMARY_ALTSTAT) < 0)
+    if (ata_wait_bsy(chan) < 0)
         return -1;
 
     return count * SECTOR_SIZE;
 }
 
-int ata_flush_cache(void) {
-    if (use_ahci)
-        return ahci_flush_cache();
-    if (!primary_master.present)
-        return -1;
+static void ata_register_drive(ata_drive_t *drive, const char *name) {
+    drive->bdev.name = name;
+    drive->bdev.lba_count = drive->lba28_sectors;
+    drive->bdev.read = ata_drive_read;
+    drive->bdev.write = ata_drive_write;
+    drive->bdev.priv = drive;
+    block_device_register(&drive->bdev);
+}
 
-    if (ata_wait_bsy(ATA_PRIMARY_ALTSTAT) < 0)
-        return -1;
+int ata_init(void) {
+    ata_count = 0;
+    for (int i = 0; i < ATA_DRIVES_MAX; i++) {
+        ata_drives[i].present = 0;
+        ata_drives[i].bdev.name = NULL;
+    }
 
-    outb(ATA_PRIMARY_CMD, ATA_CMD_FLUSH);
-    ata_io_wait();
+    /* Primary master */
+    ata_drives[ata_count].chan = &primary_chan;
+    ata_drives[ata_count].drive_sel = ATA_DRIVE_MASTER;
+    if (ata_identify(&ata_drives[ata_count]) == 0) {
+        debug_printf("ata0: model='%s' lba28=%u\r\n",
+                     ata_drives[ata_count].model,
+                     ata_drives[ata_count].lba28_sectors);
+        ata_register_drive(&ata_drives[ata_count], "ata0");
+        ata_count++;
+    }
 
-    if (ata_wait_bsy(ATA_PRIMARY_ALTSTAT) < 0)
-        return -1;
+    /* Primary slave */
+    ata_drives[ata_count].chan = &primary_chan;
+    ata_drives[ata_count].drive_sel = ATA_DRIVE_SLAVE;
+    if (ata_identify(&ata_drives[ata_count]) == 0) {
+        debug_printf("ata1: model='%s' lba28=%u\r\n",
+                     ata_drives[ata_count].model,
+                     ata_drives[ata_count].lba28_sectors);
+        ata_register_drive(&ata_drives[ata_count], "ata1");
+        ata_count++;
+    }
 
-    return 0;
+    /* Secondary master */
+    ata_drives[ata_count].chan = &secondary_chan;
+    ata_drives[ata_count].drive_sel = ATA_DRIVE_MASTER;
+    if (ata_identify(&ata_drives[ata_count]) == 0) {
+        debug_printf("ata2: model='%s' lba28=%u\r\n",
+                     ata_drives[ata_count].model,
+                     ata_drives[ata_count].lba28_sectors);
+        ata_register_drive(&ata_drives[ata_count], "ata2");
+        ata_count++;
+    }
+
+    /* Secondary slave */
+    ata_drives[ata_count].chan = &secondary_chan;
+    ata_drives[ata_count].drive_sel = ATA_DRIVE_SLAVE;
+    if (ata_identify(&ata_drives[ata_count]) == 0) {
+        debug_printf("ata3: model='%s' lba28=%u\r\n",
+                     ata_drives[ata_count].model,
+                     ata_drives[ata_count].lba28_sectors);
+        ata_register_drive(&ata_drives[ata_count], "ata3");
+        ata_count++;
+    }
+
+    debug_printf("ata: %d drive(s) found\r\n", ata_count);
+    return ata_count > 0 ? 0 : -1;
+}
+
+ata_drive_t *ata_get_drive(int index) {
+    if (index < 0 || index >= ata_count)
+        return NULL;
+    return &ata_drives[index];
+}
+
+int ata_drive_count(void) {
+    return ata_count;
 }

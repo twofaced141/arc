@@ -74,6 +74,24 @@ IRQ 13, 45
 IRQ 14, 46
 IRQ 15, 47
 
+/* Default IRQ stubs for vectors 48-255 */
+.altmacro
+.set _irq_n, 16
+.set _vec_n, 48
+.rept 208
+    IRQ %_irq_n, %_vec_n
+    .set _irq_n, _irq_n + 1
+    .set _vec_n, _vec_n + 1
+.endr
+.noaltmacro
+
+/* Table of default IRQ stub addresses (vectors 48-255) */
+.section .rodata
+.global irq_default_stubs
+irq_default_stubs:
+.include "irq_stubtable.inc"
+.text
+
 .extern isr_handler
 isr_common_stub:
     pusha

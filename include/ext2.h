@@ -2,6 +2,8 @@
 #define EXT2_H
 
 #include <stdint.h>
+#include "spinlock.h"
+#include "block.h"
 
 struct stat;
 struct dirent;
@@ -11,6 +13,13 @@ struct dirent;
 #define EXT2_SB_OFFSET    1024
 #define EXT2_SECTOR_SIZE  512
 #define EXT2_NAME_MAX     255
+
+#define EXT2_MAX_OPEN_INODES 32
+
+typedef struct {
+    uint32_t ino;
+    int refcount;
+} ext2_open_inode_t;
 
 #define EXT2_S_IFMT    0xF000
 #define EXT2_S_IFSOCK  0xC000
@@ -24,6 +33,7 @@ struct dirent;
 #define EXT2_FT_UNKNOWN  0
 #define EXT2_FT_REG_FILE 1
 #define EXT2_FT_DIR      2
+#define EXT2_FT_SYMLINK  7
 
 typedef struct {
     uint32_t inodes_count;
@@ -121,17 +131,25 @@ typedef struct {
     uint32_t groups_count;
     ext2_bgdesc_t *bgdt;
     int present;
+    block_device_t *dev;
+    uint32_t lba_offset;
     uint8_t scratch[4096];
+    spinlock_t lock;
+    int lock_depth;
+    ext2_open_inode_t open_inodes[EXT2_MAX_OPEN_INODES];
 } ext2_fs_t;
 
-int  ext2_init(ext2_fs_t *fs);
+int  ext2_init(ext2_fs_t *fs, block_device_t *dev, uint32_t lba_offset);
+int  ext2_probe(block_device_t *dev, uint32_t lba_offset);
 int  ext2_read_inode(ext2_fs_t *fs, uint32_t inum, ext2_inode_t *inode);
 int  ext2_read_block(ext2_fs_t *fs, uint32_t block_addr, void *buf);
 int  ext2_read_data_block(ext2_fs_t *fs, ext2_inode_t *inode, uint32_t iblock, void *buf);
+int  ext2_read_link(ext2_fs_t *fs, uint32_t ino, char *buf, uint32_t size);
 int  ext2_lookup(ext2_fs_t *fs, uint32_t dir_ino, const char *name, uint32_t *out_ino, uint8_t *out_type);
 int  ext2_open_path(ext2_fs_t *fs, const char *path, uint32_t *out_ino, uint8_t *out_type);
 int  ext2_read_file(ext2_fs_t *fs, uint32_t ino, void *buf, uint32_t offset, uint32_t size);
 int  ext2_resolve(ext2_fs_t *fs, uint32_t base_ino, const char *path, uint32_t *out_ino, uint8_t *out_type);
+int  ext2_resolve_nofollow(ext2_fs_t *fs, uint32_t base_ino, const char *path, uint32_t *out_ino, uint8_t *out_type);
 int  ext2_find_name(ext2_fs_t *fs, uint32_t dir_ino, uint32_t target_ino, char *name_out);
 int  ext2_read_names(ext2_fs_t *fs, uint32_t dir_ino, char *buf, uint32_t size, uint32_t *out_bytes);
 int  ext2_write_block(ext2_fs_t *fs, uint32_t block_addr, const void *buf);
@@ -145,11 +163,18 @@ int  ext2_create(ext2_fs_t *fs, const char *name, uint32_t parent_ino, uint32_t 
 int  ext2_free_inode(ext2_fs_t *fs, uint32_t inum);
 int  ext2_free_block(ext2_fs_t *fs, uint32_t block_addr);
 int  ext2_truncate(ext2_fs_t *fs, uint32_t inum);
+int  ext2_link(ext2_fs_t *fs, uint32_t dir_ino, const char *name, uint32_t target_ino);
 int  ext2_unlink(ext2_fs_t *fs, uint32_t dir_ino, const char *name);
 int  ext2_rename(ext2_fs_t *fs, uint32_t old_dir_ino, const char *old_name, uint32_t new_dir_ino, const char *new_name);
 int  ext2_mkdir(ext2_fs_t *fs, const char *name, uint32_t parent_ino, uint32_t *out_ino);
 int  ext2_rmdir(ext2_fs_t *fs, uint32_t parent_ino, const char *name);
+int  ext2_symlink(ext2_fs_t *fs, const char *name, uint32_t parent_ino, const char *target, uint32_t *out_ino);
+int  ext2_utimens(ext2_fs_t *fs, uint32_t ino, const uint32_t times[2]);
 int  ext2_stat(ext2_fs_t *fs, uint32_t ino, struct stat *st);
 int  ext2_getdents(ext2_fs_t *fs, uint32_t dir_ino, struct dirent *dirp, uint32_t count);
+
+void ext2_ihold(ext2_fs_t *fs, uint32_t ino);
+void ext2_iput(ext2_fs_t *fs, uint32_t ino);
+int  ext2_irefcount(ext2_fs_t *fs, uint32_t ino);
 
 #endif

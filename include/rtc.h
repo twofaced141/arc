@@ -29,12 +29,15 @@
 #define RTC_INT_NO          40
 
 typedef struct {
-    uint16_t year;
-    uint8_t  month;
-    uint8_t  day;
-    uint8_t  hour;
-    uint8_t  minute;
-    uint8_t  second;
+    int tm_sec;
+    int tm_min;
+    int tm_hour;
+    int tm_mday;
+    int tm_mon;
+    int tm_year;
+    int tm_wday;
+    int tm_yday;
+    int tm_isdst;
 } rtc_time_t;
 
 void         rtc_init(void);

@@ -17,7 +17,7 @@ struct gdt_ptr {
 } __attribute__((packed));
 
 static struct tss kernel_tss;
-static struct gdt_entry gdt[6];
+static struct gdt_entry gdt[7];
 static struct gdt_ptr   gdtp;
 
 static uint8_t kernel_stack[KERNEL_STACK_SIZE] __attribute__((aligned(16)));
@@ -34,7 +34,7 @@ static void gdt_set_gate(int num, uint32_t base, uint32_t limit, uint8_t access,
 }
 
 void gdt_install(void) {
-    gdtp.limit = sizeof(struct gdt_entry) * 6 - 1;
+    gdtp.limit = sizeof(struct gdt_entry) * 7 - 1;
     gdtp.base  = (uint32_t)&gdt;
 
     gdt_set_gate(0, 0, 0, 0, 0);                          /* null descriptor   */
@@ -47,6 +47,9 @@ void gdt_install(void) {
     uint32_t tss_base = (uint32_t)&kernel_tss;
     uint32_t tss_limit = sizeof(struct tss) - 1;
     gdt_set_gate(5, tss_base, tss_limit, 0xE9, 0x00);
+
+    /* TLS descriptor: user data segment, base = USER_TLS_VADDR (0xBFFFB000), 4GB limit */
+    gdt_set_gate(6, 0xBFFFB000, 0xFFFFFFFF, 0xF2, 0xCF);
 
     /* Clear TSS and set kernel stack at top of kernel stack area */
     for (uint32_t i = 0; i < sizeof(struct tss) / 4; i++)

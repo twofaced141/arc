@@ -6,6 +6,7 @@
 #define MULTIBOOT2_MAGIC 0x36d76289
 
 #define MULTIBOOT_TAG_END              0
+#define MULTIBOOT_TAG_CMDLINE          1
 #define MULTIBOOT_TAG_MODULE           3
 #define MULTIBOOT_TAG_BASIC_MEMINFO    4
 #define MULTIBOOT_TAG_MMAP             6
@@ -20,6 +21,12 @@ typedef struct {
     uint32_t total_size;
     uint32_t reserved;
 } __attribute__((packed)) multiboot2_info_t;
+
+typedef struct {
+    uint32_t type;
+    uint32_t size;
+    char     cmdline[];
+} __attribute__((packed)) multiboot2_tag_cmdline_t;
 
 typedef struct {
     uint32_t type;
@@ -64,18 +71,13 @@ typedef struct {
 typedef struct {
     uint32_t type;
     uint32_t size;
-    uint32_t fb_addr;
+    uint64_t fb_addr;
     uint32_t fb_pitch;
     uint32_t fb_width;
     uint32_t fb_height;
-    uint32_t fb_bpp;
-    uint32_t fb_type;
-    uint32_t fb_red_pos;
-    uint32_t fb_red_mask_size;
-    uint32_t fb_green_pos;
-    uint32_t fb_green_mask_size;
-    uint32_t fb_blue_pos;
-    uint32_t fb_blue_mask_size;
+    uint8_t  fb_bpp;
+    uint8_t  fb_type;
+    uint16_t fb_reserved;
 } __attribute__((packed)) multiboot2_tag_framebuffer_t;
 
 static inline multiboot2_tag_t *multiboot2_first_tag(multiboot2_info_t *info) {

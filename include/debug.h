@@ -6,6 +6,7 @@
 
 void debug_init(void);
 void debug_putchar(char c);
+void debug_write(const char *buf, unsigned int count);
 void debug_print(const char *s);
 void debug_println(const char *s);
 void debug_print_hex8(uint8_t value);

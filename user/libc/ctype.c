@@ -11,5 +11,6 @@ int isprint(int c) { return c >= 0x20 && c <= 0x7E; }
 int iscntrl(int c) { return (c >= 0 && c <= 0x1F) || c == 0x7F; }
 int ispunct(int c) { return isprint(c) && !isalnum(c) && !isspace(c); }
 int isgraph(int c) { return c > 0x20 && c <= 0x7E; }
+int isblank(int c) { return c == ' ' || c == '\t'; }
 int toupper(int c) { return islower(c) ? c - 32 : c; }
 int tolower(int c) { return isupper(c) ? c + 32 : c; }
