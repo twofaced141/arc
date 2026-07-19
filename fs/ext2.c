@@ -134,10 +134,13 @@ int ext2_read_inode(ext2_fs_t *fs, uint32_t inum, ext2_inode_t *inode) {
 }
 
 int ext2_read_block(ext2_fs_t *fs, uint32_t block_addr, void *buf) {
+    /* Guard against 32-bit overflow: block_addr * block_size must fit in uint32_t */
+    if (block_addr > 0xFFFFFFFFU / fs->block_size) return -1;
     return disk_read(fs, buf, block_addr * fs->block_size, fs->block_size);
 }
 
 int ext2_write_block(ext2_fs_t *fs, uint32_t block_addr, const void *buf) {
+    if (block_addr > 0xFFFFFFFFU / fs->block_size) return -1;
     return disk_write(fs, buf, block_addr * fs->block_size, fs->block_size);
 }
 

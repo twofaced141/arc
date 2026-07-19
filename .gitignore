@@ -19,5 +19,17 @@ iso_root/
 *.log
 log
 
+# Build artifacts
+*.a
+*.o
+*.elf
+*.iso
+*.bin
+*.img
+kallsyms_data.c
+
+# Planning
+.omo/
+
 # OS
 .DS_Store

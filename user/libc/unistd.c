@@ -832,7 +832,7 @@ int tcsendbreak(int fd, int duration) {
     return 0;
 }
 
-/* Socket stubs - kernel has no networking */
+/* Socket syscall wrappers */
 int socket(int domain, int type, int protocol) {
     return do_syscall(SYSCALL_SOCKET, domain, type, protocol, 0);
 }

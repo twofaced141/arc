@@ -92,6 +92,7 @@ static int user_range_ok(const void *addr, uint32_t size, int writable) {
     for (uint32_t page = start & ~0xFFF; page < end_page; page += PAGE_SIZE) {
         int flags = vmm_get_page_flags(dir, page);
         if (!(flags & VMM_PRESENT)) return 0;
+        if (!(flags & VMM_USER)) return 0;
         if (writable && !(flags & VMM_WRITABLE) && !(flags & VMM_COW)) return 0;
     }
     return 1;
@@ -677,6 +678,7 @@ void syscall_handler(registers_t *r) {
         if (prot & PROT_WRITE) page_flags |= VMM_WRITABLE;
 
         if (flags & MAP_PHYS) {
+            if (cur->uid != 0) { r->eax = (uint32_t)MAP_FAILED; break; }
             uint32_t phys_base = (uint32_t)fd;
             if ((phys_base & 0xFFF) != 0) { debug_printf("mmap: unaligned phys\n"); r->eax = (uint32_t)MAP_FAILED; break; }
             for (uint32_t i = 0; i < pages; i++) {
@@ -1145,6 +1147,7 @@ void syscall_handler(registers_t *r) {
         ext2_inode_t inode;
         if (ext2_read_inode(fs, ino, &inode) < 0)
             { r->eax = -1; break; }
+        if (cur->euid != inode.uid && cur->uid != 0) { r->eax = -1; break; }
         inode.mode = (inode.mode & ~0xFFF) | ((uint16_t)(r->ecx) & 0xFFF);
         inode.ctime = 0;
         r->eax = ext2_write_inode(fs, ino, &inode) == 0 ? 0 : -1;
@@ -1164,6 +1167,7 @@ void syscall_handler(registers_t *r) {
         ext2_inode_t inode;
         if (ext2_read_inode(fs, ino, &inode) < 0)
             { r->eax = -1; break; }
+        if (cur->uid != 0) { r->eax = -1; break; }
         inode.uid = (uint16_t)r->ecx;
         inode.gid = (uint16_t)r->edx;
         inode.ctime = 0;
@@ -1365,6 +1369,7 @@ void syscall_handler(registers_t *r) {
     }
     case SYSCALL_SETUID: {
         if (!cur) { r->eax = -1; break; }
+        if (cur->uid != 0) { r->eax = -1; break; }
         cur->uid = (uint16_t)r->ebx;
         cur->euid = (uint16_t)r->ebx;
         r->eax = 0;
@@ -1372,6 +1377,7 @@ void syscall_handler(registers_t *r) {
     }
     case SYSCALL_SETGID: {
         if (!cur) { r->eax = -1; break; }
+        if (cur->uid != 0) { r->eax = -1; break; }
         cur->gid = (uint16_t)r->ebx;
         cur->egid = (uint16_t)r->ebx;
         r->eax = 0;
@@ -1379,12 +1385,14 @@ void syscall_handler(registers_t *r) {
     }
     case SYSCALL_SETEUID: {
         if (!cur) { r->eax = -1; break; }
+        if (cur->uid != 0) { r->eax = -1; break; }
         cur->euid = (uint16_t)r->ebx;
         r->eax = 0;
         break;
     }
     case SYSCALL_SETEGID: {
         if (!cur) { r->eax = -1; break; }
+        if (cur->uid != 0) { r->eax = -1; break; }
         cur->egid = (uint16_t)r->ebx;
         r->eax = 0;
         break;
@@ -1588,8 +1596,9 @@ void syscall_handler(registers_t *r) {
         }
         break;
     case SYSCALL_MOUNT: {
+        if (!cur || cur->uid != 0) { r->eax = -1; break; }
         char kdev[256], ktarget[256];
-        if (!cur || strncpy_from_user(kdev, (const char *)r->ebx, 256) <= 0 ||
+        if (strncpy_from_user(kdev, (const char *)r->ebx, 256) <= 0 ||
             strncpy_from_user(ktarget, (const char *)r->ecx, 256) <= 0)
             { r->eax = -1; break; }
 
@@ -1673,6 +1682,7 @@ void syscall_handler(registers_t *r) {
         break;
     }
     case SYSCALL_OOM_KILL: {
+        if (!cur || cur->uid != 0) { r->eax = -1; break; }
         int pid = (int)r->ebx;
         if (pid == 0) {
             r->eax = oom_kill_victim();

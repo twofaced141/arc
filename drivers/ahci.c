@@ -614,6 +614,7 @@ static int ahci_block_write(block_device_t *dev, const void *buf, uint32_t lba, 
 
 int ahci_read_sectors(uint32_t lba, int count, void *buf) {
     if (!ahci_dev.present) return -1;
+    if (count * AHCI_SECTOR_SIZE > 8192) return -1;
 
     /* Use bounce buffer: DMA into it, then copy to caller */
     int ret = ahci_dma_transfer(lba, count, bounce_phys, 0);
@@ -628,6 +629,7 @@ int ahci_read_sectors(uint32_t lba, int count, void *buf) {
 
 int ahci_write_sectors(uint32_t lba, int count, const void *buf) {
     if (!ahci_dev.present) return -1;
+    if (count * AHCI_SECTOR_SIZE > 8192) return -1;
 
     /* Copy caller data to bounce buffer */
     uint8_t *dst = (uint8_t *)BOUNCE_VADDR;

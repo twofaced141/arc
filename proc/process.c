@@ -284,6 +284,10 @@ process_t *process_create_elf(file_t *file) {
         uint32_t seg_start = phdrs[i].p_vaddr;
         uint32_t seg_end_file = seg_start + phdrs[i].p_filesz;
         uint32_t seg_end_mem = seg_start + phdrs[i].p_memsz;
+        /* Check for 32-bit overflow */
+        if (seg_end_mem < phdrs[i].p_vaddr) goto err_load;
+        /* Must not overlap kernel space */
+        if (seg_end_mem > 0xC0000000) goto err_load;
         uint32_t page_start = seg_start & ~0xFFF;
         uint32_t page_end = (seg_end_mem + PAGE_SIZE - 1) & ~0xFFF;
 

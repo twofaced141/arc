@@ -525,6 +525,7 @@ int copy_from_user(void *dst, const void *user_src, uint32_t size) {
     uint32_t end_page = (addr + size + PAGE_SIZE - 1) & ~0xFFF;
     for (uint32_t page = addr & ~0xFFF; page < end_page; page += PAGE_SIZE) {
         if (!vmm_is_page_present(dir, page)) return -1;
+        if (!(vmm_get_page_flags(dir, page) & VMM_USER)) return -1;
     }
 
     for (uint32_t i = 0; i < size; i++)
@@ -543,6 +544,7 @@ int copy_to_user(void *user_dst, const void *src, uint32_t size) {
     for (uint32_t page = addr & ~0xFFF; page < end_page; page += PAGE_SIZE) {
         int flags = vmm_get_page_flags(dir, page);
         if (!(flags & VMM_PRESENT)) return -1;
+        if (!(flags & VMM_USER)) return -1;
         if (!(flags & VMM_WRITABLE) && !(flags & VMM_COW)) return -1;
     }
 
@@ -563,6 +565,7 @@ int strncpy_from_user(char *dst, const char *user_src, uint32_t max_len) {
     uint32_t end_page = (addr + max_len + PAGE_SIZE - 1) & ~0xFFF;
     for (uint32_t page = addr & ~0xFFF; page < end_page; page += PAGE_SIZE) {
         if (!vmm_is_page_present(dir, page)) return -1;
+        if (!(vmm_get_page_flags(dir, page) & VMM_USER)) return -1;
     }
 
     for (uint32_t i = 0; i < max_len; i++) {

@@ -120,7 +120,7 @@ int acpi_init(void) {
                             debug_printf(" %x", dsdt_copy[j+d]);
                         debug_printf("\r\n");
                         if (j+5 < dsdt_search && dsdt_copy[j+5] == 0x12) {
-                            sleep_type_a = 7;
+                            sleep_type_a = 0xFF; /* sentinel — _S5 not yet parsed */
                             uint32_t elem = j + 8;
                             int ei = 0;
                             while (elem < dsdt_search - 1 && ei < 4) {
@@ -143,7 +143,7 @@ int acpi_init(void) {
                 kfree(dsdt_copy);
             }
 
-            if (sleep_type_a == 0) {
+            if (sleep_type_a == 0xFF) {
                 debug_print("acpi: _S5 not found, using QEMU default 7\r\n");
                 sleep_type_a = 7;
             }
@@ -183,7 +183,13 @@ void acpi_poweroff(void) {
         debug_print("acpi: cannot poweroff (not initialized)\r\n");
         return;
     }
-    debug_print("acpi: poweroff (stub)\r\n");
+    debug_printf("acpi: poweroff via PM1a_CNT=0x%x SLP_TYP=%d\r\n",
+                 pm1a_cnt_blk, sleep_type_a);
+    __asm__ __volatile__("cli");
+    outw(pm1a_cnt_blk, (sleep_type_a << 10) | (1 << 13));
+    for (volatile int i = 0; i < 100000; i++);
+    debug_print("acpi: poweroff failed, halting\r\n");
+    for (;;) __asm__ __volatile__("hlt");
 }
 
 void acpi_reboot(void) {

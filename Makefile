@@ -7,7 +7,7 @@ CFLAGS   = -ffreestanding -nostdlib -nostartfiles -nodefaultlibs \
            -fno-pic -no-pie -fno-stack-protector \
            -fno-asynchronous-unwind-tables -mno-sse -mno-mmx -O0 \
            -fno-builtin -fno-omit-frame-pointer -I net -I include -I . -I $(LWIP_DIR)/src/include
-ASFLAGS  = --32
+ASFLAGS  = --32 -I interrupts
 LDFLAGS  = -T boot/linker.ld -nostdlib -m elf_i386
 
 KERNEL_DIRS = kernel interrupts drivers mm proc fs lib boot net

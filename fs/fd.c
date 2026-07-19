@@ -9,6 +9,7 @@
 #include "procfs.h"
 #include "net/socket.h"
 #include "devfs.h"
+#include "scheduler.h"
 
 void fd_init_table(fd_entry_t *table) {
     for (int i = 0; i < FD_MAX; i++) {
@@ -515,6 +516,8 @@ int fd_fchmod(fd_entry_t *table, int fd, uint16_t mode) {
     ext2_inode_t inode;
     if (ext2_read_inode(f->ext2_fs, f->ext2_ino, &inode) < 0)
         return -1;
+    process_t *cur = scheduler_current_process();
+    if (cur && cur->euid != inode.uid && cur->uid != 0) return -1;
     inode.mode = (inode.mode & ~0xFFF) | (mode & 0xFFF);
     inode.ctime = 0;
     return ext2_write_inode(f->ext2_fs, f->ext2_ino, &inode);
@@ -529,6 +532,8 @@ int fd_fchown(fd_entry_t *table, int fd, uint16_t uid, uint16_t gid) {
     ext2_inode_t inode;
     if (ext2_read_inode(f->ext2_fs, f->ext2_ino, &inode) < 0)
         return -1;
+    process_t *cur = scheduler_current_process();
+    if (cur && cur->uid != 0) return -1;
     inode.uid = uid;
     inode.gid = gid;
     inode.ctime = 0;
