@@ -2,6 +2,10 @@
 
 Minimal i386 kernel with multitasking, virtual memory, filesystems, TCP/IP networking, POSIX-like syscalls, and userspace sockets.
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Platform](https://img.shields.io/badge/platform-i386-blue.svg)]()
+[![Build](https://img.shields.io/badge/build-make-green.svg)]()
+
 ## Features
 
 - **Architecture**: i386, protected mode, higher-half kernel at `0xC0000000`
