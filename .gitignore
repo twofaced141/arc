@@ -3,6 +3,8 @@
 *.iso
 iso_root/
 *.bak
+*.bak2
+*.full
 arc.bin
 disk.img
 root.img
