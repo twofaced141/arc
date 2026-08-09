@@ -15,3 +15,5 @@ __pycache__/
 *.pyc
 *.d
 *.map
+PLAN.md
+SMP.md
