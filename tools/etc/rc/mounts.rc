@@ -1,0 +1,24 @@
+; mounts.rc — declarative filesystem mounts (arc init)
+;
+; The root filesystem is mounted by the kernel from the "root=" boot
+; argument before init runs; mount units cover everything else.
+; Device names are the kernel's block device names WITHOUT /dev/:
+; ramdisk, ahci0, ahci0p1, ahci0p2 ...
+
+; The boot partition (GRUB + kernel, ext2) — genuinely mounts once the
+; service executor ships.
+(unit bootfs
+  (type mount)
+  (device ahci0p1)
+  (fstype ext2)
+  (mountpoint /boot)
+  (flags ro))
+
+; Example: an in-memory /tmp on the embedded ramdisk (commented out —
+; it would shadow files written to the root fs on the same device).
+; (unit tmp
+;   (type mount)
+;   (device ramdisk)
+;   (fstype ufs)
+;   (mountpoint /tmp)
+;   (flags rw))

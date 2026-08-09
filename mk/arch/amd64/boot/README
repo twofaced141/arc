@@ -1,0 +1,16 @@
+amd64 (x86-64) port skeleton.
+
+TODO:
+- mk/arch/amd64/boot/linker.ld  — 64-bit ELF linker script (OUTPUT_FORMAT elf64-x86-64)
+- mk/arch/amd64/boot/boot.s     — 64-bit multiboot2 entry (long mode setup: EFER.LME, paging, GDT)
+- mk/arch/amd64/intr/           — 64-bit IDT, GDT, ISR, APIC
+- mk/arch/amd64/thread/         — 64-bit context switch (swapgs-based)
+- mk/arch/amd64/syscall/        — SYSCALL/SYSRET or SYSENTER/SYSEXIT handler
+- mk/arch/amd64/include/        — arch-specific headers (segments.h, paging.h, regs.h)
+
+Key differences from i386:
+- Paging: PML4 → PDP → PD → PT (48-bit virtual, 52-bit physical)
+- Interrupts: IDT with IST, APIC mandatory (no PIC)
+- Syscalls: MSR-based (LSTAR, STAR, SF_MASK) instead of int 0x80
+- Higher half: 0xFFFFFFFF80000000 (canonical) vs 0xC0000000
+- ABI: System V x86-64 (register args: rdi, rsi, rdx, rcx, r8, r9)

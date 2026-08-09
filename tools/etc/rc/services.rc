@@ -1,0 +1,42 @@
+; services.rc — long-running daemons (arc init)
+;
+; Units below are PLACEHOLDERS: the binaries (/sbin/driverd etc.) do not
+; exist in the root image yet.  The service executor is not written yet
+; either, so these only exercise parsing/listing.  Once the executor
+; lands, missing binaries will fail exec and respawn per policy — the
+; correct observable behavior.
+;
+; Field reference:
+;   (deps A B)      — A and B must be healthy first
+;   (after A)       — ordering without a hard dependency
+;   (respawn ...)   — never | on-failure (default) | always
+;   (ready port X)  — healthy when a service registers port X
+;   (ready sleep N) — healthy N seconds after start
+;   (stdio silent)  — /dev/null instead of the console
+
+(unit driverd
+  (type service)
+  (exec /sbin/driverd)
+  (deps bootfs)
+  (respawn on-failure))
+
+;(unit configd
+;  (type service)
+;  (exec /sbin/configd)
+;  (deps driverd)
+;  (ready port cfg)
+;  (uid 3)
+;  (env ARC_ROOT=/))
+
+;(unit syslogd
+;  (type service)
+;  (exec /sbin/syslogd)
+;  (deps configd)
+;  (respawn always))
+
+; One-shot example (commented out — /sbin/fsck does not exist yet):
+; (unit fsck-root
+;   (type oneshot)
+;   (exec /sbin/fsck /dev/ahci0p2)
+;   (deps bootfs)
+;   (stdio silent))
