@@ -9,7 +9,6 @@ arc.bin
 disk.img
 root.img
 host_test
-mkdisk
 .codegraph/
 __pycache__/
 *.pyc

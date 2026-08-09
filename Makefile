@@ -174,8 +174,8 @@ root.img: $(ROOT_IMG_DEPS) tools/mkfs_ufs.py
 	python3 tools/mkfs_ufs.py $@ --add user/init/init.elf:/sbin/init --add user/tests/sigexec/sigexec.elf:/sbin/sigexec --add user/drivers/driverd/driverd.elf:/sbin/driverd --add tools/etc/rc/mounts.rc:/etc/rc/mounts.rc --add tools/etc/rc/services.rc:/etc/rc/services.rc
 
 # Bootable disk image with MBR + 2 partitions (boot + root)
-disk.img: arc.elf mkdisk.sh
-	./mkdisk.sh
+disk.img: arc.elf tools/mkdisk.sh
+	tools/mkdisk.sh
 
 clean:
 	find . -name '*.o' -delete
