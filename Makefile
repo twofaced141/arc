@@ -24,8 +24,33 @@ endif
 BSD_ROOT = bsd
 BSD_DIRS = $(BSD_ROOT)/init $(BSD_ROOT)/proc $(BSD_ROOT)/sys $(BSD_ROOT)/vfs $(BSD_ROOT)/vfs/devfs \
            $(BSD_ROOT)/vfs/ext2 $(BSD_ROOT)/vfs/ufs $(BSD_ROOT)/signal $(BSD_ROOT)/tty $(BSD_ROOT)/uipc \
-           $(BSD_ROOT)/drivers $(BSD_ROOT)/drivers/serial \
+           $(BSD_ROOT)/drivers $(BSD_ROOT)/drivers/serial $(BSD_ROOT)/net $(BSD_ROOT)/net/arch \
            $(BSD_ROOT)/arch/i386 $(BSD_ROOT)/arch/amd64 $(BSD_ROOT)/arch/arm64
+
+# lwIP — vendored in bsd/net/lwip/src (see tools/vendor_lwip.sh + bsd/net/README.md).
+# Dirty upstream tree (doc/doxygen, contrib/*.sln, src/apps/http/fs/*.html) is
+# never committed: vendor script copies only whitelist.  Build uses explicit
+# LWIP_SRCS (from src/Filelists.mk), not wildcard over bsd/net/lwip.
+LWIPDIR  = bsd/net/lwip/src
+LWIP_AVAILABLE := $(wildcard $(LWIPDIR)/core/init.c)
+ifeq ($(LWIP_AVAILABLE),)
+  LWIP_SRCS :=
+else
+  LWIP_COREFILES = $(LWIPDIR)/core/init.c $(LWIPDIR)/core/def.c $(LWIPDIR)/core/dns.c \
+                   $(LWIPDIR)/core/inet_chksum.c $(LWIPDIR)/core/ip.c $(LWIPDIR)/core/mem.c \
+                   $(LWIPDIR)/core/memp.c $(LWIPDIR)/core/netif.c $(LWIPDIR)/core/pbuf.c \
+                   $(LWIPDIR)/core/raw.c $(LWIPDIR)/core/stats.c $(LWIPDIR)/core/sys.c \
+                   $(LWIPDIR)/core/altcp.c $(LWIPDIR)/core/altcp_alloc.c $(LWIPDIR)/core/altcp_tcp.c \
+                   $(LWIPDIR)/core/tcp.c $(LWIPDIR)/core/tcp_in.c $(LWIPDIR)/core/tcp_out.c \
+                   $(LWIPDIR)/core/timeouts.c $(LWIPDIR)/core/udp.c
+  LWIP_CORE4FILES = $(LWIPDIR)/core/ipv4/acd.c $(LWIPDIR)/core/ipv4/autoip.c $(LWIPDIR)/core/ipv4/dhcp.c \
+                    $(LWIPDIR)/core/ipv4/etharp.c $(LWIPDIR)/core/ipv4/icmp.c $(LWIPDIR)/core/ipv4/igmp.c \
+                    $(LWIPDIR)/core/ipv4/ip4_frag.c $(LWIPDIR)/core/ipv4/ip4.c $(LWIPDIR)/core/ipv4/ip4_addr.c
+  LWIP_NETIFFILES = $(LWIPDIR)/netif/ethernet.c
+  # APIFILES not needed for NO_SYS=1 raw API; keep err.c for error strings
+  LWIP_APIFILES = $(LWIPDIR)/api/err.c
+  LWIP_SRCS = $(LWIP_COREFILES) $(LWIP_CORE4FILES) $(LWIP_NETIFFILES) $(LWIP_APIFILES)
+endif
 
 ifeq ($(ARCH),arm64)
     MK_DIRS = mk/vm mk/dev mk/lib mk/time mk/smp \
@@ -91,9 +116,11 @@ LDFLAGS  = -T mk/arch/$(ARCH)/boot/linker.ld -nostdlib $(LD_ARCH)
 
 INCLUDES = -I mk/arch/$(ARCH)/include -I mk/include -I mk/dev/include -I mk/tests \
            -I include -I . $(BSD_INCLUDES) \
+           -I bsd/net -I bsd/net/arch \
+           $(if $(LWIP_AVAILABLE),-I $(LWIPDIR)/include -I $(LWIPDIR)/include/lwip,)
 
 
-SRCS_C = $(wildcard $(addsuffix /*.c,$(ALL_DIRS)))
+SRCS_C = $(wildcard $(addsuffix /*.c,$(ALL_DIRS))) $(LWIP_SRCS)
 SRCS_S = $(wildcard $(addsuffix /*.s,$(ALL_DIRS)))
 SRCS_S += $(wildcard $(addsuffix /*.S,$(ALL_DIRS)))
 OBJS   = $(patsubst %.c,%.o,$(SRCS_C)) \
@@ -151,6 +178,11 @@ user/init/init.elf: user/init/init.o user/rc/rcparse.o user/init/init.ld
 # exec signal-state probe
 user/tests/sigexec/sigexec.elf: user/tests/sigexec/sigexec.o user/tests/sigexec/sigexec.ld
 	$(LD) $(USER_LDFLAGS) -T user/tests/sigexec/sigexec.ld -o $@ user/tests/sigexec/sigexec.o
+
+# lwIP is whitelisted and needs different warnings (upstream triggers -Wunused-parameter etc.)
+bsd/net/lwip/%.o: CFLAGS += -Wno-unused-parameter -Wno-unused-function -Wno-sign-compare -Wno-missing-field-initializers
+# bsd/net/ (our wrapper) also sees lwIP headers
+bsd/net/%.o: CFLAGS += -Wno-unused-parameter
 
 %.o: %.c
 	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ $<

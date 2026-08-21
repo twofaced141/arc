@@ -1,0 +1,21 @@
+# lwIP вендор — грязь upstream никогда не коммитим
+# vendor скрипт качает и чистит, коммитим только whitelist:
+#   bsd/net/lwip/src/{core,api,include,netif}
+#   bsd/net/lwip/COPYING, bsd/net/lwip/.vendor_rev
+# Все ниже — игнорируется чтобы случайно не закоммитить мусор
+
+# upstream artifacts (doc, contrib, test) - если кто-то распаковал полный tarball
+lwip/doc/
+lwip/contrib/
+lwip/test/
+lwip/CMakeFiles/
+lwip/*.html
+lwip/**/*.html
+lwip/**/*.sln
+lwip/**/*.vcxproj
+lwip/**/*.vcfilters
+
+# временные файлы
+lwip/src/apps/
+lwip/src/netif/ppp/
+lwip/src/netif/lowpan*
