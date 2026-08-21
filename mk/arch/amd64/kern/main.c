@@ -198,6 +198,13 @@ static void mk_syscall_handler(registers_t *r) {
 void mk_init(struct arc_boot_info *boot_info) {
     log_print(LOG_LEVEL_DEBUG, "mk: init started\r\n");
 
+    /* Per-CPU access must work before the first page fault can fire
+     * (vmm_init below): GS.base = &cpus[0].arch.  cpu_init() re-runs
+     * arch_percpu_init() later — it is idempotent. */
+    cpus[0].id = 0;
+    cpus[0].state = CPU_ONLINE;
+    arch_percpu_init(&cpus[0]);
+
     idt_init();
     gdt_install();
     pic_remap();
@@ -386,19 +393,26 @@ void kernel_main(struct arc_boot_info *boot) {
         for (unsigned i = 1; i < cpu_count(); i++)
             cpu_send_ipi(cpu_get(i), IPI_RESCHEDULE);
 
+        /* Wait for each AP's monotonic IPI counter to advance (the
+         * transient need_resched flag is consumed by the AP's own
+         * scheduler_switch, so it is not observable from the BSP). */
         uint64_t spins = 0;
         int received = 0;
         while (spins++ < 100000000ULL) {
             arch_cpu_relax();
             received = 0;
             for (unsigned i = 1; i < cpu_count(); i++)
-                if (cpu_get(i)->arch.need_resched)
+                if (cpu_get(i)->ipi_received)
                     received++;
             if (received == (int)(cpu_count() - 1))
                 break;
         }
         log_printf(LOG_LEVEL_INFO, "smp: IPI_RESCHEDULE delivered to %d/%u CPUs\r\n",
                    received, cpu_count() - 1);
+    }
+
+    if (cpu_count() > 1) {
+        sched_dump_stats();
     }
 
     log_print(LOG_LEVEL_DEBUG, "arc: interrupts enabled\n");
@@ -408,3 +422,5 @@ void kernel_main(struct arc_boot_info *boot) {
         __asm__ __volatile__("hlt");
     }
 }
+
+
