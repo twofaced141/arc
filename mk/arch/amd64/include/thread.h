@@ -40,6 +40,7 @@
 
 /* Forward declaration — task.h includes thread.h, so we can't include it here */
 struct task;
+struct runqueue;
 
 #define THREAD_UNUSED   0
 #define THREAD_READY    1
@@ -77,6 +78,7 @@ typedef struct thread {
     struct thread *next;
     struct thread *prev;
     prio_array_t *array;
+    struct runqueue *rq;        /* home runqueue (per-CPU scheduler) */
 
     union { uint64_t rip; uint64_t eip; };
     union { uint64_t user_rsp; uint64_t user_esp; };

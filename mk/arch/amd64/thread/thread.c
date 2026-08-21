@@ -81,6 +81,7 @@ thread_t *thread_create(uint64_t rip, page_directory_t *page_dir, int user) {
     thr->next = NULL;
     thr->prev = NULL;
     thr->array = NULL;
+    thr->rq = NULL;
     thr->task = NULL;
 
     {
