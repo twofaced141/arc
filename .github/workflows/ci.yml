@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  # Primary target: build + host tests + real QEMU boot to userspace.
+  amd64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 parted grub-pc-bin grub-common e2fsprogs python3
+
+      - name: Host tests
+        run: make hosttest
+
+      - name: Build kernel
+        run: make ARCH=amd64 -j"$(nproc)"
+
+      - name: QEMU boot smoke test
+        run: tools/qa/qemu-smoke.sh amd64
+
+  # Experimental arch — must still build; boot covered by amd64 disk flow.
+  i386:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-multilib qemu-system-x86 \
+            parted grub-pc-bin grub-common e2fsprogs python3
+
+      - name: Build kernel
+        run: make ARCH=i386 -j"$(nproc)"
+
+      - name: QEMU boot smoke test
+        run: tools/qa/qemu-smoke.sh i386
+
+  # Experimental arch (QEMU virt only) — build + boot in virt.
+  arm64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu qemu-system-arm python3
+
+      - name: Build kernel
+        run: make ARCH=arm64 -j"$(nproc)" arc.bin
+
+      - name: QEMU boot smoke test (virt)
+        run: tools/qa/qemu-smoke.sh arm64
