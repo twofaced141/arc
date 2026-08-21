@@ -188,9 +188,10 @@ irq_common_stub:
 .global syscall_entry
 syscall_entry:
     movq %rsp, user_rsp(%rip)
-    movq kernel_tss+4(%rip), %rsp   /* TSS rsp0 = current thread's stack TOP */
-                                     /* (not syscall_kernel_rsp: that drifts   */
-                                     /* downward by one frame per syscall)     */
+    /* Per-CPU syscall stack: %gs:32 = cpu->arch.syscall_rsp0, kept in
+     * sync with the TSS rsp0 of this CPU by tss_set_kernel_stack().
+     * (Offset contract enforced by _Static_assert in arch_cpu.h.) */
+    movq %gs:32, %rsp
 
     push $0x23
     push user_rsp(%rip)

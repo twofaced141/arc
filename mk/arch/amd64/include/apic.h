@@ -119,6 +119,11 @@ void lapic_eoi(void);
 void lapic_write(int reg, uint32_t val);
 uint32_t lapic_read(int reg);
 
+/* Per-CPU LAPIC timer: calibrate against the PM timer and program a
+ * periodic 100 Hz interrupt on vector 32 (APs only — the BSP keeps
+ * the PIT). */
+void lapic_timer_percpu_init(void);
+
 int  ioapic_init(void);
 void ioapic_write(int reg, uint32_t val);
 uint32_t ioapic_read(int reg);

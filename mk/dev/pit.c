@@ -42,6 +42,7 @@
 #include "clocksource.h"
 #include "clockevent.h"
 #include "debug.h"
+#include "cpu.h"
 
 #define PIT_BASE_FREQ 1193180u
 #define PIT_IRQ       32
@@ -62,7 +63,15 @@ static void pit_set_next_event(uint64_t ticks) {
 
 static void timer_handler(registers_t *r) {
     (void)r;
-    clockevent_tick();
+#if defined(__x86_64__)
+    /* The PIT feeds the global tick counter; with per-CPU timers
+     * (Phase 12) only the BSP may tick it — APs use the LAPIC timer.
+     * cpu_current() is FS-based on i386, where per-CPU timers do not
+     * exist yet, so the guard is amd64-only. */
+    struct cpu *c = cpu_current();
+    if (c && c->id == 0)
+#endif
+        clockevent_tick();
 }
 
 static struct clockevent pit_clockevent = {

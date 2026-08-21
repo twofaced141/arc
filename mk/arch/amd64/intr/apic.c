@@ -98,6 +98,39 @@ void lapic_eoi(void) {
     lapic_write(LAPIC_REG_EOI, 0);
 }
 
+/* Busy-wait on the ACPI PM timer (3.579545 MHz); falls back to a
+ * countdown loop when no PM timer is present. */
+static void apic_delay_us(unsigned us) {
+    if (acpi_info.pm_tmr_blk) {
+        uint32_t start = inl(acpi_info.pm_tmr_blk);
+        uint32_t ticks = (uint32_t)((us * 3579545ULL) / 1000000ULL);
+        while ((uint32_t)(inl(acpi_info.pm_tmr_blk) - start) < ticks)
+            __asm__ __volatile__("pause");
+    } else {
+        for (volatile uint64_t i = 0; i < (uint64_t)us * 2000ULL; i++)
+            __asm__ __volatile__("pause");
+    }
+}
+
+/* Calibrate the LAPIC timer bus frequency with a 10 ms one-shot and
+ * program a periodic 100 Hz tick on vector 32 (same vector as the
+ * BSP's PIT, so the shared IRQ0 handler + scheduler tick logic just
+ * work on every CPU).  Runs with IF=0 and the timer LVT masked, so
+ * the calibration one-shot can never fire an interrupt. */
+void lapic_timer_percpu_init(void) {
+    lapic_write(LAPIC_REG_TIMER_DIV, LAPIC_DIV1);
+    lapic_write(LAPIC_REG_TIMER_ICOUNT, 0xFFFFFFFFu);
+    apic_delay_us(10000);
+    uint32_t remaining = lapic_read(LAPIC_REG_TIMER_CCOUNT);
+    uint32_t per_sec = (0xFFFFFFFFu - remaining) * 100u;
+    uint32_t count = per_sec / 100u;
+    if (count == 0)
+        count = 1;
+
+    lapic_write(LAPIC_REG_TIMER_ICOUNT, count);
+    lapic_write(LAPIC_REG_LVT_TIMER, LAPIC_TIMER_PERIODIC | 32);
+}
+
 /* ------------------------------------------------------------------ */
 /* IPI (Phase 8): physical-mode delivery to one APIC ID               */
 /* ------------------------------------------------------------------ */
@@ -119,20 +152,6 @@ static void lapic_send_icr(uint32_t apic_id, uint32_t icr) {
 /* Fixed delivery: used for the generic IPI vector. */
 void lapic_send_ipi(uint32_t apic_id, uint8_t vector) {
     lapic_send_icr(apic_id, ICR_DELIVERY_FIXED | vector);
-}
-
-/* Busy-wait on the ACPI PM timer (3.579545 MHz); falls back to a
- * countdown loop when no PM timer is present. */
-static void apic_delay_us(unsigned us) {
-    if (acpi_info.pm_tmr_blk) {
-        uint32_t start = inl(acpi_info.pm_tmr_blk);
-        uint32_t ticks = (uint32_t)((us * 3579545ULL) / 1000000ULL);
-        while ((uint32_t)(inl(acpi_info.pm_tmr_blk) - start) < ticks)
-            __asm__ __volatile__("pause");
-    } else {
-        for (volatile uint64_t i = 0; i < (uint64_t)us * 2000ULL; i++)
-            __asm__ __volatile__("pause");
-    }
 }
 
 /* INIT: assert (~10 ms) then deassert. */
