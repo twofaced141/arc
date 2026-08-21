@@ -74,33 +74,88 @@ static int port_grow_queue(ipc_port_t *port) {
     if (!new_q)
         return -1;
 
+    uint32_t *new_senders = (uint32_t *)kmalloc(new_size * sizeof(uint32_t));
+    if (!new_senders) {
+        kfree(new_q);
+        return -1;
+    }
+
     /* Copy existing messages into the new buffer (linearise the ring) */
     uint32_t count = port->queue_count;
     for (uint32_t i = 0; i < count; i++) {
         uint32_t src = (port->queue_head + i) % port->queue_size;
         new_q[i] = port->queue[src];
+        new_senders[i] = port->queue_senders[src];
     }
 
     kfree(port->queue);
+    kfree(port->queue_senders);
     port->queue = new_q;
+    port->queue_senders = new_senders;
     port->queue_size = new_size;
     port->queue_head = 0;
     port->queue_tail = count;
     return 0;
 }
 
-/* ---- Internal: move dispose rights into receiver's C-space ------ */
-static int deliver_dispose(task_t *receiver, const ipc_msg_t *msg) {
+/* ---- Internal: validate dispose descriptors against the sender's C-space.
+ *
+ * A sender may only dispose of capabilities it actually holds: every
+ * dispose handle must name a slot in the *sender's* cspace whose type
+ * matches the descriptor.  Without this check a malicious process could
+ * forge handles naming another task's slots, and deliver_dispose()
+ * (which resolves the source cspace from the handle's task id) would
+ * move that task's capabilities into the receiver's cspace. ---- */
+static int validate_dispose(task_t *sender, const ipc_msg_t *msg) {
+    if (!msg->ndispose)
+        return 0;
+    if (!sender)
+        return -1;
+    if (msg->ndispose > IPC_DISPOSE_MAX)
+        return -1;
+
+    for (uint32_t i = 0; i < msg->ndispose; i++) {
+        if (handle_task_id(msg->dispose[i].handle) != sender->task_id)
+            return -1;
+        int slot = handle_slot(msg->dispose[i].handle);
+        cslot_t *cs = cspace_lookup(&sender->cspace, slot);
+        if (!cs || !cs->in_use)
+            return -1;
+        if (cs->type != msg->dispose[i].type)
+            return -1;
+    }
+    return 0;
+}
+
+/* ---- Internal: move dispose rights into receiver's C-space ----
+ *
+ * The source cspace is resolved from the *recorded* sender task_id
+ * (stored in the queue slot at send time), never from the handle's
+ * task id field — a sender can forge that field to name a foreign
+ * task's slots. */
+static int deliver_dispose(task_t *receiver, const ipc_msg_t *msg,
+                           uint32_t sender_tid) {
+    if (sender_tid == 0)
+        return 0;
+
+    task_t *sender = task_find(sender_tid);
+    if (!sender)
+        return 0;   /* sender died — nothing to move */
+
     int moved = 0;
     for (uint32_t i = 0; i < msg->ndispose; i++) {
-        uint32_t src_tid = handle_task_id(msg->dispose[i].handle);
         int src_slot = handle_slot(msg->dispose[i].handle);
 
-        task_t *sender = task_find(src_tid);
-        if (!sender) continue;
+        /* Belt and braces: the handle must still name the recorded
+         * sender, not some other task. */
+        if (handle_task_id(msg->dispose[i].handle) != sender_tid)
+            continue;
 
         cslot_t *src = cspace_lookup(&sender->cspace, src_slot);
-        if (!src) continue;
+        if (!src)
+            continue;
+        if (src->type != msg->dispose[i].type)
+            continue;
 
         /* Move the slot from sender to receiver */
         int dst_slot = cspace_move(&sender->cspace, &receiver->cspace, src_slot);
@@ -118,6 +173,13 @@ ipc_port_t *port_create(void) {
 
     p->queue = (ipc_msg_t *)kmalloc(PORT_MIN_QUEUE_SIZE * sizeof(ipc_msg_t));
     if (!p->queue) {
+        kfree(p);
+        return NULL;
+    }
+
+    p->queue_senders = (uint32_t *)kmalloc(PORT_MIN_QUEUE_SIZE * sizeof(uint32_t));
+    if (!p->queue_senders) {
+        kfree(p->queue);
         kfree(p);
         return NULL;
     }
@@ -144,19 +206,22 @@ int port_destroy(ipc_port_t *port) {
 
     port->ref_count = 0;  /* mark dead */
 
-    /* Wake any blocked receiver */
+    /* Wake any blocked receiver.  The thread was pulled off the
+     * runqueue by port_recv (scheduler_remove_thread), so it must be
+     * re-enqueued — a raw state write would strand it forever. */
     if (port->blocked_tid) {
         thread_t *waiter = thread_find(port->blocked_tid);
-        if (waiter && waiter->state == THREAD_BLOCKED) {
-            waiter->state = THREAD_READY;
-        }
         port->blocked_tid = 0;
+        if (waiter)
+            scheduler_unblock_thread(waiter);
     }
 
     spin_unlock_irqrestore(&port->lock, flags);
 
     kfree(port->queue);
+    kfree(port->queue_senders);
     port->queue = NULL;
+    port->queue_senders = NULL;
     kfree(port);
     return 0;
 }
@@ -164,9 +229,13 @@ int port_destroy(ipc_port_t *port) {
 /* ---- Send ---- */
 
 int port_send(ipc_port_t *port, const ipc_msg_t *msg, task_t *sender) {
-    (void)sender;
     if (!port || !msg) return IPC_ERR_NOSLOT;
     PORT_ASSERT_VALID(port);
+
+    /* Capability-transfer sanity: the sender may only dispose of
+     * capabilities it holds (see validate_dispose). */
+    if (validate_dispose(sender, msg) < 0)
+        return IPC_ERR_INVAL;
 
     uint32_t flags;
     spin_lock_irqsave(&port->lock, &flags);
@@ -196,6 +265,10 @@ int port_send(ipc_port_t *port, const ipc_msg_t *msg, task_t *sender) {
     for (uint32_t i = 0; i < ndispose; i++) {
         slot->dispose[i] = msg->dispose[i];
     }
+
+    /* Record the true sender: deliver_dispose() resolves the source
+     * cspace from this value, never from the handle in the message. */
+    port->queue_senders[port->queue_tail] = sender ? sender->task_id : 0;
 
     port->queue_tail = (port->queue_tail + 1) % port->queue_size;
     port->queue_count++;
@@ -263,6 +336,7 @@ int port_recv(ipc_port_t *port, ipc_msg_t *msg) {
 
     /* Dequeue message */
     ipc_msg_t *slot = &port->queue[port->queue_head];
+    uint32_t sender_tid = port->queue_senders[port->queue_head];
     msg->msg_id    = slot->msg_id;
     msg->data_size = slot->data_size;
     msg->ndispose  = slot->ndispose;
@@ -276,10 +350,11 @@ int port_recv(ipc_port_t *port, ipc_msg_t *msg) {
 
     spin_unlock_irqrestore(&port->lock, flags);
 
-    /* Move dispose rights into receiver's C-space */
+    /* Move dispose rights into receiver's C-space.  The source is the
+     * recorded sender, not the handle's (forgable) task id. */
     task_t *receiver = task_current();
     if (receiver && msg->ndispose > 0) {
-        deliver_dispose(receiver, msg);
+        deliver_dispose(receiver, msg, sender_tid);
     }
 
     return IPC_OK;
@@ -440,12 +515,14 @@ int sys_port_call(uint64_t handle, ipc_msg_t *user_msg) {
     int ret = sys_port_send_handle(handle, &kmsg);
     if (ret != IPC_OK) {
         cspace_free_slot(&cur->cspace, reply_slot);
+        port_destroy(reply_port);
         return ret;
     }
 
     /* Block on reply (use existing recv on the call port + embedded reply_handle) */
     ret = sys_port_recv(reply_handle, user_msg);
     cspace_free_slot(&cur->cspace, reply_slot);
+    port_destroy(reply_port);
     return ret;
 }
 

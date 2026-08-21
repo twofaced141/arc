@@ -85,6 +85,7 @@ typedef struct ipc_port {
 
     /* Circular message queue (dynamically allocated, grows on demand) */
     ipc_msg_t  *queue;
+    uint32_t   *queue_senders;  /* per-slot sender task_id (kernel-only) */
     uint32_t    queue_size;     /* allocated slot count */
     uint32_t    queue_head;
     uint32_t    queue_tail;
