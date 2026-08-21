@@ -31,28 +31,53 @@
 
 
 #include "gdt.h"
+#include "cpu.h"
 
-/* GDT entries: 64-bit kernel code/data, 32-bit user segments, 64-bit user code,
- * TSS descriptor (2 entries wide) */
-static uint64_t gdt_entries[8];
+/* GDT: null, kernel code/data, user segments, then one 16-byte TSS
+ * descriptor per CPU.  CPU 0 keeps the historic selector 0x30;
+ * CPU i>0 gets 0x40 + 0x10*(i-1).  All CPUs share the same GDT image
+ * (the AP trampoline lgdt's it), but each loads its own TSS via ltr. */
+#define GDT_TSS0_ENTRY 6
+#define GDT_TSS0_SEL   0x30
+#define GDT_TSS_ENTRY(i)  (GDT_TSS0_ENTRY + 2 * (i))
+#define GDT_TSS_SEL(i)    ((i) == 0 ? GDT_TSS0_SEL \
+                                    : (uint16_t)(0x40 + 0x10 * ((i) - 1)))
+
+static uint64_t gdt_entries[GDT_TSS0_ENTRY + 2 * CPU_MAX];
 static struct {
     uint16_t limit;
     uint64_t base;
 } __attribute__((packed)) gdt_ptr;
 
-/* Non-static so syscall_entry (interrupts.s) can load rsp0 from it. */
-struct tss kernel_tss;
+static struct tss per_cpu_tss[CPU_MAX];
 
 /* Dedicated stacks for exceptions that must never run on the thread stack:
  * a double fault (e.g. overflowed/corrupt kernel stack) or NMI landing on
- * the broken stack would otherwise push it into a triple fault. */
+ * the broken stack would otherwise push it into a triple fault.  Shared by
+ * all CPUs' TSS IST entries (a simultaneous DF/NMI on two CPUs is not
+ * survivable anyway). */
 #define DF_STACK_SIZE  16384
 #define NMI_STACK_SIZE 8192
 static uint8_t df_stack[DF_STACK_SIZE] __attribute__((aligned(16)));
 static uint8_t nmi_stack[NMI_STACK_SIZE] __attribute__((aligned(16)));
 
 void tss_set_kernel_stack(uint64_t rsp0) {
-    kernel_tss.rsp0 = rsp0;
+    struct cpu *c = cpu_current();
+    unsigned id = c ? c->id : 0;
+    per_cpu_tss[id].rsp0 = rsp0;
+    if (c)
+        c->arch.syscall_rsp0 = rsp0;
+}
+
+static void gdt_set_tss_descriptor(int e, uint64_t base, uint32_t limit) {
+    gdt_entries[e] =
+        ((uint64_t)limit & 0xFFFF) |
+        ((base & 0xFFFF) << 16) |
+        (((base >> 16) & 0xFF) << 32) |
+        (0x89ULL << 40) |
+        ((((uint64_t)limit >> 16) & 0x0F) << 48) |
+        ((base >> 24) & 0xFFULL) << 56;
+    gdt_entries[e + 1] = (base >> 32);
 }
 
 /* Expose the installed GDT to the SMP code (AP trampoline shares it). */
@@ -69,37 +94,21 @@ void gdt_install(void) {
     gdt_entries[4] = 0x00CFF2000000FFFFULL;      /* 32-bit user data    (sel=0x23) DPL=3 */
     gdt_entries[5] = 0x0020FA0000000000ULL;      /* 64-bit user code    (sel=0x2B) DPL=3 */
 
-    /* Clear TSS */
-    for (uint32_t i = 0; i < sizeof(struct tss) / 8; i++)
-        ((uint64_t *)&kernel_tss)[i] = 0;
+    /* Clear all TSSes */
+    for (unsigned i = 0; i < CPU_MAX; i++) {
+        for (uint32_t w = 0; w < sizeof(struct tss) / 8; w++)
+            ((uint64_t *)&per_cpu_tss[i])[w] = 0;
+        per_cpu_tss[i].ist1 = (uint64_t)(uintptr_t)&df_stack[DF_STACK_SIZE];
+        per_cpu_tss[i].ist2 = (uint64_t)(uintptr_t)&nmi_stack[NMI_STACK_SIZE];
+        gdt_set_tss_descriptor(GDT_TSS_ENTRY(i), (uint64_t)&per_cpu_tss[i],
+                               sizeof(struct tss) - 1);
+    }
 
-    /* Set initial kernel stack (will be updated per-thread by scheduler) */
     {
         uint64_t rsp;
         __asm__ __volatile__("mov %%rsp, %0" : "=r"(rsp));
-        kernel_tss.rsp0 = rsp;
-    }
-
-    /* IST1 = double fault, IST2 = NMI: exceptions delivered through these
-     * IST indices switch to a dedicated stack regardless of the (possibly
-     * broken) interrupted stack, so the panic dump itself is safe. */
-    kernel_tss.ist1 = (uint64_t)(uintptr_t)&df_stack[DF_STACK_SIZE];
-    kernel_tss.ist2 = (uint64_t)(uintptr_t)&nmi_stack[NMI_STACK_SIZE];
-
-    /* Build 64-bit TSS descriptor (2 qwords, sel=0x30) */
-    {
-        uint64_t base = (uint64_t)&kernel_tss;
-        uint32_t limit = sizeof(struct tss) - 1;
-
-        gdt_entries[6] =
-            ((uint64_t)limit & 0xFFFF) |
-            ((base & 0xFFFF) << 16) |
-            (((base >> 16) & 0xFF) << 32) |
-            (0x89ULL << 40) |
-            ((((uint64_t)limit >> 16) & 0x0F) << 48) |
-            ((base >> 24) & 0xFFULL) << 56;
-
-        gdt_entries[7] = (base >> 32);
+        per_cpu_tss[0].rsp0 = rsp;
+        cpus[0].arch.syscall_rsp0 = rsp;
     }
 
     gdt_ptr.limit = sizeof(gdt_entries) - 1;
@@ -122,6 +131,19 @@ void gdt_install(void) {
         : "memory"
     );
 
-    /* Load TSS (selector 0x30 = entry 6, TI=GDT, RPL=0) */
-    __asm__ __volatile__("ltr %0" : : "r"((uint16_t)0x30));
+    /* Load the BSP TSS (selector 0x30) */
+    __asm__ __volatile__("ltr %0" : : "r"((uint16_t)GDT_TSS0_SEL));
+}
+
+/* AP-side: point TR at this CPU's TSS and seed rsp0/syscall_rsp0 with
+ * the trampoline stack so a user-mode interrupt on the AP works even
+ * before the first context switch.  Must run with GS set (cpu_current
+ * valid) — arch_ap_entry guarantees this. */
+void gdt_percpu_init(struct cpu *cpu) {
+    unsigned id = cpu->id;
+    uint64_t top = cpu->kernel_stack
+        ? (uint64_t)(uintptr_t)cpu->kernel_stack + THREAD_KSTACK_SIZE : 0;
+    per_cpu_tss[id].rsp0 = top;
+    cpu->arch.syscall_rsp0 = top;
+    __asm__ __volatile__("ltr %0" : : "r"(GDT_TSS_SEL(id)));
 }

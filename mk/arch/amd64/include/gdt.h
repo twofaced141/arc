@@ -35,6 +35,8 @@
 
 #include <stdint.h>
 
+struct cpu;
+
 #define KERNEL_CS 0x08
 #define KERNEL_DS 0x10
 
@@ -59,5 +61,6 @@ struct tss {
 void gdt_install(void);
 void tss_set_kernel_stack(uint64_t rsp0);
 void gdt_get_ptr(uint64_t *base, uint16_t *limit);
+void gdt_percpu_init(struct cpu *cpu);
 
 #endif

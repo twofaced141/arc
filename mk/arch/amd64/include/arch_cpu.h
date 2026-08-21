@@ -34,6 +34,7 @@
 #define ARCH_CPU_H
 
 #include <stdint.h>
+#include <stddef.h>
 
 struct cpu;
 
@@ -50,7 +51,13 @@ struct arch_cpu {
     uint32_t ipi_pending;       /* bitmask of pending IPI types */
     int      need_resched;      /* Phase 11: set by scheduler_ipi() */
     uint64_t stack_base;        /* per-CPU kernel stack (AP trampoline) */
+    uint64_t syscall_rsp0;      /* offset 32: syscall_entry reads %gs:32 */
 };
+
+/* interrupts.s loads %gs:32 for the syscall entry stack — keep the
+ * field at a fixed offset and refuse to build if it moves. */
+_Static_assert(offsetof(struct arch_cpu, syscall_rsp0) == 32,
+               "interrupts.s expects syscall_rsp0 at offset 32");
 
 static inline struct cpu *arch_cpu_current(void) {
     struct cpu *self;
