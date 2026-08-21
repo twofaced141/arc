@@ -5,7 +5,7 @@
  *
  * NO_SYS=1: ARC provides its own timers/threads (clockevent + scheduler),
  * so lwIP runs in NO_SYS mode (raw API, tcpip_thread disabled).
- * Memory: use lwIP mem/memp pools backed by ARC kmalloc/pmm.
+ * Memory uses lwIP mem/memp pools backed by ARC kmalloc/pmm.
  */
 
 #ifndef LWIPOPTS_H

@@ -3,8 +3,8 @@
  *
  * bsd/net/net.c — glue between ARC BSD personality and lwIP
  *
- * Пока lwIP не завендорен (bsd/net/lwip/src отсутствует) — no-op.
- * После vendor_lwip.sh здесь будет lwip_init() + net_timer_tick().
+ * No-op until lwIP is vendored (bsd/net/lwip/src missing).
+ * After vendor_lwip.sh it will call lwip_init() + net_timer_tick().
  */
 
 void net_init(void) {

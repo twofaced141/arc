@@ -1,64 +1,69 @@
-# bsd/net — сеть (lwIP)
+# bsd/net — networking (lwIP)
 
-`ARC` гибрид: `mk/` микроядро + `bsd/` personality. Сеть живет в `bsd/net/`,
-но сам стек - вендорный `lwIP` (BSD license, совместим с `LICENSE` ARC `BSD-3-Clause`).
+`ARC` is a hybrid: `mk/` microkernel + `bsd/` personality. Networking lives in
+`bsd/net/`, but the stack itself is vendored `lwIP` (BSD license, compatible
+with `LICENSE` `BSD-3-Clause`).
 
-## Почему lwIP грязный и как мы чистим
+## Why lwIP is noisy and how we clean it
 
-Upstream `lwip-tcpip/lwip` (см. `tools/vendor_lwip.sh:fetch`) содержит в одном
-репозитории то что не нужно ядру:
+Upstream `lwip-tcpip/lwip` (see `tools/vendor_lwip.sh:fetch`) bundles a lot
+that the kernel does not need in a single repository:
 
-* `doc/doxygen/output/*.html` - сгенеренный doxygen
-* `contrib/ports/win32/msvc/*.sln`, `*.vcxproj` - Visual Studio проекты
-* `contrib/examples/httpd/examples_fs/*.html`, `src/apps/http/fs/*.html` - примеры
-* `test/`, `contrib/Coverity/`, `CMake` артефакты
+* `doc/doxygen/output/*.html` — generated doxygen
+* `contrib/ports/win32/msvc/*.sln`, `*.vcxproj` — Visual Studio projects
+* `contrib/examples/httpd/examples_fs/*.html`, `src/apps/http/fs/*.html` — examples
+* `test/`, `contrib/Coverity/`, `CMake` artifacts
 
-Если добавить весь репо через `BSD_DIRS += bsd/net/lwip` + `wildcard *.c` - в сборку
-попадет мусор и `Makefile:96` соберет `makefsdata.c` как часть ядра.
+Adding the whole repo via `BSD_DIRS += bsd/net/lwip` + `wildcard *.c` would
+pull clutter into the build and `Makefile:96` would compile `makefsdata.c` as
+part of the kernel.
 
-Решение: **whitelist, а не wildcard**.
+Solution: **whitelist, not wildcard**.
 
-* `BSD_DIRS` содержит только `bsd/net` (наш код-обвязка: `socket.c`, `if.c`, `arch/*`)
-* `lwIP` лежит в `bsd/net/lwip/` как вендор, но компилируются только файлы из
-  `bsd/net/lwip/src/Filelists.mk` (`COREFILES` + `CORE4FILES` + `APIFILES` + `NETIFFILES`)
-  через явный `LWIP_SRCS` в корневом `Makefile`. См. `Makefile:LWIP_SRCS`.
-* Мусор физически не попадает в репо: `tools/vendor_lwip.sh` копирует только
-  `src/{core,api,include,netif} + COPYING + src/Filelists.mk` и отбрасывает
+* `BSD_DIRS` contains only `bsd/net` (our wrapper: `socket.c`, `if.c`, `arch/*`)
+* `lwIP` lives in `bsd/net/lwip/` as a vendor, but only files from
+  `bsd/net/lwip/src/Filelists.mk` (`COREFILES` + `CORE4FILES` + `APIFILES` +
+  `NETIFFILES`) are built via explicit `LWIP_SRCS` in the top-level `Makefile`.
+  See `Makefile:LWIP_SRCS`.
+* Clutter never enters the repo: `tools/vendor_lwip.sh` copies only
+  `src/{core,api,include,netif} + COPYING + src/Filelists.mk` and drops
   `doc/`, `contrib/`, `test/`, `*.html`, `*.sln`.
 
 ```
-bsd/net/                <- наш BSD personality (сокеты/if)
+bsd/net/                <- BSD personality (sockets/if)
   socket.c              <- sockfs vnode_ops VSOCK
-  if.c                  <- ifnet список
-  arch/cc.h             <- lwIP port: типы/byteorder
-  arch/sys_arch.c       <- NO_SYS=1 заглушки
-  lwip/                 <- вендор lwIP (только src/)
+  if.c                  <- ifnet list
+  arch/cc.h             <- lwIP port: types/byteorder
+  arch/sys_arch.c       <- NO_SYS=1 stubs
+  lwip/                 <- vendored lwIP (src/ only)
     src/core/*.c
     src/api/*.c
     src/include/lwip/*.h
     src/netif/ethernet.c
     COPYING
-  lwipopts.h            <- конфигурация lwIP для ARC
+  lwipopts.h            <- lwIP config for ARC
 ```
 
-## Вендоринг
+## Vendoring
 
-Не коммитим весь upstream. Для обновления:
+Do not commit the full upstream. To update:
 
 ```sh
-tools/vendor_lwip.sh --rev master   # качает tarball и чистит
-# или
+tools/vendor_lwip.sh --rev master   # download tarball and clean
+# or
 tools/vendor_lwip.sh --rev STABLE-2_2_0 --pin
 git add bsd/net/lwip bsd/net/lwipopts.h
 ```
 
-Скрипт идемпотентен, удаляет `*.html`, `*.sln`, `*.vcxproj`, `doxygen/`, `contrib/`.
+The script is idempotent and removes `*.html`, `*.sln`, `*.vcxproj`,
+`doxygen/`, `contrib/`.
 
-## Сборка
+## Build
 
-`Makefile` отдельно собирает `LWIP` с флагами:
+`Makefile` builds `LWIP` separately with:
+
 * `-I bsd/net -I bsd/net/lwip/src/include -I bsd/net/lwip/src/include/lwip`
-* `-I bsd/net/arch` для `cc.h`
-* `-Wno-unused-parameter` - lwIP триггерит штатные варнинги
+* `-I bsd/net/arch` for `cc.h`
+* `-Wno-unused-parameter` — lwIP triggers benign warnings
 
-Проверка: `make ARCH=amd64` должен показать `lwip: X files` и не тянуть `doc/`.
+Check: `make ARCH=amd64` should show `lwip: X files` and not pull `doc/`.
