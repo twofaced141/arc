@@ -2,12 +2,16 @@
 # mkdisk.sh — Create a bootable disk image with two partitions (NO ROOT NEEDED):
 #   p1: ext2 boot partition — GRUB core + kernel
 #   p2: UFS2 root partition — root filesystem (root.img from tools/mkfs_ufs.py)
+#
+# CI-only tooling: invoked by the QEMU smoke test (tools/qa/qemu-smoke.sh)
+# and GitHub Actions.  The kernel source tree build (make) does not use it.
 set -euo pipefail
 
-IMGDIR="$(cd "$(dirname "$0")" && pwd)"
-DISK_IMG="${IMGDIR}/disk.img"
-KERNEL="${IMGDIR}/arc.elf"
-ROOT_IMG="${IMGDIR}/root.img"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+DISK_IMG="${REPO_ROOT}/disk.img"
+KERNEL="${REPO_ROOT}/arc.elf"
+ROOT_IMG="${REPO_ROOT}/root.img"
 
 # Partition layout (MBR)
 BOOT_START_MiB=1        # start of partition 1 (also end of GRUB gap)

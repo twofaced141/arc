@@ -126,7 +126,7 @@ USER_LDFLAGS  = -nostdlib $(LD_ARCH)
 USER_PROGS = user/init/init.elf user/tests/sigexec/sigexec.elf \
              user/drivers/driverd/driverd.elf
 
-.PHONY: all clean run disk user
+.PHONY: all clean user
 
 all: arc.elf user
 
@@ -173,9 +173,11 @@ root.img: $(ROOT_IMG_DEPS) tools/mkfs_ufs.py
 	@echo "  GEN     $@"
 	python3 tools/mkfs_ufs.py $@ --add user/init/init.elf:/sbin/init --add user/tests/sigexec/sigexec.elf:/sbin/sigexec --add user/drivers/driverd/driverd.elf:/sbin/driverd --add tools/etc/rc/mounts.rc:/etc/rc/mounts.rc --add tools/etc/rc/services.rc:/etc/rc/services.rc
 
-# Bootable disk image with MBR + 2 partitions (boot + root)
-disk.img: arc.elf tools/mkdisk.sh
-	tools/mkdisk.sh
+# Bootable disk image with MBR + 2 partitions (boot + root).
+# CI-only: built by tools/qa/qemu-smoke.sh, not part of the kernel build.
+.PHONY: disk.img
+disk.img: arc.elf root.img tools/qa/mkdisk.sh
+	tools/qa/mkdisk.sh
 
 clean:
 	find . -name '*.o' -delete
@@ -212,15 +214,9 @@ host_test: $(HOST_TEST_SRCS)
 clean-hosttest:
 	rm -f host_test
 
-run: disk.img arc.bin
-ifeq ($(ARCH),arm64)
-	qemu-system-aarch64 -machine virt,gic-version=2 -cpu cortex-a57 \
-		-display none -serial stdio -m 64 -kernel arc.bin
-else
-	qemu-system-x86_64 -machine q35 \
-		-drive file=disk.img,format=raw,if=ide \
-		-serial stdio -no-reboot -m 64
-endif
+# QEMU boot smoke test (any arch): tools/qa/qemu-smoke.sh
+#   amd64/i386: boots a GRUB disk image (built by tools/qa/mkdisk.sh)
+#   arm64:      boots arc.bin in QEMU virt
 
 # arm64: QEMU only places the DTB in RAM when booting a raw binary
 # (-kernel with an ELF gives x0=0 and no DTB), so the kernel is
