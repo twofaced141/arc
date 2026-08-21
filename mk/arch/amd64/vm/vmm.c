@@ -40,6 +40,7 @@
 #include "personality.h"
 #include "scheduler.h"
 #include "thread.h"
+#include "cpu.h"
 
 /* amd64 4-level paging:
  *
@@ -63,7 +64,9 @@
 #define IDENTITY_MAP_SIZE 0x4000000ULL   /* 64MB */
 
 static pml4_t *kernel_pml4;
-static pml4_t *current_pml4;
+/* Per-CPU active PML4 (Phase 12): each CPU runs its own CR3 and the
+ * fault/walk paths must use that CPU's directory. */
+static pml4_t *current_pml4[CPU_MAX];
 static pdp_t *kernel_low_pdp;
 
 static inline void invlpg(uintptr_t addr) {
@@ -200,7 +203,7 @@ void vmm_init(void) {
                        | VMM_PRESENT | VMM_WRITABLE | PTE_HUGE;
     }
 
-    current_pml4 = kernel_pml4;
+    current_pml4[0] = kernel_pml4;   /* vmm_init runs on the BSP */
     switch_cr3((uintptr_t)kernel_pml4);
     log_printf(LOG_LEVEL_INFO, "vmm: kernel_pml4 phys=%p\r\n", (void *)kernel_pml4);
 
@@ -467,14 +470,22 @@ page_directory_t *vmm_create_directory(void) {
 void vmm_switch_directory(page_directory_t *dir) {
     if (!dir)
         return;
-    current_pml4 = dir;
+    current_pml4[cpu_current()->id] = dir;
     switch_cr3((uintptr_t)dir);
+}
+
+static int vmm_dir_in_use(page_directory_t *dir) {
+    for (unsigned i = 0; i < CPU_MAX; i++) {
+        if (current_pml4[i] == dir)
+            return 1;
+    }
+    return 0;
 }
 
 void vmm_free_directory(page_directory_t *dir) {
     if (!dir)
         return;
-    if (dir == kernel_pml4 || dir == current_pml4)
+    if (dir == kernel_pml4 || vmm_dir_in_use(dir))
         return;
 
     for (int pml4i = 0; pml4i < 512; pml4i++) {
@@ -519,7 +530,7 @@ void vmm_free_directory(page_directory_t *dir) {
 }
 
 page_directory_t *vmm_get_current_directory(void) {
-    return current_pml4;
+    return current_pml4[cpu_current()->id];
 }
 
 page_directory_t *vmm_get_kernel_directory(void) {
@@ -596,8 +607,8 @@ void vmm_register_fault_handler(page_fault_handler_t handler) {
 /* Copy-on-write: the faulting page is COW (read-only, VMM_COW set).
  * Allocate a private page, copy the shared contents through the temp
  * slot, and remap the faulting address writable. */
-static int handle_cow_fault(uint64_t fault_addr) {
-    uint64_t *pte = walk_leaf(current_pml4, fault_addr);
+static int handle_cow_fault(pml4_t *pml4, uint64_t fault_addr) {
+    uint64_t *pte = walk_leaf(pml4, fault_addr);
     if (!pte || !(*pte & VMM_PRESENT))
         return 0;
     if (!(*pte & VMM_COW))
@@ -626,10 +637,11 @@ static int handle_cow_fault(uint64_t fault_addr) {
 void page_fault_handler(registers_t *r) {
     uint64_t fault_addr = read_cr2();
     uint32_t error_code = (uint32_t)r->err_code;
+    pml4_t *pml4 = current_pml4[cpu_current()->id];
 
     if (error_code & 0x4) {
         /* Fault in user mode */
-        if ((error_code & 0x1) && handle_cow_fault(fault_addr))
+        if ((error_code & 0x1) && handle_cow_fault(pml4, fault_addr))
             return;
         if (user_fault_handler) {
             user_fault_handler(r, fault_addr, error_code);
@@ -665,13 +677,13 @@ void page_fault_handler(registers_t *r) {
                  (r->rip >= 0x100000 && r->rip < 0x117050) ? "TEXT" : "NOT-TEXT");
     log_printf(LOG_LEVEL_ERROR, "PF: cr3=0x%lx fault_mapped=%s rip_mapped=%s\r\n",
                  cr3,
-                 walk_leaf(current_pml4, fault_addr) ? "yes" : "NO",
-                 walk_leaf(current_pml4, r->rip) ? "yes" : "NO");
+                 walk_leaf(pml4, fault_addr) ? "yes" : "NO",
+                 walk_leaf(pml4, r->rip) ? "yes" : "NO");
     log_printf(LOG_LEVEL_ERROR, "PF: cur tid=%u name='%s' state=%u kernel_rsp=0x%lx\r\n",
                  ct ? ct->tid : 0, ct ? ct->name : "?", ct ? ct->state : 0,
                  ct ? ct->kernel_rsp : 0);
 
-    uint64_t *rip_pte = walk_leaf(current_pml4, r->rip);
+    uint64_t *rip_pte = walk_leaf(pml4, r->rip);
     if (rip_pte) {
         log_printf(LOG_LEVEL_ERROR, "PF: rip bytes: ");
         for (int i = 0; i < 8; i++)
@@ -683,8 +695,8 @@ void page_fault_handler(registers_t *r) {
 
     log_printf(LOG_LEVEL_ERROR, "PF: rsp=0x%lx rbp=0x%lx", r->rsp, r->rbp);
     if (r->rbp >= 0x1000) {
-        uint64_t *rp = walk_leaf(current_pml4, r->rbp);
-        uint64_t *rpr = walk_leaf(current_pml4, r->rbp + 8);
+        uint64_t *rp = walk_leaf(pml4, r->rbp);
+        uint64_t *rpr = walk_leaf(pml4, r->rbp + 8);
         if (rp && rpr) {
             log_printf(LOG_LEVEL_ERROR, " rbp[ret]=0x%lx", *(uint64_t *)(uintptr_t)(r->rbp + 8));
         }
