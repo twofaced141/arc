@@ -147,8 +147,10 @@ int arch_percpu_init(struct cpu *cpu) {
 /* ------------------------------------------------------------------ */
 
 void arch_ap_entry(struct cpu *cpu) {
-    /* Long mode, per-CPU stack, GS set, shared GDT/IDT. */
-    lapic_init();   /* INIT left the LAPIC disabled — enables SVR, masks LVTs */
+    lapic_init();
+    gdt_percpu_init(cpu);
+    lapic_timer_percpu_init();
+
     cpu_ap_main(cpu);
     /* never returns */
 }

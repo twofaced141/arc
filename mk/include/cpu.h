@@ -71,6 +71,8 @@ struct cpu {
     struct runqueue *runqueue;
     void *kernel_stack;
 
+    volatile unsigned long ipi_received; /* Phase 11: monotonic IPI count */
+
     struct arch_cpu arch;
 };
 

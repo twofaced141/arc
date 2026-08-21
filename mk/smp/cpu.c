@@ -201,8 +201,10 @@ void ipi_handler(enum ipi_type type) {
 __attribute__((weak))
 void scheduler_ipi(void) {
     struct cpu *cpu = cpu_current();
-    if (cpu)
+    if (cpu) {
+        cpu->ipi_received++;
         cpu->arch.need_resched = 1;
+    }
 }
 
 /* Phase 14: TLB shootdown target — arch-specific flush; no-op until
