@@ -615,11 +615,13 @@ void vmm_register_fault_handler(page_fault_handler_t handler) {
     user_fault_handler = handler;
 }
 
-/* Copy-on-write: the faulting page is COW (read-only, VMM_COW set).
- * Allocate a private page, copy the shared contents through the temp
- * slot, and remap the faulting address writable. */
-static int handle_cow_fault(pml4_t *pml4, uint64_t fault_addr) {
-    uint64_t *pte = walk_leaf(pml4, fault_addr);
+/* Copy-on-write core: if the page is COW (read-only, VMM_COW set),
+ * allocate a private page, copy the shared contents through the temp
+ * slot, and remap writable.  Public so mprotect(PROT_WRITE) can break
+ * sharing explicitly instead of silently keeping parent and child on
+ * one physical page.  Returns 1 if the page was broken, 0 otherwise. */
+int vmm_cow_break(pml4_t *pml4, uint64_t virt) {
+    uint64_t *pte = walk_leaf(pml4, virt);
     if (!pte || !(*pte & VMM_PRESENT))
         return 0;
     if (!(*pte & VMM_COW))
@@ -638,11 +640,18 @@ static int handle_cow_fault(pml4_t *pml4, uint64_t fault_addr) {
     }
 
     *pte = (new_phys & ~0xFFFULL) | ((*pte & 0xFFF) & ~(VMM_WRITABLE | VMM_COW)) | VMM_WRITABLE;
-    invlpg(fault_addr);
+    invlpg(virt);
 
-    memcpy((void *)(uintptr_t)(fault_addr & ~0xFFFULL), old_va, PAGE_SIZE);
+    memcpy((void *)(uintptr_t)(virt & ~0xFFFULL), old_va, PAGE_SIZE);
     vmm_temp_unmap();
     return 1;
+}
+
+/* Copy-on-write: the faulting page is COW (read-only, VMM_COW set).
+ * Allocate a private page, copy the shared contents through the temp
+ * slot, and remap the faulting address writable. */
+static int handle_cow_fault(pml4_t *pml4, uint64_t fault_addr) {
+    return vmm_cow_break(pml4, fault_addr);
 }
 
 void page_fault_handler(registers_t *r) {

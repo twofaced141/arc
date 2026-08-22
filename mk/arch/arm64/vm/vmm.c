@@ -492,6 +492,13 @@ static int handle_cow(page_directory_t *l0, uint64_t fault_addr) {
     return 1;
 }
 
+/* Public COW break for mprotect(PROT_WRITE): arm64 marks COW pages
+ * read-only via ATTR_AP_RO, so a plain flag rewrite would leave two
+ * tasks writing one physical page.  Returns 1 if the page was broken,
+ * 0 if it was not shared (or could not be broken). */
+int vmm_cow_break(page_directory_t *l0, uint64_t virt) {
+    return handle_cow(l0, virt);
+}
 
 void vmm_fork_cow_pages(page_directory_t *parent_dir, page_directory_t *child_dir) {
     if (!parent_dir || !child_dir) return;

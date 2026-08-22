@@ -471,6 +471,28 @@ int64_t sys_mprotect(proc_t *p, registers_t *r) {
             if (!vmm_present(p, pg))
                 continue;   /* not yet materialized: prot applies on fault */
             uint32_t fl = vmm_get_page_flags(p->page_dir, pg);
+
+            /* Making a page writable must first privatize it if it is
+             * copy-on-write shared with a parent/child after fork().
+             * Just OR-ing VMM_WRITABLE into a COW PTE left both tasks
+             * silently writing one physical page.  On allocation
+             * failure report ENOMEM (POSIX allows it here). */
+            if (prot & PROT_WRITE) {
+#if defined(__aarch64__)
+                /* arm64 PTEs carry no VMM_COW flag bit (COW pages are
+                 * simply read-only), so any not-yet-writable page may
+                 * be shared — break it before granting write access. */
+                int cow = !(fl & VMM_WRITABLE);
+#else
+                int cow = (fl & VMM_COW) != 0;
+#endif
+                if (cow) {
+                    if (!vmm_cow_break(p->page_dir, pg))
+                        return -ENOMEM;
+                    fl = vmm_get_page_flags(p->page_dir, pg);
+                }
+            }
+
             uint64_t new = fl & ~((uint64_t)VMM_WRITABLE);
 #if defined(__x86_64__)
             new &= ~VMM_NX;

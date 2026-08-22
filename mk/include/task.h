@@ -123,6 +123,13 @@ void     task_init(void);
 task_t  *task_create(const char *name);
 void     task_destroy(task_t *task);
 task_t  *task_find(uint32_t task_id);
+/* Like task_find, but returns with task_lock HELD (IRQ state stored in
+ * *flags): the caller must task_put() when done.  Use this whenever
+ * the result is dereferenced after inspection — plain task_find can
+ * return a pointer that is kfree'd by a concurrent task_destroy
+ * before use. */
+task_t  *task_find_hold(uint32_t task_id, uint32_t *flags);
+void     task_put(task_t *task, uint32_t flags);
 task_t  *task_current(void);    /* task of the running thread */
 
 /* ---- C-space operations ---- */
@@ -131,6 +138,11 @@ void     cspace_destroy(cspace_t *cs);
 int      cspace_alloc_slot(cspace_t *cs, uint32_t type, uint32_t rights, uint64_t object_id);
 int      cspace_free_slot(cspace_t *cs, int slot);
 cslot_t *cspace_lookup(cspace_t *cs, int slot);
+/* Copy the slot's contents under the cspace lock into *out; returns 0
+ * on success, -1 if the slot is invalid.  Prefer this over holding the
+ * raw cslot_t* from cspace_lookup: the array can be swapped by a
+ * concurrent grow. */
+int      cspace_lookup_snapshot(cspace_t *cs, int slot, cslot_t *out);
 int      cspace_move(cspace_t *from, cspace_t *to, int slot);
 
 /* ---- Syscalls ---- */

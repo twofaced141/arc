@@ -98,7 +98,10 @@ isr_common_stub:
     mov $0x10, %ax
     mov %ax, %ds
     mov %ax, %es
-    mov %ax, %fs
+    /* FS deliberately NOT reloaded: kernel code never uses %fs-relative
+     * memory (no stack protector), and reloading the selector zeroes the
+     * hidden FSBASE — which destroyed user TLS (arch_prctl/set_thread_area)
+     * on every interrupt or syscall that did not context-switch. */
 
 
     cld
@@ -149,7 +152,10 @@ irq_common_stub:
     mov $0x10, %ax
     mov %ax, %ds
     mov %ax, %es
-    mov %ax, %fs
+    /* FS deliberately NOT reloaded: kernel code never uses %fs-relative
+     * memory (no stack protector), and reloading the selector zeroes the
+     * hidden FSBASE — which destroyed user TLS (arch_prctl/set_thread_area)
+     * on every interrupt or syscall that did not context-switch. */
 
 
     cld
@@ -223,7 +229,10 @@ syscall_entry:
     mov $0x10, %ax
     mov %ax, %ds
     mov %ax, %es
-    mov %ax, %fs
+    /* FS deliberately NOT reloaded: kernel code never uses %fs-relative
+     * memory (no stack protector), and reloading the selector zeroes the
+     * hidden FSBASE — which destroyed user TLS (arch_prctl/set_thread_area)
+     * on every interrupt or syscall that did not context-switch. */
 
 
     cld

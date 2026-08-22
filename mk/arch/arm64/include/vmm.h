@@ -77,6 +77,9 @@ int vmm_map_page(page_directory_t *dir, uint64_t phys, uint64_t virt, uint64_t f
 void vmm_unmap_page(page_directory_t *dir, uint64_t virt);
 uint64_t vmm_get_physical(page_directory_t *dir, uint64_t virt);
 int vmm_get_page_flags(page_directory_t *dir, uint64_t virt);
+/* Break copy-on-write sharing on a user page (mprotect PROT_WRITE).
+ * Returns 1 if the page was privatized, 0 if it was not COW. */
+int vmm_cow_break(page_directory_t *dir, uint64_t virt);
 int vmm_is_page_present(page_directory_t *dir, uint64_t virt);
 
 void vmm_register_fault_handler(page_fault_handler_t handler);

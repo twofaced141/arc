@@ -51,6 +51,7 @@
 #define IPC_DATA_SIZE      64
 #define IPC_DISPOSE_MAX    4
 #define PORT_DEFAULT_QUEUE_SIZE  128  /* dynamic, grown on demand */
+#define PORT_WAITERS_MAX   8          /* blocked recv/poll threads per port */
 
 /* ---- IPC error codes ---- */
 #define IPC_OK         0
@@ -80,7 +81,8 @@ typedef struct ipc_msg {
 /* ---- Port object ---- */
 typedef struct ipc_port {
     uint32_t   magic;          /* 0x504F5254 — corruption canary */
-    int        ref_count;
+    int        ref_count;      /* references from cspace slots; mutated
+                                 only under port_table_lock (see below) */
     spinlock_t lock;
 
     /* Circular message queue (dynamically allocated, grows on demand) */
@@ -94,8 +96,11 @@ typedef struct ipc_port {
     /* Pending notify flag (single bit, cleared on first recv) */
     int        pending_notify;
 
-    /* Thread blocked on recv (0 = none) */
-    uint32_t   blocked_tid;
+    /* Threads blocked in recv/poll on this port.  A single blocked_tid
+     * lost wakeups whenever two threads received from one port; the
+     * list is bounded and deduplicated.  Manipulated under ->lock. */
+    uint32_t   waiters[PORT_WAITERS_MAX];
+    int        waiter_count;
 } ipc_port_t;
 
 /* ================================================================
@@ -103,7 +108,14 @@ typedef struct ipc_port {
  * ================================================================ */
 
 ipc_port_t *port_create(void);
+/* Mark the port dead, wake its waiters, drop one reference (the
+ * creator's).  The memory is freed when the last slot reference goes
+ * away via port_release(). */
 int         port_destroy(ipc_port_t *port);
+/* Drop one reference taken by a lookup; frees the port at zero.
+ * Safe to call with a stale pointer: membership in the global port
+ * table is verified first. */
+void        port_release(ipc_port_t *port);
 int         port_send(ipc_port_t *port, const ipc_msg_t *msg, task_t *sender);
 int         port_recv(ipc_port_t *port, ipc_msg_t *msg);
 int         port_notify(ipc_port_t *port);

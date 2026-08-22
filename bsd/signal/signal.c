@@ -85,23 +85,27 @@ int signal_deliver(proc_t *p, int sig, registers_t *r) {
     }
 
     sighandler_t h = p->signals.handler[sig];
-    p->signals.pending[sig] = 0;
 
-    if (h == SIG_IGN)
+    if (h == SIG_IGN) {
+        p->signals.pending[sig] = 0;
         return 0;
+    }
 
     if (h == SIG_DFL) {
         switch (signal_default_action(sig)) {
         case SIGACT_IGN:
+            p->signals.pending[sig] = 0;
             return 0;
         case SIGACT_STOP:
             p->state = PRS_STOPPED;
             p->stopped = 1;
             p->exit_sig = (uint8_t)sig;
+            p->signals.pending[sig] = 0;
             return 0;
         case SIGACT_CONT:
             p->state = PRS_NORMAL;
             p->stopped = 0;
+            p->signals.pending[sig] = 0;
             return 0;
         case SIGACT_TERM:
         case SIGACT_CORE:
@@ -126,6 +130,7 @@ int signal_deliver(proc_t *p, int sig, registers_t *r) {
      * Rewind the PC past the syscall instruction and save the syscall
      * number + argument registers; sigreturn re-executes it after the
      * handler returns.  A fresh frame starts restart-inactive. */
+    uint32_t new_eip = r->eip;
     if (p->signals.syscall_restartable &&
         (p->signals.sa_flags[sig] & SA_RESTART)) {
         frame.restart_active = 1;
@@ -136,16 +141,19 @@ int signal_deliver(proc_t *p, int sig, registers_t *r) {
         frame.restart_arg3   = r->esi;
         frame.restart_arg4   = r->edi;
         frame.restart_arg5   = r->ebp;
-        r->eip -= BSD_SYSCALL_INS_LEN;
-        frame.saved_eip = r->eip;
-        p->signals.restart_frame = 1;
+        new_eip = r->eip - BSD_SYSCALL_INS_LEN;
+        frame.saved_eip = new_eip;
     } else {
         frame.restart_active = 0;
         frame.restart_sysno  = 0;
     }
 
-    /* Block the delivered signal and the handler's sa_mask while the
-     * handler runs; restore on sigreturn. */
+    /* Compute the handler mask but do NOT commit it yet: the frame is
+     * installed in user memory first, and only on success does any
+     * kernel state change.  A failed copy (bad altstack, unmapped
+     * stack) must leave the signal pending and the mask untouched —
+     * otherwise the signal silently disappears and sigreturn never
+     * runs to restore the saved mask. */
     uint32_t old_mask = 0;
     for (int i = 1; i < NSIG; i++)
         if (p->signals.blocked[i])
@@ -156,8 +164,6 @@ int signal_deliver(proc_t *p, int sig, registers_t *r) {
     if (!(p->signals.sa_flags[sig] & SA_NODEFER))
         new_mask |= (1u << sig);
     new_mask |= p->signals.sa_mask[sig];
-    for (int i = 1; i < NSIG; i++)
-        p->signals.blocked[i] = (new_mask & (1u << i)) ? 1 : 0;
 
     uint32_t stack = r->useresp;
     if ((p->signals.sa_flags[sig] & SA_ONSTACK) && p->signals.ss_active &&
@@ -189,6 +195,13 @@ int signal_deliver(proc_t *p, int sig, registers_t *r) {
         copy_to_user((void *)(uintptr_t)(esp + 4), &sig, sizeof(sig)) != 0)
         return -EFAULT;
 
+    /* Frame is in user memory — commit all kernel-side state now. */
+    p->signals.pending[sig] = 0;
+    for (int i = 1; i < NSIG; i++)
+        p->signals.blocked[i] = (new_mask & (1u << i)) ? 1 : 0;
+    if (frame.restart_active)
+        p->signals.restart_frame = 1;
+
     r->useresp = esp;
     r->eip = (uint32_t)h;
     p->signals.in_signal = 1;
@@ -211,23 +224,27 @@ int signal_deliver(proc_t *p, int sig, registers_t *r) {
     }
 
     sighandler_t h = p->signals.handler[sig];
-    p->signals.pending[sig] = 0;
 
-    if (h == SIG_IGN)
+    if (h == SIG_IGN) {
+        p->signals.pending[sig] = 0;
         return 0;
+    }
 
     if (h == SIG_DFL) {
         switch (signal_default_action(sig)) {
         case SIGACT_IGN:
+            p->signals.pending[sig] = 0;
             return 0;
         case SIGACT_STOP:
             p->state = PRS_STOPPED;
             p->stopped = 1;
             p->exit_sig = (uint8_t)sig;
+            p->signals.pending[sig] = 0;
             return 0;
         case SIGACT_CONT:
             p->state = PRS_NORMAL;
             p->stopped = 0;
+            p->signals.pending[sig] = 0;
             return 0;
         case SIGACT_TERM:
         case SIGACT_CORE:
@@ -251,10 +268,7 @@ int signal_deliver(proc_t *p, int sig, registers_t *r) {
     frame.saved_ss   = r->ss;
     frame.saved_rax  = r->rax;
 
-    /* SA_RESTART: an interruptible syscall was aborted by this signal.
-     * Rewind the PC past the syscall instruction and save the syscall
-     * number + argument registers; sigreturn re-executes it after the
-     * handler returns.  A fresh frame starts restart-inactive. */
+    uint64_t new_rip = r->rip;
     if (p->signals.syscall_restartable &&
         (p->signals.sa_flags[sig] & SA_RESTART)) {
         frame.restart_active = 1;
@@ -265,16 +279,19 @@ int signal_deliver(proc_t *p, int sig, registers_t *r) {
         frame.restart_arg3   = r->r10;
         frame.restart_arg4   = r->r8;
         frame.restart_arg5   = r->r9;
-        r->rip -= BSD_SYSCALL_INS_LEN;
-        frame.saved_rip = r->rip;
-        p->signals.restart_frame = 1;
+        new_rip = r->rip - BSD_SYSCALL_INS_LEN;
+        frame.saved_rip = new_rip;
     } else {
         frame.restart_active = 0;
         frame.restart_sysno  = 0;
     }
 
-    /* Block the delivered signal and the handler's sa_mask while the
-     * handler runs; restore on sigreturn. */
+    /* Compute the handler mask but do NOT commit it yet: the frame is
+     * installed in user memory first, and only on success does any
+     * kernel state change.  A failed copy (bad altstack, unmapped
+     * stack) must leave the signal pending and the mask untouched —
+     * otherwise the signal silently disappears and sigreturn never
+     * runs to restore the saved mask. */
     uint32_t old_mask = 0;
     for (int i = 1; i < NSIG; i++)
         if (p->signals.blocked[i])
@@ -285,8 +302,6 @@ int signal_deliver(proc_t *p, int sig, registers_t *r) {
     if (!(p->signals.sa_flags[sig] & SA_NODEFER))
         new_mask |= (1u << sig);
     new_mask |= p->signals.sa_mask[sig];
-    for (int i = 1; i < NSIG; i++)
-        p->signals.blocked[i] = (new_mask & (1u << i)) ? 1 : 0;
 
     uint64_t stack = r->rsp;
     if ((p->signals.sa_flags[sig] & SA_ONSTACK) && p->signals.ss_active &&
@@ -312,6 +327,13 @@ int signal_deliver(proc_t *p, int sig, registers_t *r) {
         copy_to_user((void *)rsp, &restorer, sizeof(restorer)) != 0)
         return -EFAULT;
 
+    /* Frame is in user memory — commit all kernel-side state now. */
+    p->signals.pending[sig] = 0;
+    for (int i = 1; i < NSIG; i++)
+        p->signals.blocked[i] = (new_mask & (1u << i)) ? 1 : 0;
+    if (frame.restart_active)
+        p->signals.restart_frame = 1;
+
     r->rsp = rsp;
     r->rdi = (uint64_t)sig; /* SysV amd64: first arg in RDI */
     r->rip = (uint64_t)h;
@@ -335,23 +357,27 @@ int signal_deliver(proc_t *p, int sig, registers_t *r) {
     }
 
     sighandler_t h = p->signals.handler[sig];
-    p->signals.pending[sig] = 0;
 
-    if (h == SIG_IGN)
+    if (h == SIG_IGN) {
+        p->signals.pending[sig] = 0;
         return 0;
+    }
 
     if (h == SIG_DFL) {
         switch (signal_default_action(sig)) {
         case SIGACT_IGN:
+            p->signals.pending[sig] = 0;
             return 0;
         case SIGACT_STOP:
             p->state = PRS_STOPPED;
             p->stopped = 1;
             p->exit_sig = (uint8_t)sig;
+            p->signals.pending[sig] = 0;
             return 0;
         case SIGACT_CONT:
             p->state = PRS_NORMAL;
             p->stopped = 0;
+            p->signals.pending[sig] = 0;
             return 0;
         case SIGACT_TERM:
         case SIGACT_CORE:
@@ -378,6 +404,7 @@ int signal_deliver(proc_t *p, int sig, registers_t *r) {
      * Rewind the PC past the svc instruction and save the syscall
      * number + argument registers; sigreturn re-executes it after the
      * handler returns.  A fresh frame starts restart-inactive. */
+    uint64_t new_elr = r->elr;
     if (p->signals.syscall_restartable &&
         (p->signals.sa_flags[sig] & SA_RESTART)) {
         frame.restart_active = 1;
@@ -388,16 +415,19 @@ int signal_deliver(proc_t *p, int sig, registers_t *r) {
         frame.restart_arg3   = r->x[4];
         frame.restart_arg4   = r->x[5];
         frame.restart_arg5   = r->x[6];
-        r->elr -= BSD_SYSCALL_INS_LEN;
-        frame.saved_elr = r->elr;
-        p->signals.restart_frame = 1;
+        new_elr = r->elr - BSD_SYSCALL_INS_LEN;
+        frame.saved_elr = new_elr;
     } else {
         frame.restart_active = 0;
         frame.restart_sysno  = 0;
     }
 
-    /* Block the delivered signal and the handler's sa_mask while the
-     * handler runs; restore on sigreturn. */
+    /* Compute the handler mask but do NOT commit it yet: the frame is
+     * installed in user memory first, and only on success does any
+     * kernel state change.  A failed copy (bad altstack, unmapped
+     * stack) must leave the signal pending and the mask untouched —
+     * otherwise the signal silently disappears and sigreturn never
+     * runs to restore the saved mask. */
     uint32_t old_mask = 0;
     for (int i = 1; i < NSIG; i++)
         if (p->signals.blocked[i])
@@ -408,8 +438,6 @@ int signal_deliver(proc_t *p, int sig, registers_t *r) {
     if (!(p->signals.sa_flags[sig] & SA_NODEFER))
         new_mask |= (1u << sig);
     new_mask |= p->signals.sa_mask[sig];
-    for (int i = 1; i < NSIG; i++)
-        p->signals.blocked[i] = (new_mask & (1u << i)) ? 1 : 0;
 
     uint64_t stack = r->sp;
     if ((p->signals.sa_flags[sig] & SA_ONSTACK) && p->signals.ss_active &&
@@ -419,6 +447,13 @@ int signal_deliver(proc_t *p, int sig, registers_t *r) {
     stack -= sizeof(sigframe_t);
     if (copy_to_user((void *)stack, &frame, sizeof(sigframe_t)) != 0)
         return -EFAULT;
+
+    /* Frame is in user memory — commit all kernel-side state now. */
+    p->signals.pending[sig] = 0;
+    for (int i = 1; i < NSIG; i++)
+        p->signals.blocked[i] = (new_mask & (1u << i)) ? 1 : 0;
+    if (frame.restart_active)
+        p->signals.restart_frame = 1;
 
     /* Handler runs with the signal number in x0 (AAPCS); it returns via
      * `ret` to the restorer in lr, which invokes sigreturn. */
@@ -447,7 +482,17 @@ int signal_check_pending(proc_t *p, registers_t *r) {
 
     for (int sig = 1; sig < NSIG; sig++) {
         if (p->signals.pending[sig] && !p->signals.blocked[sig]) {
-            signal_deliver(p, sig, r);
+            int ret = signal_deliver(p, sig, r);
+            if (ret != 0) {
+                /* The sigframe could not be installed (unmapped stack
+                 * or altstack).  Retrying would spin forever and
+                 * dropping the signal violates "must not be ignored":
+                 * POSIX says force the default action — terminate. */
+                p->signals.pending[sig] = 0;
+                p->exit_sig = (uint8_t)SIGSEGV;
+                proc_exit(139, r);
+                thread_exit(139);
+            }
             return 1;
         }
     }

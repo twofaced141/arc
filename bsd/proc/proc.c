@@ -847,44 +847,46 @@ pid_t proc_waitpid(pid_t pid, int *status, int options) {
         return -EINVAL;
 
     for (;;) {
-        proc_t *child = NULL;
+        /* Scan ALL matching children, not just the first one: children
+         * are pushed LIFO by fork, so stopping at the head would let
+         * the newest live child hide an older zombie forever. */
+        proc_t *zombie = NULL, *stopped_child = NULL, *any = NULL;
         for (proc_t *c = p->children; c; c = c->sibling) {
-            if (pid > 0) {
-                if (c->pid == pid) {
-                    child = c;
-                    break;
-                }
-            } else {
-                child = c;
+            if (pid > 0 && c->pid != pid)
+                continue;
+            if (!any)
+                any = c;
+            if (c->state == PRS_ZOMBIE) {
+                zombie = c;
                 break;
             }
+            if ((options & WUNTRACED) && c->stopped && !stopped_child)
+                stopped_child = c;
         }
 
-        if (!child)
-            return -ECHILD;
-
-        if (child->state == PRS_ZOMBIE) {
-            int st = (child->exit_status & 0xFF) << 8;
-            if (child->exit_sig)
-                st = (int)child->exit_sig;
+        if (zombie) {
+            int st = (zombie->exit_status & 0xFF) << 8;
+            if (zombie->exit_sig)
+                st = (int)zombie->exit_sig;
             if (status)
                 *status = st;
-            pid_t cpid = child->pid;
+            pid_t cpid = zombie->pid;
 
             /* Unlink from the parent's children list */
-            proc_children_unlink(p, child);
+            proc_children_unlink(p, zombie);
 
-            proc_free(child);
+            proc_free(zombie);
             return cpid;
         }
 
-        if (child->stopped) {
-            if (options & WUNTRACED) {
-                if (status)
-                    *status = 0x7F | ((child->exit_sig & 0xFF) << 8);
-                return child->pid;
-            }
+        if (stopped_child) {
+            if (status)
+                *status = 0x7F | ((stopped_child->exit_sig & 0xFF) << 8);
+            return stopped_child->pid;
         }
+
+        if (!any)
+            return -ECHILD;
 
         if (options & WNOHANG)
             return 0;

@@ -340,9 +340,10 @@ void *scheduler_switch(registers_t *r) {
     if (!rq)
         return (void *)r;
 
-    /* Consume pending IPI_RESCHEDULE - any preemption satisfies it. */
-    if (cpu)
-        cpu->arch.need_resched = 0;
+    /* NOTE: IPI_RESCHEDULE's need_resched flag is NOT cleared here.
+     * Clearing it up front made the check at the bottom dead code and
+     * cross-CPU wakeups waited for the next tick.  Both switch points
+     * below consume it instead (any preemption satisfies it). */
 
     if (rq->active->nr_active == 0)
         rq_steal(rq);
@@ -395,8 +396,11 @@ void *scheduler_switch(registers_t *r) {
         rq->current = NULL;
     }
 
-    /* If current was cleared or idle, pick next. */
+    /* If current was cleared or idle, pick next.  This path always
+     * switches, so it consumes a pending IPI_RESCHEDULE too. */
     if (!rq->current) {
+        if (cpu)
+            cpu->arch.need_resched = 0;
         void *nxt = context_switch(rq, r);
         spin_unlock_irqrestore(&rq->lock, flags);
         return nxt;

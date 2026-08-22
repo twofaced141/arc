@@ -505,16 +505,22 @@ int64_t sys_poll(proc_t *p, registers_t *r) {
 
     if (nfds < 0)
         return -EINVAL;
+    /* Bound the allocation: without a cap, a huge nfds truncates
+     * (uint32_t)nfds * sizeof(struct pollfd) to zero or small while the
+     * loop below still writes kfds[i].revents for i < nfds — a linear
+     * heap overflow from a single syscall. */
+    if (nfds > FD_SETSIZE)
+        return -EINVAL;
     if (nfds == 0) {
         if (timeout_ms < 0)
             return 0;
         return 0;
     }
 
-    struct pollfd *kfds = (struct pollfd *)kmalloc((uint32_t)nfds * sizeof(struct pollfd));
+    struct pollfd *kfds = (struct pollfd *)kmalloc((size_t)nfds * sizeof(struct pollfd));
     if (!kfds)
         return -ENOMEM;
-    if (copy_from_user(kfds, ufds, (uint32_t)nfds * sizeof(struct pollfd)) < 0) {
+    if (copy_from_user(kfds, ufds, (size_t)nfds * sizeof(struct pollfd)) < 0) {
         kfree(kfds);
         return -EFAULT;
     }

@@ -168,6 +168,31 @@ task_t *task_find(uint32_t task_id) {
     return NULL;
 }
 
+task_t *task_find_hold(uint32_t task_id, uint32_t *flags_out) {
+    if (task_id == 0 || !flags_out) return NULL;
+
+    uint32_t flags;
+    spin_lock_irqsave(&task_lock, &flags);
+
+    uint32_t idx = task_hash_id(task_id);
+    task_t *t = task_hash[idx];
+    while (t) {
+        if (t->task_id == task_id) {
+            *flags_out = flags;
+            return t;   /* task_lock intentionally still held */
+        }
+        t = t->next;
+    }
+
+    spin_unlock_irqrestore(&task_lock, flags);
+    return NULL;
+}
+
+void task_put(task_t *task, uint32_t flags) {
+    (void)task;
+    spin_unlock_irqrestore(&task_lock, flags);
+}
+
 task_t *task_current(void) {
     thread_t *thr = thread_current();
     if (!thr) return NULL;
@@ -211,8 +236,11 @@ int sys_task_create(void) {
 int sys_task_destroy(void) {
     task_t *cur = task_current();
     if (!cur) return -1;
-    task_destroy(cur);
-    return 0;
+    /* Refuse to destroy the CALLING task: kfree() of the live task_t
+     * (and its thread->task back-pointer) while the caller is still
+     * executing is a guaranteed use-after-free on the next syscall.
+     * Tasks are torn down by their owner/parent instead. */
+    return -1;
 }
 
 int sys_slot_alloc(uint32_t type, uint32_t rights) {
@@ -226,11 +254,15 @@ int sys_slot_alloc(uint32_t type, uint32_t rights) {
 }
 
 int sys_slot_free(uint64_t handle) {
-    uint32_t tid = handle_task_id(handle);
+    task_t *cur = task_current();
+    if (!cur) return -1;
+
+    /* Only free slots in OUR OWN cspace.  The old code trusted the
+     * task id embedded in the handle and would happily free a slot in
+     * ANY task's capability table (cross-task DoS / confusion). */
+    if (handle_task_id(handle) != cur->task_id)
+        return -1;
+
     int slot = handle_slot(handle);
-
-    task_t *t = task_find(tid);
-    if (!t) return -1;
-
-    return cspace_free_slot(&t->cspace, slot);
+    return cspace_free_slot(&cur->cspace, slot);
 }

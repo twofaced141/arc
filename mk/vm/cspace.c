@@ -31,6 +31,7 @@
 
 
 #include "task.h"
+#include "port.h"
 #include "vmm.h"
 #include "debug.h"
 #include "string.h"
@@ -85,7 +86,7 @@ void cspace_destroy(cspace_t *cs) {
     cs->bitmap_words = 0;
 }
 
-/* ---- Grow capacity 2× (internally locked, caller must NOT hold cs->lock) ---- */
+/* ---- Grow capacity 2× (caller must hold cs->lock) ---- */
 static int cspace_grow(cspace_t *cs) {
     int new_max = cs->max_slots * 2;
     if (new_max > CSPACE_MAX_SLOTS)
@@ -149,13 +150,15 @@ int cspace_alloc_slot(cspace_t *cs, uint32_t type, uint32_t rights, uint64_t obj
 
     int slot = bitmap_alloc(cs->free_bitmap, cs->bitmap_words);
     if (slot < 0) {
-        /* Out of slots — try to grow */
-        spin_unlock_irqrestore(&cs->lock, flags);
-
-        if (cspace_grow(cs) < 0)
+        /* Out of slots — grow.  The old code dropped the lock around
+         * cspace_grow(): two concurrent allocators could both see the
+         * same max_slots, both memcpy/kfree, and double-free the live
+         * array.  Growing under the lock serializes them; kmalloc
+         * under a spinlock is already the norm in this kernel. */
+        if (cspace_grow(cs) < 0) {
+            spin_unlock_irqrestore(&cs->lock, flags);
             return -1;
-
-        spin_lock_irqsave(&cs->lock, &flags);
+        }
         slot = bitmap_alloc(cs->free_bitmap, cs->bitmap_words);
         if (slot < 0) {
             spin_unlock_irqrestore(&cs->lock, flags);
@@ -175,6 +178,9 @@ int cspace_alloc_slot(cspace_t *cs, uint32_t type, uint32_t rights, uint64_t obj
 int cspace_free_slot(cspace_t *cs, int slot) {
     if (!cs || slot < 0 || !cs->slots || slot >= cs->max_slots) return -1;
 
+    uint32_t type = 0;
+    uint64_t object_id = 0;
+
     uint32_t flags;
     spin_lock_irqsave(&cs->lock, &flags);
 
@@ -183,6 +189,9 @@ int cspace_free_slot(cspace_t *cs, int slot) {
         return -1;
     }
 
+    type      = cs->slots[slot].type;
+    object_id = cs->slots[slot].object_id;
+
     cs->slots[slot].object_id = 0;
     cs->slots[slot].type      = 0;
     cs->slots[slot].rights    = 0;
@@ -190,6 +199,14 @@ int cspace_free_slot(cspace_t *cs, int slot) {
     bitmap_free(cs->free_bitmap, slot);
 
     spin_unlock_irqrestore(&cs->lock, flags);
+
+    /* Release the reference this slot owned.  Done OUTSIDE cs->lock:
+     * port_release() takes the global port table lock, and taking it
+     * under cs->lock would invert against syscall paths that resolve
+     * ports without holding cs->lock. */
+    if (type == CAP_PORT)
+        port_release((ipc_port_t *)(uintptr_t)object_id);
+
     return 0;
 }
 
@@ -197,6 +214,26 @@ cslot_t *cspace_lookup(cspace_t *cs, int slot) {
     if (!cs || slot < 0 || !cs->slots || slot >= cs->max_slots) return NULL;
     if (!cs->slots[slot].in_use) return NULL;
     return &cs->slots[slot];
+}
+
+int cspace_lookup_snapshot(cspace_t *cs, int slot, cslot_t *out) {
+    if (!cs || !out || slot < 0 || !cs->slots || slot >= cs->max_slots)
+        return -1;
+
+    uint32_t flags;
+    spin_lock_irqsave(&cs->lock, &flags);
+
+    /* Copy under the lock: a concurrent cspace_grow can kfree and
+     * swap the slot array, so a raw cslot_t* returned by
+     * cspace_lookup may dangle by the time fields are read. */
+    if (!cs->slots[slot].in_use) {
+        spin_unlock_irqrestore(&cs->lock, flags);
+        return -1;
+    }
+    *out = cs->slots[slot];
+
+    spin_unlock_irqrestore(&cs->lock, flags);
+    return 0;
 }
 
 int cspace_move(cspace_t *from, cspace_t *to, int slot) {
@@ -222,23 +259,12 @@ int cspace_move(cspace_t *from, cspace_t *to, int slot) {
     /* Find a free slot in destination */
     int dst_slot = bitmap_alloc(to->free_bitmap, to->bitmap_words);
     if (dst_slot < 0) {
-        /* Try to grow destination, then retry */
-        spin_unlock_irqrestore(&from->lock, fflags);
-        spin_unlock_irqrestore(&to->lock, tflags);
-
-        if (cspace_grow(to) < 0)
-            return -1;
-
-        /* Re-acquire locks and retry */
-        if ((uintptr_t)from < (uintptr_t)to) {
-            spin_lock_irqsave(&from->lock, &fflags);
-            spin_lock_irqsave(&to->lock, &tflags);
-        } else {
-            spin_lock_irqsave(&to->lock, &tflags);
-            spin_lock_irqsave(&from->lock, &fflags);
-        }
-
-        if (!from->slots[slot].in_use) {
+        /* Try to grow the destination while still holding both locks:
+         * dropping them here would let a concurrent free_slot run on
+         * `from` between our unlock and re-lock (the slot could be
+         * freed or reused under us).  cspace_grow requires cs->lock
+         * held since the alloc-path double-free fix. */
+        if (cspace_grow(to) < 0) {
             spin_unlock_irqrestore(&from->lock, fflags);
             spin_unlock_irqrestore(&to->lock, tflags);
             return -1;

@@ -33,6 +33,7 @@
 #include "bsd/tty.h"
 #include "bsd/errno.h"
 #include "bsd/select.h"
+#include "vmm.h"
 #include "debug.h"
 #include "string.h"
 
@@ -187,25 +188,47 @@ int tty_write(tty_t *t, const void *buf, size_t count) {
 int tty_ioctl(tty_t *t, int cmd, void *data) {
     if (!t) return -ENXIO;
 
+    /* `data` is a raw user pointer straight from sys_ioctl: it must
+     * never be dereferenced directly.  Every access goes through
+     * copy_from_user/copy_to_user so a forged address fails with
+     * EFAULT instead of reading or writing kernel memory. */
     switch (cmd) {
-    case TIOCGPGRP:
-        if (data) *(pid_t *)data = t->pgrp;
+    case TIOCGPGRP: {
+        if (!data) return -EFAULT;
+        pid_t pgrp = t->pgrp;
+        if (copy_to_user(data, &pgrp, sizeof(pgrp)) != 0)
+            return -EFAULT;
         return 0;
-    case TIOCSPGRP:
-        if (data) t->pgrp = *(pid_t *)data;
+    }
+    case TIOCSPGRP: {
+        pid_t pgrp;
+        if (!data || copy_from_user(&pgrp, data, sizeof(pgrp)) != 0)
+            return -EFAULT;
+        t->pgrp = pgrp;
         return 0;
-    case TIOCGETA:
-        if (data) *(termios_t *)data = t->term;
+    }
+    case TIOCGETA: {
+        if (!data) return -EFAULT;
+        termios_t term = t->term;
+        if (copy_to_user(data, &term, sizeof(term)) != 0)
+            return -EFAULT;
         return 0;
-    case TIOCSETA:
-        if (data) {
-            t->term = *(termios_t *)data;
-            tty_apply_lflags(t);
-        }
+    }
+    case TIOCSETA: {
+        termios_t term;
+        if (!data || copy_from_user(&term, data, sizeof(term)) != 0)
+            return -EFAULT;
+        t->term = term;
+        tty_apply_lflags(t);
         return 0;
-    case TIOCGWINSZ:
-        if (data) *(struct winsize *)data = t->winsize;
+    }
+    case TIOCGWINSZ: {
+        if (!data) return -EFAULT;
+        struct winsize ws = t->winsize;
+        if (copy_to_user(data, &ws, sizeof(ws)) != 0)
+            return -EFAULT;
         return 0;
+    }
     default:
         return -ENOTTY;
     }
