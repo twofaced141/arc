@@ -1,8 +1,7 @@
 # bsd/net — networking (lwIP)
 
 Networking lives in
-`bsd/net/`, but the stack itself is vendored `lwIP` (BSD license, compatible
-with `LICENSE` `BSD-3-Clause`).
+`bsd/net/`, but the stack itself is vendored `lwIP`.
 
 ## Why lwIP is noisy and how we clean it
 
