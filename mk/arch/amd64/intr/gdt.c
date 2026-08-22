@@ -115,6 +115,13 @@ void gdt_install(void) {
     gdt_ptr.base = (uint64_t)&gdt_entries[0];
 
     __asm__ __volatile__("lgdt %0" : : "m"(gdt_ptr));
+    /* NB: GS is deliberately NOT reloaded here.  Loading a data
+     * selector into %gs replaces its hidden base with the descriptor
+     * base (0), silently destroying the per-CPU IA32_GS_BASE written
+     * by arch_percpu_init().  Any code reading %gs:offset between this
+     * reload and the next arch_percpu_init() would dereference
+     * address 0.  In long mode the selector value of GS is irrelevant;
+     * only the MSR-set base matters. */
     __asm__ __volatile__(
         "push $0x08\n"
         "push $1f\n"
@@ -124,7 +131,6 @@ void gdt_install(void) {
         "mov %%ax, %%ds\n"
         "mov %%ax, %%es\n"
         "mov %%ax, %%fs\n"
-        "mov %%ax, %%gs\n"
         "mov %%ax, %%ss\n"
         :
         :

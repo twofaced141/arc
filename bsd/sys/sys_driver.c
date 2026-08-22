@@ -89,17 +89,33 @@ int64_t sys_phys_map(proc_t *p, registers_t *r) {
     uint64_t phys_page = phys & ~(PAGE_SIZE - 1ULL);
     uint64_t offset    = phys - phys_page;
     uint64_t map_size  = (offset + size + PAGE_SIZE - 1ULL) & ~(PAGE_SIZE - 1ULL);
-    uint64_t virt_page = virt - offset;
+    uint64_t virt_page;
 
     /* Capability gate: the range must be an MMIO resource of a device
      * the process has open (IOConnectMapMemory-style). */
     if (!dev_handle_has_resource(p, ARC_RES_MMIO, phys_page, map_size))
         return -1;
 
-    /* If virt was 0, auto-allocate from USER_MMAP_START */
-    if (virt == 0) {
-        virt_page = p->mmap_next;
-        p->mmap_next += map_size;
+    /* Containment: the mapping MUST land in the user half.  Without
+     * this check a caller could aim `virt` at the shared kernel-half
+     * page tables and overwrite a GLOBAL PTE (visible to every
+     * process) with its own MMIO frame. */
+    if (virt != 0) {
+        virt_page = virt - offset;
+        if ((virt & (PAGE_SIZE - 1)) || virt_page < USER_BASE ||
+            virt_page > USER_STACK_TOP ||
+            map_size > USER_STACK_TOP - virt_page)
+            return -1;
+    } else {
+        /* Auto-place from the shared mmap cursor (same allocator as
+         * sys_mmap — using a second private cursor let phys_map and
+         * mmap silently hand out overlapping ranges). */
+        virt_page = (p->mmap_cursor + PAGE_SIZE - 1) & ~(uintptr_t)(PAGE_SIZE - 1);
+        if (virt_page < USER_MMAP_START)
+            virt_page = USER_MMAP_START;
+        if (virt_page > USER_STACK_TOP || map_size > USER_STACK_TOP - virt_page)
+            return -1;
+        p->mmap_cursor = (uintptr_t)(virt_page + map_size);
     }
 
     uint32_t vmm_flags = VMM_PRESENT | VMM_USER | VMM_WRITABLE;
@@ -143,14 +159,24 @@ int64_t sys_dma_alloc(proc_t *p, registers_t *r) {
 
     uint32_t count = (uint32_t)((size + PAGE_SIZE - 1ULL) / PAGE_SIZE);
     if (count == 0) return -1;
+    /* Cap the allocation so the cursor below can never run away. */
+    if (count > 4096) return -1;   /* 16 MB */
 
     /* Allocate physically contiguous pages */
     void *phys = pmm_alloc_pages(count);
     if (!phys) return -1;
 
-    /* Map into process's address space */
-    uint32_t virt = p->mmap_next;
-    p->mmap_next += count * PAGE_SIZE;
+    /* Map into process's address space — auto-place from the shared
+     * mmap cursor with an explicit containment check. */
+    uintptr_t virt = (p->mmap_cursor + PAGE_SIZE - 1) & ~(uintptr_t)(PAGE_SIZE - 1);
+    if (virt < USER_MMAP_START)
+        virt = USER_MMAP_START;
+    if ((uint64_t)virt > USER_STACK_TOP ||
+        (uint64_t)count * PAGE_SIZE > USER_STACK_TOP - virt) {
+        pmm_free_pages(phys, count);
+        return -1;
+    }
+    p->mmap_cursor = virt + count * PAGE_SIZE;
 
     uint32_t vmm_flags = VMM_PRESENT | VMM_USER | VMM_WRITABLE;
     for (uint32_t i = 0; i < count; i++) {
@@ -168,7 +194,7 @@ int64_t sys_dma_alloc(proc_t *p, registers_t *r) {
 
     /* Write result back to userspace */
     dma_alloc_result_t result;
-    result.virt = virt;
+    result.virt = (uint32_t)virt;
     result.phys = (uint32_t)(uintptr_t)phys;
 
     if (copy_to_user(user_result, &result, sizeof(result)) < 0) {
@@ -186,11 +212,14 @@ int64_t sys_dma_alloc(proc_t *p, registers_t *r) {
 /* Per-IRQ subscriber table: stores the TID+PID of the thread waiting
  * for this IRQ.  tid == 0 means no subscriber.  Accessed from both
  * syscall context and IRQ context.  PID is kept so the subscription
- * can be revoked when the process exits. */
+ * can be revoked when the process exits.  pending counts IRQs that
+ * fired while nobody was blocked on them, so a wait that races with
+ * the IRQ cannot sleep forever (lost wakeup). */
 #define IRQ_MAX 256
 struct irq_sub {
     uint32_t tid;
     pid_t    pid;
+    uint32_t pending;
 };
 static struct irq_sub irq_subscribers[IRQ_MAX];
 static spinlock_t irq_lock;
@@ -200,17 +229,21 @@ static int irq_wake_user(uint8_t irq_num) {
     uint32_t flags;
     spin_lock_irqsave(&irq_lock, &flags);
 
-    uint32_t tid = irq_subscribers[irq_num].tid;
-    if (tid == 0) {
+    if (irq_subscribers[irq_num].tid == 0) {
         spin_unlock_irqrestore(&irq_lock, flags);
         return -1; /* no subscriber */
     }
 
-    thread_t *t = thread_find(tid);
+    thread_t *t = thread_find(irq_subscribers[irq_num].tid);
     if (!t || t->state != THREAD_BLOCKED) {
-        /* TID stale or thread not waiting — clean up */
-        irq_subscribers[irq_num].tid = 0;
-        irq_subscribers[irq_num].pid = 0;
+        /* Nobody parked on this line right now (stale TID, or the
+         * subscriber is running and about to call irq_wait) — record
+         * the event so the next wait returns immediately instead of
+         * blocking forever. */
+        if (irq_subscribers[irq_num].pending < 0xFFFFFFFFu)
+            irq_subscribers[irq_num].pending++;
+        if (!t)
+            irq_subscribers[irq_num].tid = 0;
         spin_unlock_irqrestore(&irq_lock, flags);
         return -1;
     }
@@ -268,12 +301,12 @@ int64_t sys_irq_wait(proc_t *p, registers_t *r) {
     (void)r;
     if (!p || !p->thread) return -1;
 
-    /* Check whether this thread has subscribed to at least one IRQ.
-     * If not, return immediately — blocking would leave the thread
-     * stuck in THREAD_BLOCKED with nobody to wake it, eventually
-     * starving the scheduler and causing a crash in __ffs. */
     uint32_t tid = p->thread->tid;
     int has_subscription = 0;
+
+    /* Consume a pending IRQ first: an interrupt that fired between the
+     * subscription and this call must not strand us in THREAD_BLOCKED
+     * with nobody left to wake us. */
     for (int i = 0; i < IRQ_MAX; i++) {
         if (irq_subscribers[i].tid == tid) {
             has_subscription = 1;
@@ -283,9 +316,21 @@ int64_t sys_irq_wait(proc_t *p, registers_t *r) {
     if (!has_subscription)
         return 0;
 
-    /* Block the current thread.  The IRQ handler will wake us
-     * via scheduler_unblock_thread().  The scheduler picks another
-     * thread because we're THREAD_BLOCKED. */
+    for (int i = 0; i < IRQ_MAX; i++) {
+        uint32_t flags;
+        spin_lock_irqsave(&irq_lock, &flags);
+        if (irq_subscribers[i].tid == tid && irq_subscribers[i].pending > 0) {
+            irq_subscribers[i].pending--;
+            spin_unlock_irqrestore(&irq_lock, flags);
+            return 0;
+        }
+        spin_unlock_irqrestore(&irq_lock, flags);
+    }
+
+    /* Block the current thread.  The IRQ handler will wake us via
+     * scheduler_unblock_thread(); if the IRQ lands before we actually
+     * block, irq_wake_user bumps `pending` above and our next call
+     * consumes it. */
     p->thread->state = THREAD_BLOCKED;
     return 0;
 }
@@ -444,7 +489,7 @@ int64_t sys_service_lookup(proc_t *p, registers_t *r) {
     uint64_t data = service_table[idx].driver_data;
     spin_unlock_irqrestore(&service_lock, flags);
 
-    return (int)data;
+    return (int64_t)data;   /* full 64 bits — (int) truncated handles */
 }
 
 int64_t sys_service_query(proc_t *p, registers_t *r) {
@@ -515,7 +560,11 @@ int64_t sys_pci_device_info(proc_t *p, registers_t *r) {
     if (ret < 0)
         return -1;
 
-    memcpy(user_out, &info, sizeof(info));
+    /* copy_to_user, NOT memcpy: user_out is an attacker-chosen pointer
+     * and a direct kernel write through it is an arbitrary-write
+     * primitive. */
+    if (copy_to_user(user_out, &info, sizeof(info)) < 0)
+        return -1;
     return 0;
 }
 
@@ -752,7 +801,7 @@ extern int block_ipc_attach(int io_handle, const char *name,
  * requests to the channel.
  */
 int64_t sys_io_register(proc_t *p, registers_t *r) {
-    (void)p;
+    if (!p) return -1;
     const char *user_name = (const char *)(uintptr_t)ARG1(r);
     uint32_t    block_sz  = (uint32_t)ARG2(r);
     uint64_t    num_blk   = ARG3(r) | ((uint64_t)ARG4(r) << 32);
@@ -766,6 +815,16 @@ int64_t sys_io_register(proc_t *p, registers_t *r) {
 
     int h = io_channel_create(name);
     if (h < 0) return -1;
+
+    /* Claim ownership: only the registering process may fetch or
+     * complete requests on this channel.  Without this any process
+     * could hijack the real block driver's queue (handles are small
+     * integers).  On a duplicate name the existing channel keeps its
+     * original owner and the claim is refused. */
+    if (io_channel_set_owner(h, p->pid) < 0) {
+        log_printf(LOG_LEVEL_WARN, "io_register: '%s' already owned\n", name);
+        return -1;
+    }
 
     /* If it's a block channel and we have valid geometry, attach a block device */
     if (block_sz > 0 && num_blk > 0 &&
@@ -783,20 +842,22 @@ int64_t sys_io_register(proc_t *p, registers_t *r) {
 }
 
 int64_t sys_io_get_request(proc_t *p, registers_t *r) {
-    (void)p;
+    if (!p) return -1;
     int          handle  = (int)ARG1(r);
     struct io_request *user_req = (struct io_request *)(uintptr_t)ARG2(r);
 
     if (!user_req) return -1;
+    if (!io_channel_owner_ok(handle, p->pid)) return -1;
     return io_channel_get_request(handle, user_req);
 }
 
 int64_t sys_io_complete(proc_t *p, registers_t *r) {
-    (void)p;
+    if (!p) return -1;
     int      handle     = (int)ARG1(r);
     uint64_t request_id = ARG2(r);
     int      result     = (int)ARG3(r);
 
+    if (!io_channel_owner_ok(handle, p->pid)) return -1;
     return io_channel_complete(handle, request_id, result);
 }
 

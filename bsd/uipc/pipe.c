@@ -131,11 +131,24 @@ static ssize_t pipe_read(vnode_t *vp, void *buf, size_t count,
         uint32_t flags;
         spin_lock_irqsave(&pp->lock, &flags);
         size_t used = pipe_used(pp);
+
+        if (used > 0) {
+            /* Compute the length and copy under ONE lock hold — a
+             * concurrent reader could otherwise drain the pipe between
+             * a stale `used` sample and the copy, reading garbage past
+             * the tail. */
+            size_t n = count < used ? count : used;
+            for (size_t i = 0; i < n; i++)
+                ((char *)buf)[i] = pp->buf[(pp->tail + i) % PIPE_BUF_SIZE];
+            pp->tail += n;
+            spin_unlock_irqrestore(&pp->lock, flags);
+            waitq_wake_all(&pp->wq);
+            return (ssize_t)n;
+        }
+
         int no_writers = (pp->writers <= 0);
         spin_unlock_irqrestore(&pp->lock, flags);
 
-        if (used > 0)
-            break;
         if (no_writers)
             return 0;    /* EOF */
 
@@ -145,21 +158,6 @@ static ssize_t pipe_read(vnode_t *vp, void *buf, size_t count,
         if (rc < 0)
             return -ERESTARTSYS;
     }
-
-    size_t n = count;
-    size_t used = pipe_used(pp);
-    if (n > used)
-        n = used;
-
-    uint32_t flags;
-    spin_lock_irqsave(&pp->lock, &flags);
-    for (size_t i = 0; i < n; i++)
-        ((char *)buf)[i] = pp->buf[(pp->tail + i) % PIPE_BUF_SIZE];
-    pp->tail += n;
-    spin_unlock_irqrestore(&pp->lock, flags);
-
-    waitq_wake_all(&pp->wq);
-    return (ssize_t)n;
 }
 
 static ssize_t pipe_write(vnode_t *vp, const void *buf, size_t count,
@@ -193,18 +191,23 @@ static ssize_t pipe_write(vnode_t *vp, const void *buf, size_t count,
                 return written > 0 ? (ssize_t)written : -ERESTARTSYS;
             continue;
         }
+        (void)space;
 
         size_t n = count - written;
-        if (n > space)
-            n = space;
         spin_lock_irqsave(&pp->lock, &flags);
+        /* Re-sample under the lock and clamp: another writer may have
+         * consumed the free space we saw before we got here — copying
+         * based on a stale sample would overrun the ring buffer. */
+        size_t now_space = pipe_space(pp);
+        if (n > now_space)
+            n = now_space;
         for (size_t i = 0; i < n; i++)
             pp->buf[(pp->head + i) % PIPE_BUF_SIZE] = src[written + i];
         pp->head += n;
-    spin_unlock_irqrestore(&pp->lock, flags);
-    written += n;
+        spin_unlock_irqrestore(&pp->lock, flags);
+        written += n;
 
-    waitq_wake_all(&pp->rq);
+        waitq_wake_all(&pp->rq);
     }
 
     return (ssize_t)written;

@@ -203,6 +203,12 @@ int64_t sys_fcntl(proc_t *p, registers_t *r) {
         /* Only the status flags may be changed via fcntl (POSIX). */
         f->flags = (f->flags & ~(O_APPEND | O_NONBLOCK)) |
                    ((int)arg & (O_APPEND | O_NONBLOCK));
+        /* Propagate O_NONBLOCK to socket layer (lwIP needs it for nonblocking) */
+        vnode_t *vp = (vnode_t *)f->vnode_ptr;
+        if (vp && vp->type == VSOCK) {
+            extern int socket_set_nonblock(vnode_t *vp, int nb);
+            socket_set_nonblock(vp, (f->flags & O_NONBLOCK) ? 1 : 0);
+        }
         return 0;
     }
     default:

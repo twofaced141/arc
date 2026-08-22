@@ -75,10 +75,17 @@ int sys_vm_create_shared(uint64_t size) {
     return (int)task_make_handle(cur->task_id, slot);
 }
 
-/* ---- Syscall 26 ---- */
+/* ---- Syscall 26 ----
+ * Restricted: a phys object aliases ARBITRARY physical memory (kernel
+ * image, other processes' pages, MMIO).  Only the kernel-created task
+ * may mint them; everyone else gets -1. */
 int sys_vm_create_phys(uint64_t phys_base, uint64_t size) {
     task_t *cur = task_current();
     if (!cur) return -1;
+    if (cur->task_id != 1) {
+        debug_print("vm_syscall: create_phys denied for non-kernel task\r\n");
+        return -1;
+    }
 
     if (size == 0) return -1;
     size = (size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1ULL);
@@ -99,15 +106,16 @@ int sys_vm_create_phys(uint64_t phys_base, uint64_t size) {
     return (int)task_make_handle(cur->task_id, slot);
 }
 
-/* ---- Internal: resolve a CAP_MEMORY handle to a vm_object_t* ---- */
-static vm_object_t *handle_to_vm_object(uint64_t handle) {
-    uint32_t tid = handle_task_id(handle);
+/* ---- Internal: resolve a CAP_MEMORY handle to a vm_object_t* ----
+ * The handle's embedded task id is attacker-controlled data; resolving
+ * it against a FOREIGN cspace let one task reach into another task's
+ * memory objects.  Only the caller's own cspace may be consulted. */
+static vm_object_t *handle_to_vm_object(task_t *cur, uint64_t handle) {
+    if (!cur) return NULL;
+    if (handle_task_id(handle) != cur->task_id) return NULL;
+
     int slot = handle_slot(handle);
-
-    task_t *t = task_find(tid);
-    if (!t) return NULL;
-
-    cslot_t *cs = cspace_lookup(&t->cspace, slot);
+    cslot_t *cs = cspace_lookup(&cur->cspace, slot);
     if (!cs || cs->type != CAP_MEMORY) return NULL;
 
     return (vm_object_t *)(uintptr_t)cs->object_id;
@@ -123,7 +131,7 @@ int sys_vm_map(uint64_t handle, uint64_t addr, uint32_t prot) {
         return -1;
     }
 
-    vm_object_t *obj = handle_to_vm_object(handle);
+    vm_object_t *obj = handle_to_vm_object(cur, handle);
     if (!obj) {
         debug_print("vm_syscall: map invalid handle\r\n");
         return -1;

@@ -1303,7 +1303,7 @@ netif_poll(struct netif *netif)
     SYS_ARCH_UNPROTECT(lev);
 
     in->if_idx = netif_get_index(netif);
-
+  
     LINK_STATS_INC(link.recv);
     MIB2_STATS_NETIF_ADD(stats_if, ifinoctets, in->tot_len);
     MIB2_STATS_NETIF_INC(stats_if, ifinucastpkts);

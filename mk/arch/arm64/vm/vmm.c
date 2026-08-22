@@ -36,6 +36,7 @@
 #include "memory.h"
 #include "debug.h"
 #include "fdt.h"
+#include "platform.h"
 
 /* PCI ECAM base discovered from FDT (extern from main.c). */
 extern uint64_t pci_ecam_base;
@@ -84,13 +85,14 @@ extern uint64_t pci_ecam_size;
 #define SCTLR_SA0       (1ULL << 4)
 #define SCTLR_SA        (1ULL << 3)
 
-#define RAM_BASE        0x40000000ULL
-#define RAM_SIZE        0x04000000ULL   /* 64MB */
-#define RAM_END         (RAM_BASE + RAM_SIZE)
-
-#define GICD_BASE       0x08000000ULL
-#define GICC_BASE       0x08010000ULL
-#define UART_BASE       0x09000000ULL
+/* RAM/GIC/UART bases are runtime-discovered via DT (platform.h).
+ * Fallbacks are ARM64_DEFAULT_* when DT is absent. */
+#define RAM_BASE  arm64_ram_base
+#define RAM_SIZE  arm64_ram_size
+#define RAM_END   (arm64_ram_base + arm64_ram_size)
+#define GICD_BASE arm64_gicd_base
+#define GICC_BASE arm64_gicc_base
+#define UART_BASE arm64_uart_base
 
 static page_directory_t *kernel_l1;
 static page_directory_t *current_l1;
@@ -156,7 +158,7 @@ static uint64_t *walk_pt(page_directory_t *l0, uint64_t vaddr, int create) {
     return &l3->entries[L3_IDX(vaddr)];
 }
 
-static uint64_t pte_flags(uint32_t flags) {
+static uint64_t pte_flags(uint64_t flags) {
     uint64_t attr = DESC_PAGE | ATTR_AF;
     if (flags & VMM_CACHE_DISABLE)
         attr |= ATTR_ATTR_IDX(MT_DEVICE);
@@ -166,7 +168,9 @@ static uint64_t pte_flags(uint32_t flags) {
         attr |= ATTR_AP_RO;
     if (flags & VMM_USER) {
         attr |= ATTR_AP_USER;
-        attr |= ATTR_PXN;
+        /* User page is executable only when VMM_NX is clear. */
+        if (flags & VMM_NX)
+            attr |= ATTR_PXN;
     } else {
         attr |= ATTR_UXN;
     }
@@ -175,7 +179,7 @@ static uint64_t pte_flags(uint32_t flags) {
     return attr;
 }
 
-static int map_pte(page_directory_t *l0, uint64_t phys, uint64_t virt, uint32_t flags) {
+static int map_pte(page_directory_t *l0, uint64_t phys, uint64_t virt, uint64_t flags) {
     uint64_t *pte = walk_pt(l0, virt, 1);
     if (!pte) return -1;
     *pte = (phys & ADDR_MASK) | pte_flags(flags);
@@ -214,14 +218,21 @@ void vmm_init(void) {
     initial_l0->entries[0] = (uint64_t)(uintptr_t)l1 | DESC_VALID | DESC_TABLE | ATTR_AF;
     debug_printf("vmm: L0[0] = %lx\n", initial_l0->entries[0]);
 
-    debug_print("vmm: mapping RAM...\n");
-    /* Allocate L2 page table and wire it under L1[1] */
+    debug_printf("vmm: mapping RAM 0x%lx size 0x%lx...\n", (unsigned long)RAM_BASE, (unsigned long)RAM_SIZE);
+    /* Allocate L2 page table and wire it under L1[1] (covers 0x40000000-0x7fffffff).
+     * DT-discovered RAM is expected at ARM64_DEFAULT_RAM_BASE; arbitrary
+     * bases would need additional L1 handling — kept simple for now. */
     page_directory_t *ram_l2 = (page_directory_t *)pmm_alloc_page();
     if (!ram_l2) { debug_print("vmm: failed to alloc L2\n"); return; }
     memset(ram_l2, 0, sizeof(page_directory_t));
-    l1->entries[1] = (uint64_t)(uintptr_t)ram_l2 | DESC_VALID | DESC_TABLE | ATTR_AF;
-    /* Map entire 64MB RAM as 2MB blocks (32 entries) under L2 */
-    for (int i = 0; i < 32; i++) {
+    {
+        uint64_t ram_l1_idx = (RAM_BASE >> 30) & 0x1FF;
+        l1->entries[ram_l1_idx] = (uint64_t)(uintptr_t)ram_l2 | DESC_VALID | DESC_TABLE | ATTR_AF;
+    }
+    int ram_blocks = (int)(RAM_SIZE / 0x200000ULL);
+    if (ram_blocks <= 0) ram_blocks = 1;
+    if (ram_blocks > 512) ram_blocks = 512;
+    for (int i = 0; i < ram_blocks; i++) {
         page_directory_t *l3 = (page_directory_t *)pmm_alloc_page();
         if (!l3) { debug_print("vmm: failed to alloc L3\n"); return; }
         memset(l3, 0, sizeof(page_directory_t));
@@ -417,7 +428,7 @@ page_directory_t *vmm_get_kernel_directory(void) {
     return kernel_l1;
 }
 
-int vmm_map_page(page_directory_t *dir, uint64_t phys, uint64_t virt, uint32_t flags) {
+int vmm_map_page(page_directory_t *dir, uint64_t phys, uint64_t virt, uint64_t flags) {
     return map_pte(dir, phys, virt, flags);
 }
 
@@ -480,6 +491,7 @@ static int handle_cow(page_directory_t *l0, uint64_t fault_addr) {
     inv_page(fault_addr);
     return 1;
 }
+
 
 void vmm_fork_cow_pages(page_directory_t *parent_dir, page_directory_t *child_dir) {
     if (!parent_dir || !child_dir) return;
@@ -667,6 +679,26 @@ void vmm_temp_unmap(void) {
 }
 
 /* ---- User copy ---- */
+/* Validate a user range without touching it (see amd64 vmm.c). */
+int user_range_ok(const void *uaddr, uint32_t size, int write) {
+    if (size == 0) return 1;
+    if (!uaddr) return 0;
+    page_directory_t *dir = vmm_get_current_directory();
+    for (uint32_t offset = 0; offset < size; ) {
+        uint64_t vaddr = (uint64_t)(uintptr_t)uaddr + offset;
+        uint64_t *pte = walk_pt(dir, vaddr, 0);
+        if (!pte || !(*pte & DESC_VALID) || !(*pte & ATTR_AP_USER))
+            return 0;
+        if (write && ((*pte) & ATTR_AP_RO))
+            return 0;   /* arm64 COW handled by fault path */
+        uint32_t chunk = PAGE_SIZE - (vaddr & 0xFFF);
+        if (chunk > size - offset) chunk = size - offset;
+        offset += chunk;
+    }
+    return 1;
+}
+
+
 int copy_from_user(void *dst, const void *user_src, uint32_t size) {
     if (size == 0) return 0;
     page_directory_t *dir = vmm_get_current_directory();
@@ -712,6 +744,11 @@ int strncpy_from_user(char *dst, const char *user_src, uint32_t max_len) {
     }
     dst[max_len - 1] = '\0';
     return (int)max_len - 1;
+}
+
+/* Full local TLB flush (used by the IPI_TLB handler on remote CPUs). */
+void vmm_tlb_reload_current(void) {
+    __asm__ __volatile__("tlbi vmalle1\n\tdsb sy\n\tisb" ::: "memory");
 }
 
 int vmm_handle_page_fault(registers_t *r, uint64_t fault_addr, uint32_t esr) {

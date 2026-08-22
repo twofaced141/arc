@@ -383,10 +383,26 @@ void proc_free(proc_t *p) {
         return;
     }
 
-    if (p->page_dir) {
-        vmm_free_directory(p->page_dir);
-        p->page_dir = NULL;
+    /* Tear down the address space ONLY if no other live process still
+     * runs on it.  CLONE_THREAD group members share the leader's
+     * page_dir; freeing it while they are alive (leader reaped before
+     * its threads exit) would yank the page tables out from under
+     * running threads.  A leak is safe; a free here is not. */
+    int dir_shared = 0;
+    uint32_t lflags;
+    spin_lock_irqsave(&proc_lock, &lflags);
+    for (proc_t *q = live_list; q; q = q->next) {
+        if (q != p && q->pid != PROC_NULL && q->page_dir == p->page_dir) {
+            dir_shared = 1;
+            break;
+        }
     }
+    spin_unlock_irqrestore(&proc_lock, lflags);
+
+    if (p->page_dir && !dir_shared) {
+        vmm_free_directory(p->page_dir);
+    }
+    p->page_dir = NULL;
 
     uint32_t flags;
     spin_lock_irqsave(&proc_lock, &flags);

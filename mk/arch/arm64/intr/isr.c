@@ -36,6 +36,7 @@
 #include "uart.h"
 #include "vmm.h"
 #include "personality.h"
+#include "cpu.h"
 #include <stdint.h>
 
 extern uint64_t scheduler_switch(registers_t *r);
@@ -182,6 +183,10 @@ uint64_t irq_handler(registers_t *r) {
     GICC_EOIR = iar;
 
     if (irq == TIMER_IRQ)
+        return scheduler_switch(r);
+
+    struct cpu *c = cpu_current();
+    if (c && c->arch.need_resched)
         return scheduler_switch(r);
 
     return (uint64_t)r;

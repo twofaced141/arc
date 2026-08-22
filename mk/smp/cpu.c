@@ -211,7 +211,25 @@ void scheduler_ipi(void) {
  * the VM layer is wired to it. */
 __attribute__((weak))
 void tlb_ipi(void) {
-    /* arch_tlb_flush_local(); */
+    /* Full flush: reload CR3.  No kernel mappings use the GLOBAL bit,
+     * so this drops every non-global TLB entry, including stale
+     * writable aliases of pages another CPU just made read-only for
+     * COW.  Reload via the current directory pointer to stay correct
+     * whichever address space is active here. */
+    extern void vmm_tlb_reload_current(void);
+    vmm_tlb_reload_current();
+}
+
+void tlb_flush_others(void) {
+    struct cpu *me = cpu_current();
+    unsigned n = cpu_count();
+    for (unsigned i = 0; i < n; i++) {
+        struct cpu *c = cpu_get(i);
+        if (!c || c == me || !cpu_online(c))
+            continue;
+        arch_cpu_mark_pending(c, (unsigned)IPI_TLB);
+        cpu_send_ipi(c, IPI_TLB);
+    }
 }
 
 /* ------------------------------------------------------------------ */

@@ -211,14 +211,15 @@ static void i386_backtrace(uint32_t ebp, uint32_t cr3, uint32_t cr0) {
 
 #if defined(__aarch64__)
 
+#include "platform.h"
 extern char _kernel_start[], _kernel_end[];
 
-#define A64_RAM_BASE  0x40000000ULL
-#define A64_RAM_SIZE  0x04000000ULL
+#define A64_RAM_BASE  arm64_ram_base
+#define A64_RAM_SIZE  arm64_ram_size
 
-/* The arm64 MMU identity-maps the first 64MB of RAM (kernel image and
- * all stacks live there) plus the UART/GIC; anything else is MMIO or
- * unmapped — refuse to dereference it in the panic handler. */
+/* The arm64 MMU identity-maps RAM (kernel image and all stacks live
+ * there) plus the UART/GIC; anything else is MMIO or unmapped — refuse
+ * to dereference it in the panic handler. */
 static int aarch64_addr_valid(uint64_t a) {
     return a >= A64_RAM_BASE && a < A64_RAM_BASE + A64_RAM_SIZE;
 }

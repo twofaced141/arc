@@ -3,30 +3,6 @@
  *
  * Copyright (c) 2026, fierce
  * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- * 1. Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- * 3. Neither the name of the author nor the names of its contributors
- *    may be used to endorse or promote products derived from this software
- *    without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS AS IS AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
- * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
- * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
- * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
- * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
- * SUCH DAMAGE.
  */
 
 
@@ -38,27 +14,49 @@
 #include "string.h"
 #include "vmm.h"
 #include "clockevent.h"
+#include "spinlock.h"
+#include "cpu.h"
 
-static prio_array_t active_array;
-static prio_array_t expired_array;
-static prio_array_t *active  = &active_array;
-static prio_array_t *expired = &expired_array;
-static thread_t    *current_thread;
-static thread_t    *idle_thread;
-static uint64_t ticks;
+/* One O(1) runqueue per CPU (SMP Phase 12): each CPU schedules its own
+ * threads and runs its own idle thread; threads stay on the runqueue
+ * they were added to, and an idle CPU steals work from other CPUs. */
 
-/* Sleeping threads (see amd64 scheduler for the design). */
-#define SLEEP_MAX 256
-static thread_t *sleep_queue[SLEEP_MAX];
-static int sleep_count;
+static struct runqueue rqs[CPU_MAX];
 
-static void sleep_wake_tick(void);
+static inline struct runqueue *rq_current(void) {
+    struct cpu *c = cpu_current();
+    return (c && c->runqueue) ? c->runqueue : NULL;
+}
+
+/* Pick the least-loaded online CPU's runqueue for new thread placement. */
+static struct runqueue *pick_least_loaded_rq(void) {
+    struct runqueue *best = NULL;
+    unsigned best_load = ~0u;
+    unsigned best_id = CPU_MAX;
+
+    for (unsigned i = 0; i < cpu_nr; i++) {
+        struct cpu *c = &cpus[i];
+        struct runqueue *rq = c->runqueue;
+        if (!rq || c->state != CPU_ONLINE)
+            continue;
+        unsigned load = rq->active->nr_active + rq->expired->nr_active + (unsigned)rq->sleep_count;
+        if (load < best_load || (load == best_load && i < best_id)) {
+            best = rq;
+            best_load = load;
+            best_id = i;
+        }
+    }
+    if (!best)
+        best = &rqs[0];
+    return best;
+}
 
 static inline int __ffs(uint32_t word) {
     return __builtin_ctz(word);
 }
 
-static void prio_array_enqueue(prio_array_t *pa, thread_t *t, int prio) {
+static void prio_array_enqueue(struct runqueue *rq, prio_array_t *pa, thread_t *t, int prio) {
+    (void)rq;
     if (pa->queue[prio]) {
         thread_t *head = pa->queue[prio];
         thread_t *tail = head->prev;
@@ -74,18 +72,10 @@ static void prio_array_enqueue(prio_array_t *pa, thread_t *t, int prio) {
     }
     t->array = pa;
     pa->nr_active++;
-    {
-        //uart_print(pa == &active_array ? "enq:A " : "enq:E ");
-        //uart_print_hex64(t->tid);
-        //uart_print(" p=");
-        //uart_print_hex64(prio);
-        //uart_print(" n=");
-        //uart_print_hex64(pa->nr_active);
-        //uart_print("\n");
-    }
 }
 
-static void prio_array_dequeue(prio_array_t *pa, thread_t *t, int prio) {
+static void prio_array_dequeue(struct runqueue *rq, prio_array_t *pa, thread_t *t, int prio) {
+    (void)rq;
     if (t->next == t) {
         pa->queue[prio] = 0;
         pa->bitmap[prio / 32] &= ~(1u << (prio % 32));
@@ -99,19 +89,10 @@ static void prio_array_dequeue(prio_array_t *pa, thread_t *t, int prio) {
     t->prev = 0;
     t->array = 0;
     pa->nr_active--;
-    {
-        //uart_print(pa == &active_array ? "deq:A " : "deq:E ");
-        //uart_print_hex64(t->tid);
-        //uart_print(" p=");
-        //uart_print_hex64(prio);
-        //uart_print(" n=");
-        //uart_print_hex64(pa->nr_active);
-        //uart_print("\n");
-    }
 }
 
 static int prio_array_find_top(const prio_array_t *pa) {
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < BITMAP_SIZE; i++) {
         if (pa->bitmap[i])
             return i * 32 + __ffs(pa->bitmap[i]);
     }
@@ -133,10 +114,9 @@ static inline int effective_prio(int static_prio, int sleep_avg) {
     return p;
 }
 
-/* AArch64 has no x87-style lazy mechanism in EL1 (no CR0.TS), so the  */
-/* Q0-Q31/FPSR/FPCR state is saved and restored on every context       */
-/* switch.  The kernel never executes FP/SIMD instructions, so the     */
-/* restored state survives untouched until eret.                       */
+/* AArch64 has no x87-style lazy mechanism in EL1 (no CR0.TS), so the
+ * Q0-Q31/FPSR/FPCR state is saved and restored on every context
+ * switch. */
 
 static inline void fpu_save(thread_t *t) {
     uint32_t fpsr, fpcr;
@@ -197,25 +177,26 @@ static void idle_entry(void) {
     }
 }
 
-static int setup_idle(void) {
-    idle_thread = (thread_t *)pmm_alloc_pages(1);
-    if (!idle_thread) return -1;
+static int setup_idle(struct runqueue *rq) {
+    thread_t *idle = (thread_t *)pmm_alloc_pages(1);
+    if (!idle) return -1;
 
-    uint64_t *p = (uint64_t *)idle_thread;
+    uint64_t *p = (uint64_t *)idle;
     for (int i = 0; i < 4096 / 8; i++) p[i] = 0;
 
-    idle_thread->tid = 0;
-    idle_thread->state = THREAD_READY;
-    idle_thread->static_prio = PRIO_MAX - 1;
-    idle_thread->prio = PRIO_MAX - 1;
-    idle_thread->time_slice = 1;
-    idle_thread->sleep_avg = 0;
-    idle_thread->page_dir = 0;
-    idle_thread->kernel_stack = (uint8_t *)pmm_alloc_pages(THREAD_KSTACK_SIZE / PAGE_SIZE);
-    if (!idle_thread->kernel_stack) return -1;
-    idle_thread->kernel_stack_top = (uint64_t)idle_thread->kernel_stack + THREAD_KSTACK_SIZE;
+    idle->tid = 0;
+    idle->state = THREAD_READY;
+    idle->static_prio = PRIO_MAX - 1;
+    idle->prio = PRIO_MAX - 1;
+    idle->time_slice = 1;
+    idle->sleep_avg = 0;
+    idle->page_dir = 0;
+    idle->rq = rq;
+    idle->kernel_stack = (uint8_t *)pmm_alloc_pages(THREAD_KSTACK_SIZE / PAGE_SIZE);
+    if (!idle->kernel_stack) return -1;
+    idle->kernel_stack_top = (uint64_t)idle->kernel_stack + THREAD_KSTACK_SIZE;
 
-    registers_t *frame = (registers_t *)(idle_thread->kernel_stack_top - sizeof(registers_t));
+    registers_t *frame = (registers_t *)(idle->kernel_stack_top - sizeof(registers_t));
     for (int i = 0; i < 30; i++) frame->x[i] = 0;
     frame->lr = 0;
     frame->sp = 0;
@@ -224,43 +205,56 @@ static int setup_idle(void) {
     frame->elr = (uint64_t)idle_entry;
     frame->spsr = 0x345;
 
-    idle_thread->kernel_rsp = (uint64_t)frame;
+    idle->kernel_rsp = (uint64_t)frame;
+    rq->idle = idle;
     return 0;
 }
 
-static void *context_switch(registers_t *r) {
-    if (active->nr_active == 0) {
-        prio_array_t *tmp = active;
-        active  = expired;
-        expired = tmp;
+static void rq_init(struct runqueue *rq) {
+    rq->lock = 0;
+    rq->active = &rq->arrays[0];
+    rq->expired = &rq->arrays[1];
+    for (int i = 0; i < BITMAP_SIZE; i++) {
+        rq->arrays[0].bitmap[i] = 0;
+        rq->arrays[1].bitmap[i] = 0;
+    }
+    rq->arrays[0].nr_active = 0;
+    rq->arrays[1].nr_active = 0;
+    for (int i = 0; i < PRIO_ARRAY_BITS; i++) {
+        rq->arrays[0].queue[i] = 0;
+        rq->arrays[1].queue[i] = 0;
+    }
+    rq->current = 0;
+    rq->idle = 0;
+    rq->sleep_count = 0;
+}
+
+static void *context_switch(struct runqueue *rq, registers_t *r) {
+    (void)r;
+    if (rq->active->nr_active == 0) {
+        prio_array_t *tmp = rq->active;
+        rq->active  = rq->expired;
+        rq->expired = tmp;
     }
 
-    int top_prio = prio_array_find_top(active);
+    int top_prio = prio_array_find_top(rq->active);
     if (top_prio < 0) {
-        uart_print("sw: IDLE\n");
-        if (current_thread)
-            fpu_save(current_thread);
-        current_thread = idle_thread;
-        return (void *)idle_thread->kernel_rsp;
+        if (rq->current)
+            fpu_save(rq->current);
+        rq->current = rq->idle;
+        return (void *)rq->idle->kernel_rsp;
     }
 
-    thread_t *next = active->queue[top_prio];
-    prio_array_dequeue(active, next, top_prio);
+    thread_t *next = rq->active->queue[top_prio];
+    prio_array_dequeue(rq, rq->active, next, top_prio);
 
     if (next->state == THREAD_ZOMBIE || next->state == THREAD_UNUSED)
-        return context_switch(r);
+        return context_switch(rq, r);
 
-    /* The frame at next->kernel_rsp already holds the thread's own
-     * saved state: prepared by thread_create()/arch_fork_setup_regs()
-     * for fresh threads, or saved by scheduler_switch() for threads
-     * that have run before.  Do NOT copy the interrupted thread's
-     * live registers over it — that clobbers the child's fork frame
-     * (x0/sp/callee-saved) and restarts run-before threads from
-     * their original entry instead of resuming them. */
     next->state = THREAD_RUNNING;
-    if (current_thread)
-        fpu_save(current_thread);
-    current_thread = next;
+    if (rq->current)
+        fpu_save(rq->current);
+    rq->current = next;
     fpu_restore(next);
 
     if (next->page_dir)
@@ -269,104 +263,195 @@ static void *context_switch(registers_t *r) {
     return (void *)next->kernel_rsp;
 }
 
-void *scheduler_switch(registers_t *r) {
-    ticks++;
-    sleep_wake_tick();
-
-    for (int pass = 0; pass < 2; pass++) {
-        prio_array_t *pa = (pass == 0) ? active : expired;
-        for (int i = 0; i < PRIO_ARRAY_BITS; i++) {
-            thread_t *t = pa->queue[i];
-            if (!t) continue;
-            thread_t *start = t;
-            do {
-                if (t->state == THREAD_BLOCKED && t->sleep_until && t->sleep_until <= ticks) {
-                    t->state = THREAD_READY;
-                    t->sleep_until = 0;
-                    if (t->sleep_avg < MAX_SLEEP_AVG)
-                        t->sleep_avg += 5;
-                    if (t->sleep_avg > MAX_SLEEP_AVG)
-                        t->sleep_avg = MAX_SLEEP_AVG;
-                }
-                t = t->next;
-            } while (t != start);
-        }
-    }
-
-    if (current_thread && current_thread->tid != 0 && current_thread->state == THREAD_RUNNING) {
-        current_thread->kernel_rsp = (uint64_t)r;
-
-        if (current_thread->time_slice > 0)
-            current_thread->time_slice--;
-
-        if (current_thread->time_slice == 0) {
-            current_thread->state = THREAD_READY;
-
-            if (current_thread->sleep_avg > 0)
-                current_thread->sleep_avg -= 3;
-            if (current_thread->sleep_avg < 0)
-                current_thread->sleep_avg = 0;
-
-            current_thread->prio = effective_prio(current_thread->static_prio,
-                                                  current_thread->sleep_avg);
-            current_thread->time_slice = prio_to_timeslice(current_thread->static_prio);
-
-            prio_array_enqueue(expired, current_thread, current_thread->prio);
-        } else {
-            /* Preempted with time remaining: back to the active queue
-             * with the rest of the slice.  Dropping the thread here
-             * (as before) silently removed it from all queues. */
-            current_thread->state = THREAD_READY;
-            prio_array_enqueue(active, current_thread, current_thread->prio);
-        }
-        current_thread = 0;
-    }
-
-    return context_switch(r);
-}
-
-
-/* Blocking + timed sleep                                              */
-
-void scheduler_block_current(void) {
-    thread_t *cur = current_thread;
-    if (!cur || cur == idle_thread)
+/* Phase 12 idle balancing: steal the highest-priority thread from a
+ * remote CPU's queue into ours. */
+static void rq_steal(struct runqueue *rq) {
+    if (rq->active->nr_active > 0)
         return;
 
-    if (cur->array)
-        prio_array_dequeue(cur->array, cur, cur->prio);
-    cur->state = THREAD_BLOCKED;
+    for (unsigned i = 0; i < cpu_nr; i++) {
+        if (i == rq->cpu_id)
+            continue;
+        struct cpu *c = &cpus[i];
+        struct runqueue *srq = c->runqueue;
+        if (!srq || c->state != CPU_ONLINE)
+            continue;
+
+        uint32_t sflags;
+        spin_lock_irqsave(&srq->lock, &sflags);
+
+        prio_array_t *pa = srq->active;
+        int top = prio_array_find_top(pa);
+        if (top < 0) {
+            pa = srq->expired;
+            top = prio_array_find_top(pa);
+        }
+        if (top < 0) {
+            spin_unlock_irqrestore(&srq->lock, sflags);
+            continue;
+        }
+
+        thread_t *t = pa->queue[top];
+        prio_array_dequeue(srq, pa, t, top);
+        spin_unlock_irqrestore(&srq->lock, sflags);
+
+        t->rq = rq;
+        t->state = THREAD_READY;
+        uint32_t lflags;
+        spin_lock_irqsave(&rq->lock, &lflags);
+        prio_array_enqueue(rq, rq->active, t, t->prio);
+        spin_unlock_irqrestore(&rq->lock, lflags);
+        return;
+    }
 }
 
-static void sleep_wake_tick(void) {
+/* Wake helper — caller must hold rq->lock. */
+static void rq_unblock_locked(struct runqueue *rq, thread_t *thread) {
+    if (thread->state != THREAD_BLOCKED)
+        return;
+    thread->state = THREAD_READY;
+    if (thread->sleep_avg < MAX_SLEEP_AVG)
+        thread->sleep_avg += 10;
+    if (thread->sleep_avg > MAX_SLEEP_AVG)
+        thread->sleep_avg = MAX_SLEEP_AVG;
+    thread->prio = effective_prio(thread->static_prio, thread->sleep_avg);
+    prio_array_enqueue(rq, rq->active, thread, thread->prio);
+}
+
+static void sleep_wake_tick(struct runqueue *rq) {
     uint32_t now = (uint32_t)clockevent_get_ticks();
-    for (int i = 0; i < sleep_count; i++) {
-        thread_t *t = sleep_queue[i];
+    for (int i = 0; i < rq->sleep_count; i++) {
+        thread_t *t = rq->sleep_queue[i];
         if (t && t->sleep_until && (int32_t)(now - t->sleep_until) >= 0) {
-            sleep_queue[i] = sleep_queue[--sleep_count];
+            rq->sleep_queue[i] = rq->sleep_queue[--rq->sleep_count];
             t->sleep_until = 0;
-            scheduler_unblock_thread(t);
+            rq_unblock_locked(rq, t);
             i--;
         }
     }
 }
 
+void *scheduler_switch(registers_t *r) {
+    /* Mask IRQ while switching to avoid nested tick overwriting kernel_rsp. */
+    __asm__ __volatile__("msr daifset, #2" ::: "memory");
+
+    struct cpu *cpu = cpu_current();
+    struct runqueue *rq = cpu ? cpu->runqueue : NULL;
+    if (!rq)
+        return (void *)r;
+
+    /* Consume pending IPI_RESCHEDULE - any preemption satisfies it. */
+    if (cpu)
+        cpu->arch.need_resched = 0;
+
+    if (rq->active->nr_active == 0)
+        rq_steal(rq);
+
+    uint32_t flags;
+    spin_lock_irqsave(&rq->lock, &flags);
+
+    sleep_wake_tick(rq);
+
+    if (rq->current && rq->current->tid != 0) {
+        rq->current->kernel_rsp = (uint64_t)r;
+
+        if (rq->current->state == THREAD_RUNNING) {
+            if (rq->current->time_slice > 0)
+                rq->current->time_slice--;
+
+            if (rq->current->time_slice == 0) {
+                rq->current->state = THREAD_READY;
+                if (rq->current->sleep_avg > 0)
+                    rq->current->sleep_avg -= 3;
+                if (rq->current->sleep_avg < 0)
+                    rq->current->sleep_avg = 0;
+                rq->current->prio = effective_prio(rq->current->static_prio, rq->current->sleep_avg);
+                rq->current->time_slice = prio_to_timeslice(rq->current->static_prio);
+                if (rq->current->array == rq->active)
+                    prio_array_dequeue(rq, rq->active, rq->current, rq->current->prio);
+                else if (rq->current->array)
+                    prio_array_dequeue(rq, rq->current->array, rq->current, rq->current->prio);
+                prio_array_enqueue(rq, rq->expired, rq->current, rq->current->prio);
+                rq->current = NULL;
+            } else {
+                if (rq->current->array == NULL) {
+                    rq->current->state = THREAD_READY;
+                    prio_array_enqueue(rq, rq->active, rq->current, rq->current->prio);
+                } else {
+                    rq->current->state = THREAD_READY;
+                }
+                rq->current = NULL;
+            }
+        } else if (rq->current->state == THREAD_BLOCKED) {
+            rq->current = NULL;
+        } else {
+            rq->current = NULL;
+        }
+    } else if (rq->current && rq->current->tid == 0) {
+        /* Idle thread not saved — it has its own stack. */
+        rq->current = NULL;
+    } else if (rq->current) {
+        rq->current->kernel_rsp = (uint64_t)r;
+        rq->current = NULL;
+    }
+
+    /* If current was cleared or idle, pick next. */
+    if (!rq->current) {
+        void *nxt = context_switch(rq, r);
+        spin_unlock_irqrestore(&rq->lock, flags);
+        return nxt;
+    }
+
+    /* Check need_resched for non-tick IPI path. */
+    if (cpu && cpu->arch.need_resched) {
+        cpu->arch.need_resched = 0;
+        void *nxt = context_switch(rq, r);
+        spin_unlock_irqrestore(&rq->lock, flags);
+        return nxt;
+    }
+
+    spin_unlock_irqrestore(&rq->lock, flags);
+    return (void *)r;
+}
+
+/* Blocking + timed sleep */
+
+void scheduler_block_current(void) {
+    struct runqueue *rq = rq_current();
+    thread_t *cur = rq ? rq->current : NULL;
+    if (!rq || !cur || cur == rq->idle)
+        return;
+
+    uint32_t flags;
+    spin_lock_irqsave(&rq->lock, &flags);
+    if (cur->array)
+        prio_array_dequeue(rq, cur->array, cur, cur->prio);
+    cur->state = THREAD_BLOCKED;
+    spin_unlock_irqrestore(&rq->lock, flags);
+}
+
 int scheduler_sleep_ticks(uint64_t deadline) {
-    thread_t *cur = current_thread;
-    if (!cur || cur == idle_thread)
+    struct runqueue *rq = rq_current();
+    thread_t *cur = rq ? rq->current : NULL;
+    if (!rq || !cur || cur == rq->idle)
         return -1;
 
     if ((int32_t)((uint32_t)clockevent_get_ticks() - (uint32_t)deadline) >= 0)
         return 0;
 
+    uint32_t flags;
+    spin_lock_irqsave(&rq->lock, &flags);
+
     if (cur->array)
-        prio_array_dequeue(cur->array, cur, cur->prio);
+        prio_array_dequeue(rq, cur->array, cur, cur->prio);
     cur->sleep_until = (uint32_t)deadline;
     cur->state = THREAD_BLOCKED;
 
-    int added = (sleep_count < SLEEP_MAX);
+    int added = (rq->sleep_count < SLEEP_MAX);
     if (added)
-        sleep_queue[sleep_count++] = cur;
+        rq->sleep_queue[rq->sleep_count++] = cur;
+
+    spin_unlock_irqrestore(&rq->lock, flags);
 
     if (!added) {
         cur->sleep_until = 0;
@@ -375,86 +460,186 @@ int scheduler_sleep_ticks(uint64_t deadline) {
         return -1;
     }
 
-    /* arm64 has no thread_yield; the tick path (scheduler_switch) sees
-     * THREAD_BLOCKED and switches away.  When the deadline expires the
-     * sleep scan wakes us and we resume right after WFI. */
-    __asm__ __volatile__("msr daifclr, #2" ::: "memory");
-    __asm__ __volatile__("wfi");
-    return 0;
+    return 1;
 }
 
 void scheduler_init(void) {
-    for (int i = 0; i < 5; i++) {
-        active_array.bitmap[i] = 0;
-        expired_array.bitmap[i] = 0;
-    }
-    active_array.nr_active = 0;
-    expired_array.nr_active = 0;
-    for (int i = 0; i < PRIO_ARRAY_BITS; i++) {
-        active_array.queue[i] = 0;
-        expired_array.queue[i] = 0;
-    }
-    current_thread = 0;
+    struct cpu *bsp = &cpus[0];
+    struct runqueue *rq = &rqs[0];
 
-    if (setup_idle() < 0)
+    bsp->runqueue = rq;
+    rq->cpu_id = 0;
+    rq_init(rq);
+
+    if (setup_idle(rq) < 0)
         return;
 
-    idle_thread->state = THREAD_RUNNING;
-    current_thread = idle_thread;
-    uart_print("scheduler: O(1) init done\n");
+    rq->idle->state = THREAD_RUNNING;
+    rq->current = rq->idle;
+    bsp->current = rq->idle;
+    bsp->idle = rq->idle;
+    uart_print("scheduler: per-CPU O(1) runqueues ready\n");
+}
+
+void scheduler_init_cpu(struct cpu *cpu) {
+    struct runqueue *rq = &rqs[cpu->id];
+
+    cpu->runqueue = rq;
+    rq->cpu_id = cpu->id;
+    rq_init(rq);
+
+    if (setup_idle(rq) < 0) {
+        uart_print("smp: cpu idle setup failed\n");
+        return;
+    }
+
+    rq->idle->state = THREAD_RUNNING;
+    rq->current = rq->idle;
+    cpu->current = rq->idle;
+    cpu->idle = rq->idle;
+    uart_print("smp: cpu runqueue ready\n");
 }
 
 void scheduler_add_thread(thread_t *thread) {
     if (!thread) return;
 
-    if (thread->static_prio == 0)
+    if (thread->static_prio == 0 && thread->tid != 0)
         thread->static_prio = DEFAULT_PRIO;
     if (thread->prio == 0)
         thread->prio = thread->static_prio;
     if (thread->time_slice == 0)
         thread->time_slice = prio_to_timeslice(thread->static_prio);
 
+    struct runqueue *rq = pick_least_loaded_rq();
+
+    uint32_t flags;
+    spin_lock_irqsave(&rq->lock, &flags);
     thread->state = THREAD_READY;
-    prio_array_enqueue(active, thread, thread->prio);
+    thread->rq = rq;
+    prio_array_enqueue(rq, rq->active, thread, thread->prio);
+    spin_unlock_irqrestore(&rq->lock, flags);
 }
 
 void scheduler_remove_thread(thread_t *thread) {
     if (!thread || !thread->array) return;
 
+    struct runqueue *rq = thread->rq;
+    if (!rq) return;
+
+    uint32_t flags;
+    spin_lock_irqsave(&rq->lock, &flags);
+
     if (thread->array) {
-        prio_array_dequeue(thread->array, thread, thread->prio);
+        prio_array_dequeue(rq, thread->array, thread, thread->prio);
         thread->state = THREAD_ZOMBIE;
     }
+
+    spin_unlock_irqrestore(&rq->lock, flags);
 }
 
 void scheduler_unblock_thread(thread_t *thread) {
     if (!thread) return;
 
-    if (thread->state == THREAD_BLOCKED) {
-        thread->state = THREAD_READY;
-        if (thread->sleep_avg < MAX_SLEEP_AVG)
-            thread->sleep_avg += 10;
-        if (thread->sleep_avg > MAX_SLEEP_AVG)
-            thread->sleep_avg = MAX_SLEEP_AVG;
+    struct runqueue *rq = thread->rq ? thread->rq : rq_current();
+    if (!rq) return;
 
-        thread->prio = effective_prio(thread->static_prio, thread->sleep_avg);
-        prio_array_enqueue(active, thread, thread->prio);
+    uint32_t flags;
+    spin_lock_irqsave(&rq->lock, &flags);
+    rq_unblock_locked(rq, thread);
+    spin_unlock_irqrestore(&rq->lock, flags);
+
+    if (rq != rq_current() && cpu_online(cpu_get(rq->cpu_id)))
+        cpu_send_ipi(cpu_get(rq->cpu_id), IPI_RESCHEDULE);
+}
+
+int thread_migrate(thread_t *thread, unsigned target_cpu) {
+    if (!thread) return -1;
+    if (target_cpu >= cpu_nr || target_cpu >= CPU_MAX) return -1;
+
+    struct cpu *tcpu = cpu_get(target_cpu);
+    if (!tcpu || tcpu->state != CPU_ONLINE || !tcpu->runqueue) return -1;
+
+    struct runqueue *target_rq = tcpu->runqueue;
+    struct runqueue *source_rq = thread->rq;
+
+    if (!source_rq) return -1;
+    if (source_rq == target_rq) return 0;
+
+    if (thread->state == THREAD_RUNNING) {
+        struct runqueue *cur_rq = rq_current();
+        if (cur_rq && cur_rq->current == thread)
+            return -1;
     }
+
+    if (thread->state == THREAD_BLOCKED && thread->sleep_until)
+        return -1;
+
+    uint32_t sflags;
+    spin_lock_irqsave(&source_rq->lock, &sflags);
+    if (thread->array) {
+        prio_array_dequeue(source_rq, thread->array, thread, thread->prio);
+    }
+    thread->state = THREAD_READY;
+    thread->rq = target_rq;
+    spin_unlock_irqrestore(&source_rq->lock, sflags);
+
+    uint32_t tflags;
+    spin_lock_irqsave(&target_rq->lock, &tflags);
+    prio_array_enqueue(target_rq, target_rq->active, thread, thread->prio);
+    spin_unlock_irqrestore(&target_rq->lock, tflags);
+
+    if (target_rq != rq_current() && cpu_online(tcpu))
+        cpu_send_ipi(tcpu, IPI_RESCHEDULE);
+
+    return 0;
 }
 
 thread_t *scheduler_current_thread(void) {
-    return current_thread;
+    struct runqueue *rq = rq_current();
+    return rq ? rq->current : NULL;
 }
 
-/* Yield the CPU from kernel-thread context.
- * Called from blocking paths (waitq_sleep, waitq_sleep_timeout) after
- * the current thread was pulled off the runqueue.  WFI must run with
- * the IRQ mask clear: exceptions to EL1 set PSTATE.I, so without an
- * explicit daifclr the timer IRQ can never wake us and the whole
- * system freezes on the first blocking syscall.  Do NOT touch the
- * thread state here — scheduler_block_current() already marked it
- * THREAD_BLOCKED, and scheduler_unblock_thread() only re-enqueues
- * threads whose state is still THREAD_BLOCKED. */
+void sched_dump_stats(void) {
+    for (unsigned i = 0; i < cpu_nr; i++) {
+        struct cpu *c = &cpus[i];
+        struct runqueue *rq = c->runqueue;
+        if (!rq) {
+            uart_print("sched: cpu no rq\n");
+            continue;
+        }
+        uart_print("sched: cpu load\n");
+        (void)rq;
+    }
+}
+
+void scheduler_set_nice(thread_t *t, int nice) {
+    if (!t) return;
+    if (nice < -20) nice = -20;
+    if (nice > 19)  nice = 19;
+
+    struct runqueue *rq = t->rq ? t->rq : rq_current();
+    if (!rq) return;
+
+    uint32_t flags;
+    spin_lock_irqsave(&rq->lock, &flags);
+
+    int new_static = 120 + nice;
+    if (new_static < MAX_RT_PRIO) new_static = MAX_RT_PRIO;
+    if (new_static >= PRIO_MAX) new_static = PRIO_MAX - 1;
+    if (t->array) {
+        prio_array_dequeue(rq, t->array, t, t->prio);
+        t->static_prio = new_static;
+        t->prio = effective_prio(t->static_prio, t->sleep_avg);
+        t->time_slice = prio_to_timeslice(t->static_prio);
+        prio_array_enqueue(rq, t->array, t, t->prio);
+    } else {
+        t->static_prio = new_static;
+        t->prio = effective_prio(t->static_prio, t->sleep_avg);
+    }
+
+    spin_unlock_irqrestore(&rq->lock, flags);
+}
+
 void thread_yield(void) {
     __asm__ __volatile__("msr daifclr, #2" ::: "memory");
     __asm__ __volatile__("wfi");

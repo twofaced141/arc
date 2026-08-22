@@ -168,7 +168,21 @@ typedef struct proc proc_t;
 #define SYS_GETRLIMIT   93
 #define SYS_SETRLIMIT   94
 
-#define SYS_MAX         96
+/* Networking (BSD sockets — lwIP NO_SYS raw backend) */
+#define SYS_SOCKET      95
+#define SYS_BIND        96
+#define SYS_CONNECT     97
+#define SYS_LISTEN      98
+#define SYS_ACCEPT      99
+#define SYS_GETSOCKNAME 100
+#define SYS_GETPEERNAME 101
+#define SYS_SENDTO      102
+#define SYS_RECVFROM    103
+#define SYS_SETSOCKOPT  104
+#define SYS_GETSOCKOPT  105
+#define SYS_SHUTDOWN    106
+
+#define SYS_MAX         107
 
 /* Syscall dispatch */
 void syscall_init(void);
@@ -273,6 +287,20 @@ int64_t sys_io_complete(proc_t *p, registers_t *r);
 /* Monitoring syscalls */
 int64_t sys_get_free_pages(proc_t *p, registers_t *r);
 int64_t sys_get_total_pages(proc_t *p, registers_t *r);
+
+/* Networking */
+int64_t sys_socket(proc_t *p, registers_t *r);
+int64_t sys_bind(proc_t *p, registers_t *r);
+int64_t sys_connect(proc_t *p, registers_t *r);
+int64_t sys_listen(proc_t *p, registers_t *r);
+int64_t sys_accept(proc_t *p, registers_t *r);
+int64_t sys_getsockname(proc_t *p, registers_t *r);
+int64_t sys_getpeername(proc_t *p, registers_t *r);
+int64_t sys_sendto(proc_t *p, registers_t *r);
+int64_t sys_recvfrom(proc_t *p, registers_t *r);
+int64_t sys_setsockopt(proc_t *p, registers_t *r);
+int64_t sys_getsockopt(proc_t *p, registers_t *r);
+int64_t sys_shutdown(proc_t *p, registers_t *r);
 
 /* Driver infrastructure init — called from bsd_init */
 void sys_driver_init(void);

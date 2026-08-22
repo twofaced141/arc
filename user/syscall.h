@@ -75,6 +75,7 @@
 #define SYS_SETGID  60
 #define SYS_CLOCK_GETTIME 70
 #define SYS_SELECT  74
+#define SYS_POLL    75
 #define SYS_CLONE   76
 #define SYS_FUTEX   77
 #define SYS_MMAP    78
@@ -94,6 +95,20 @@
 #define SYS_SYSINFO     92
 #define SYS_GETRLIMIT   93
 #define SYS_SETRLIMIT   94
+
+/* Networking (BSD sockets — lwIP backend in bsd/net) */
+#define SYS_SOCKET      95
+#define SYS_BIND        96
+#define SYS_CONNECT     97
+#define SYS_LISTEN      98
+#define SYS_ACCEPT      99
+#define SYS_GETSOCKNAME 100
+#define SYS_GETPEERNAME 101
+#define SYS_SENDTO      102
+#define SYS_RECVFROM    103
+#define SYS_SETSOCKOPT  104
+#define SYS_GETSOCKOPT  105
+#define SYS_SHUTDOWN    106
 
 #define BSD_SYS(n) (1024L + (n))
 
@@ -221,6 +236,107 @@ static long getrlimit(int which, void *rlim) {
 }
 static long setrlimit(int which, void *rlim) {
     return syscall2(BSD_SYS(SYS_SETRLIMIT), which, (long)rlim);
+}
+
+/* ---- BSD sockets (kernel backend: bsd/net socketfs on lwIP) ---- */
+
+/* Values match bsd/include/bsd/socket.h (wire ABI) */
+#define AF_INET         2
+#define SOCK_STREAM     1
+#define SOCK_DGRAM      2
+#define SOCK_RAW        3
+#define IPPROTO_TCP     6
+#define IPPROTO_UDP     17
+#define SOL_SOCKET      0xfff
+#define SO_REUSEADDR    0x0004
+
+#define POLLIN          0x001
+#define POLLOUT         0x004
+#define POLLERR         0x008
+
+struct sockaddr {
+    unsigned char sa_len;
+    unsigned char sa_family;
+    char          sa_data[14];
+};
+
+struct sockaddr_in {
+    unsigned char  sin_len;    /* set to sizeof(struct sockaddr_in) */
+    unsigned char  sin_family;
+    unsigned short sin_port;   /* network byte order */
+    unsigned int   sin_addr;   /* network byte order */
+    char           sin_zero[8];
+};
+
+struct pollfd {
+    int   fd;
+    short events;
+    short revents;
+};
+
+/* Byte-swap helpers (all supported targets are little-endian). */
+static unsigned short htons(unsigned short v) {
+    return (unsigned short)((v << 8) | (v >> 8));
+}
+static unsigned short ntohs(unsigned short v) { return htons(v); }
+static unsigned int htonl(unsigned int v) {
+    return ((v & 0xffu) << 24) | ((v & 0xff00u) << 8) |
+           ((v & 0x00ff0000u) >> 8) | (v >> 24);
+}
+static unsigned int ntohl(unsigned int v) { return htonl(v); }
+
+static int socket(int domain, int type, int protocol) {
+    return (int)syscall3(BSD_SYS(SYS_SOCKET), domain, type, protocol);
+}
+
+static int bind(int fd, const struct sockaddr *addr, unsigned int addrlen) {
+    return (int)syscall3(BSD_SYS(SYS_BIND), fd, (long)addr, addrlen);
+}
+
+static int listen(int fd, int backlog) {
+    return (int)syscall2(BSD_SYS(SYS_LISTEN), fd, backlog);
+}
+
+static int accept(int fd, struct sockaddr *addr, unsigned int *addrlen) {
+    return (int)syscall3(BSD_SYS(SYS_ACCEPT), fd, (long)addr, (long)addrlen);
+}
+
+static int connect(int fd, const struct sockaddr *addr, unsigned int addrlen) {
+    return (int)syscall3(BSD_SYS(SYS_CONNECT), fd, (long)addr, addrlen);
+}
+
+static long sendto(int fd, const void *buf, unsigned long len, int flags,
+                   const struct sockaddr *dest_addr, unsigned int addrlen) {
+    return syscall7(BSD_SYS(SYS_SENDTO), fd, (long)buf, len, flags,
+                    (long)dest_addr, addrlen);
+}
+
+static long recvfrom(int fd, void *buf, unsigned long len, int flags,
+                     struct sockaddr *src_addr, unsigned int *addrlen) {
+    return syscall7(BSD_SYS(SYS_RECVFROM), fd, (long)buf, len, flags,
+                    (long)src_addr, (long)addrlen);
+}
+
+static int getsockname(int fd, struct sockaddr *addr, unsigned int *addrlen) {
+    return (int)syscall3(BSD_SYS(SYS_GETSOCKNAME), fd, (long)addr, (long)addrlen);
+}
+
+static int getpeername(int fd, struct sockaddr *addr, unsigned int *addrlen) {
+    return (int)syscall3(BSD_SYS(SYS_GETPEERNAME), fd, (long)addr, (long)addrlen);
+}
+
+static int setsockopt(int fd, int level, int optname, const void *optval,
+                      unsigned int optlen) {
+    return (int)syscall6(BSD_SYS(SYS_SETSOCKOPT), fd, level, optname,
+                         (long)optval, optlen);
+}
+
+static int shutdown(int fd, int how) {
+    return (int)syscall2(BSD_SYS(SYS_SHUTDOWN), fd, how);
+}
+
+static int poll(struct pollfd *fds, unsigned long nfds, int timeout) {
+    return (int)syscall3(BSD_SYS(SYS_POLL), (long)fds, nfds, timeout);
 }
 
 #endif

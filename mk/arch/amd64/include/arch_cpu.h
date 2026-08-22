@@ -52,12 +52,18 @@ struct arch_cpu {
     int      need_resched;      /* Phase 11: set by scheduler_ipi() */
     uint64_t stack_base;        /* per-CPU kernel stack (AP trampoline) */
     uint64_t syscall_rsp0;      /* offset 32: syscall_entry reads %gs:32 */
+    uint64_t user_rsp0;         /* offset 40: saved user RSP (per-CPU!) */
 };
 
-/* interrupts.s loads %gs:32 for the syscall entry stack — keep the
- * field at a fixed offset and refuse to build if it moves. */
+/* interrupts.s loads %gs:32 for the syscall entry stack and stores the
+ * interrupted user RSP at %gs:40 — keep both fields at fixed offsets
+ * and refuse to build if they move.  Both MUST be per-CPU: a single
+ * global let two CPUs entering syscalls concurrently corrupt each
+ * other's saved frame. */
 _Static_assert(offsetof(struct arch_cpu, syscall_rsp0) == 32,
                "interrupts.s expects syscall_rsp0 at offset 32");
+_Static_assert(offsetof(struct arch_cpu, user_rsp0) == 40,
+               "interrupts.s expects user_rsp0 at offset 40");
 
 static inline struct cpu *arch_cpu_current(void) {
     struct cpu *self;

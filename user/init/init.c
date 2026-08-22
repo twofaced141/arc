@@ -595,6 +595,7 @@ static void service_boot(void) {
 
 /* One-shot diagnostic: fork, child exits 42, parent verifies via
  * waitpid status (kernel encodes WEXITSTATUS << 8, like BSD). */
+
 static void proc_self_test(void) {
     print("init: proc self-test: fork ");
     long pid = bsd_fork();

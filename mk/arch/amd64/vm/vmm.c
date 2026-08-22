@@ -359,6 +359,10 @@ void *kmalloc(uint32_t size) {
 }
 
 void *kcalloc(uint32_t count, uint32_t size) {
+    /* Guard the multiplication: an overflowed total would allocate a
+     * tiny buffer while every caller assumes the full count*size. */
+    if (count != 0 && size != 0 && size > 0xFFFFFFFFu / count)
+        return NULL;
     uint32_t total = count * size;
     void *ptr = kmalloc(total);
     if (ptr) {
@@ -533,11 +537,18 @@ page_directory_t *vmm_get_current_directory(void) {
     return current_pml4[cpu_current()->id];
 }
 
+/* Full local TLB flush (used by the IPI_TLB handler on remote CPUs). */
+void vmm_tlb_reload_current(void) {
+    uint64_t cr3;
+    __asm__ __volatile__("mov %%cr3, %0" : "=r"(cr3));
+    __asm__ __volatile__("mov %0, %%cr3" :: "r"(cr3) : "memory");
+}
+
 page_directory_t *vmm_get_kernel_directory(void) {
     return kernel_pml4;
 }
 
-int vmm_map_page(page_directory_t *dir, uint64_t phys, uint64_t virt, uint32_t flags) {
+int vmm_map_page(page_directory_t *dir, uint64_t phys, uint64_t virt, uint64_t flags) {
     if (!dir)
         return -1;
     pt_t *pt = NULL;
@@ -639,10 +650,19 @@ void page_fault_handler(registers_t *r) {
     uint32_t error_code = (uint32_t)r->err_code;
     pml4_t *pml4 = current_pml4[cpu_current()->id];
 
+    /* COW break: a write to a copy-on-write page.  Handle this for
+     * KERNEL faults too — the kernel legitimately writes user pages on
+     * behalf of the process (copy_to_user, vnode ops into user
+     * buffers), and a kernel-mode COW fault used to fall through to
+     * panic().  handle_cow_fault checks the VMM_COW bit itself and
+     * returns 0 for ordinary faults. */
+    if ((error_code & 0x1) && (error_code & 0x2)) {
+        if (handle_cow_fault(pml4, fault_addr))
+            return;
+    }
+
     if (error_code & 0x4) {
         /* Fault in user mode */
-        if ((error_code & 0x1) && handle_cow_fault(pml4, fault_addr))
-            return;
         if (user_fault_handler) {
             user_fault_handler(r, fault_addr, error_code);
             return;
@@ -784,6 +804,13 @@ void vmm_fork_cow_pages(page_directory_t *parent_dir, page_directory_t *child_di
             }
         }
     }
+
+    /* The parent's pages just became read-only, but only THIS cpu's
+     * TLB was invalidated (invlpg above).  A sibling thread of the
+     * same address space running on another CPU could keep writing
+     * through its stale writable TLB entry — silently corrupting the
+     * COW protocol.  Force a TLB flush on every other CPU. */
+    tlb_flush_others();
 }
 
 void vmm_clear_user_pages(page_directory_t *dir) {
@@ -822,35 +849,79 @@ void vmm_clear_user_pages(page_directory_t *dir) {
     switch_cr3((uintptr_t)dir);
 }
 
-/* === Temp mapping (single 4K slot at TEMP_VADDR) ===
- * Mapped into kernel_pml4 — every process shares the kernel half,
- * so the slot is visible in whatever address space is active. */
+/* === Temp mapping (one 4K slot PER CPU, at TEMP_VADDR - id*PAGE_SIZE)
+ * All slots live in the same page table (PD index 511 of the kernel
+ * PDP[511]), mapped into kernel_pml4 — every process shares the kernel
+ * half, so the slots are visible in whatever address space is active.
+ * A single shared slot let two CPUs servicing faults concurrently
+ * overwrite each other's mapping and copy the WRONG physical page
+ * into a process (cross-process data corruption), so each CPU owns a
+ * private slot.  Callers still must not sleep between map/unmap. */
+
+#define TEMP_SLOTS_MAX 32
+
+static uint64_t temp_vaddr_for(unsigned cpu_id) {
+    if (cpu_id >= TEMP_SLOTS_MAX)
+        cpu_id = 0;
+    return TEMP_VADDR - (uint64_t)cpu_id * PAGE_SIZE;
+}
+
+static unsigned temp_cpu_slot(void) {
+    struct cpu *c = cpu_current();
+    return c ? c->id : 0;
+}
 
 void *vmm_temp_map(uint64_t phys) {
-    if (vmm_map_page(kernel_pml4, phys, TEMP_VADDR, VMM_PRESENT | VMM_WRITABLE) < 0)
+    uint64_t va = temp_vaddr_for(temp_cpu_slot());
+    if (vmm_map_page(kernel_pml4, phys, va, VMM_PRESENT | VMM_WRITABLE) < 0)
         return NULL;
-    return (void *)(uintptr_t)TEMP_VADDR;
+    return (void *)(uintptr_t)va;
 }
 
 void vmm_temp_unmap(void) {
-    vmm_unmap_page(kernel_pml4, TEMP_VADDR);
-    invlpg(TEMP_VADDR);
+    uint64_t va = temp_vaddr_for(temp_cpu_slot());
+    vmm_unmap_page(kernel_pml4, va);
+    invlpg(va);
 }
 
-/* === User copy helpers === */
+/* === User copy helpers ===
+ *
+ * Every helper validates the FULL range up front: each covered page
+ * must exist and carry VMM_USER.  Without this a user-supplied kernel
+ * pointer would give ring 0 an arbitrary read/write primitive, and a
+ * partially unmapped buffer would fault in kernel mode and panic. */
+
+int user_range_ok(const void *uaddr, uint32_t size, int write) {
+    if (size == 0)
+        return 1;
+    if (!uaddr)
+        return 0;
+    uint64_t addr = (uint64_t)(uintptr_t)uaddr;
+
+    /* Overflow-safe upper bound check against the user/kernel split.
+     * (size is 32-bit, so only the address terms need guarding.) */
+    if (addr >= USER_STACK_TOP || addr + size > USER_STACK_TOP)
+        return 0;
+
+    page_directory_t *dir = vmm_get_current_directory();
+    uint64_t first_page = addr & ~0xFFFULL;
+    uint64_t last_page = (addr + size - 1) & ~0xFFFULL;
+    for (uint64_t page = first_page; ; page += PAGE_SIZE) {
+        int flags = vmm_get_page_flags(dir, page);
+        if (!(flags & VMM_PRESENT)) return 0;
+        if (!(flags & VMM_USER)) return 0;
+        /* COW counts as writable: the pending write breaks it (the
+         * page-fault handler now services COW breaks from kernel mode). */
+        if (write && !(flags & (VMM_WRITABLE | VMM_COW))) return 0;
+        if (page == last_page)
+            break;
+    }
+    return 1;
+}
 
 int copy_from_user(void *dst, const void *user_src, uint32_t size) {
     if (size == 0) return 0;
-    uint64_t addr = (uint64_t)(uintptr_t)user_src;
-    if (addr + size < addr) return -1;
-    if (addr + size > USER_STACK_TOP) return -1;
-
-    page_directory_t *dir = vmm_get_current_directory();
-    uint64_t end_page = (addr + size + PAGE_SIZE - 1) & ~0xFFFULL;
-    for (uint64_t page = addr & ~0xFFFULL; page < end_page; page += PAGE_SIZE) {
-        if (!vmm_is_page_present(dir, page)) return -1;
-        if (!(vmm_get_page_flags(dir, page) & VMM_USER)) return -1;
-    }
+    if (!user_range_ok(user_src, size, 0)) return -1;
 
     for (uint32_t i = 0; i < size; i++)
         ((uint8_t *)dst)[i] = ((const uint8_t *)(uintptr_t)user_src)[i];
@@ -859,18 +930,7 @@ int copy_from_user(void *dst, const void *user_src, uint32_t size) {
 
 int copy_to_user(void *user_dst, const void *src, uint32_t size) {
     if (size == 0) return 0;
-    uint64_t addr = (uint64_t)(uintptr_t)user_dst;
-    if (addr + size < addr) return -1;
-    if (addr + size > USER_STACK_TOP) return -1;
-
-    page_directory_t *dir = vmm_get_current_directory();
-    uint64_t end_page = (addr + size + PAGE_SIZE - 1) & ~0xFFFULL;
-    for (uint64_t page = addr & ~0xFFFULL; page < end_page; page += PAGE_SIZE) {
-        int flags = vmm_get_page_flags(dir, page);
-        if (!(flags & VMM_PRESENT)) return -1;
-        if (!(flags & VMM_USER)) return -1;
-        if (!(flags & VMM_WRITABLE) && !(flags & VMM_COW)) return -1;
-    }
+    if (!user_range_ok(user_dst, size, 1)) return -1;
 
     for (uint32_t i = 0; i < size; i++)
         ((uint8_t *)(uintptr_t)user_dst)[i] = ((const uint8_t *)src)[i];
@@ -879,6 +939,7 @@ int copy_to_user(void *user_dst, const void *src, uint32_t size) {
 
 int strncpy_from_user(char *dst, const char *user_src, uint32_t max_len) {
     if (max_len == 0) return -1;
+    if (!user_src) return -1;
     uint64_t addr = (uint64_t)(uintptr_t)user_src;
     if (addr >= USER_STACK_TOP) return -1;
     uint64_t avail = USER_STACK_TOP - addr;
@@ -886,16 +947,21 @@ int strncpy_from_user(char *dst, const char *user_src, uint32_t max_len) {
     if (max_len == 0) return -1;
 
     page_directory_t *dir = vmm_get_current_directory();
-    uint64_t end_page = (addr + max_len + PAGE_SIZE - 1) & ~0xFFFULL;
-    for (uint64_t page = addr & ~0xFFFULL; page < end_page; page += PAGE_SIZE) {
-        if (!vmm_is_page_present(dir, page)) return -1;
-        if (!(vmm_get_page_flags(dir, page) & VMM_USER)) return -1;
-    }
+    uint64_t cur_page = addr & ~0xFFFULL;
+    int flags = vmm_get_page_flags(dir, cur_page);
+    if (!(flags & VMM_PRESENT) || !(flags & VMM_USER)) return -1;
 
+    /* Walk byte by byte and stop at the NUL — a string that ends early
+     * must not require pages BEYOND its terminator to be mapped. */
     for (uint32_t i = 0; i < max_len; i++) {
         char c = ((const char *)(uintptr_t)user_src)[i];
         dst[i] = c;
         if (c == '\0') return (int)(i + 1);
+        if (((addr + i + 1) & ~0xFFFULL) != cur_page) {
+            cur_page = (addr + i + 1) & ~0xFFFULL;
+            flags = vmm_get_page_flags(dir, cur_page);
+            if (!(flags & VMM_PRESENT) || !(flags & VMM_USER)) return -1;
+        }
     }
     return -1;
 }

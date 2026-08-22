@@ -166,7 +166,9 @@ static int region_materialize(proc_t *p, mmap_region_t *r, uintptr_t page) {
     }
     vmm_temp_unmap();
 
-    uint32_t flags = VMM_PRESENT | VMM_USER;
+    /* VMM_NX lives at PTE bit 63 on amd64 — keep the flags wide or
+     * the bit silently truncates away and pages stay executable. */
+    uint64_t flags = VMM_PRESENT | VMM_USER;
     if (r->prot & PROT_WRITE)
         flags |= VMM_WRITABLE;
 #if defined(__x86_64__)
@@ -469,7 +471,7 @@ int64_t sys_mprotect(proc_t *p, registers_t *r) {
             if (!vmm_present(p, pg))
                 continue;   /* not yet materialized: prot applies on fault */
             uint32_t fl = vmm_get_page_flags(p->page_dir, pg);
-            uint32_t new = fl & ~VMM_WRITABLE;
+            uint64_t new = fl & ~((uint64_t)VMM_WRITABLE);
 #if defined(__x86_64__)
             new &= ~VMM_NX;
             if (!(prot & PROT_EXEC))

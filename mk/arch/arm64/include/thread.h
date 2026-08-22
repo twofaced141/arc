@@ -35,8 +35,10 @@
 
 #include <stdint.h>
 #include "isr.h"
+#include "spinlock.h"
 
 struct task;
+struct runqueue;
 
 #define THREAD_UNUSED   0
 #define THREAD_READY    1
@@ -67,6 +69,7 @@ typedef struct thread {
     struct thread *next;
     struct thread *prev;
     prio_array_t *array;
+    struct runqueue *rq;            /* home runqueue (per-CPU) */
     uint64_t entry;
     uint32_t sleep_until;
     uint64_t tls_base;              /* per-thread TLS base (unused on arm64 yet) */

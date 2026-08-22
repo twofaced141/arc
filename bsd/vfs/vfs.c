@@ -341,11 +341,21 @@ static vnode_t *vfs_lookup_internal(const char *path, int follow_final,
     while (*p) {
         char component[256];
         int i = 0;
+        int truncated = 0;
         while (*p && *p != '/' && i < 255)
             component[i++] = *p++;
+        /* A component longer than the buffer would otherwise be looked
+         * up TRUNCATED — two different paths silently resolving to the
+         * same vnode is a classic confused-deputy primitive. */
+        if (i == 255 && *p && *p != '/')
+            truncated = 1;
         component[i] = '\0';
         while (*p == '/')
             p++;
+        if (truncated) {
+            vnode_put(cur);
+            return NULL;
+        }
 
         /* Accumulated path of the directory containing this component
          * (used to resolve relative symlink targets). */
@@ -497,8 +507,11 @@ int vfs_open(proc_t *p, const char *upath, int flags, int mode) {
         return -ENOTDIR;
     }
 
-    /* Permission check on the opened file itself. */
-    if (vp->ops && vp->ops->stat && vp->type != VCHR && vp->type != VFIFO) {
+    /* Permission check on the opened file itself.  Device and FIFO
+     * nodes used to bypass this entirely — keep the check whenever the
+     * filesystem provides a stat op (devfs nodes without stat stay
+     * governed by their open path). */
+    if (vp->ops && vp->ops->stat) {
         int amode = (flags & O_ACCMODE) == O_RDONLY ? R_OK
                   : (flags & O_ACCMODE) == O_WRONLY ? W_OK : (R_OK | W_OK);
         if (vfs_perm_check(p, vp, amode) < 0) {
@@ -561,7 +574,14 @@ ssize_t vfs_read(proc_t *p, int fd, void *buf, size_t count) {
             return -EAGAIN;
     }
 
-    if (vp->ops->stat && vp->type != VCHR && vp->type != VFIFO) {
+    /* Buffer validation BEFORE any vnode op touches `buf`: it is a
+     * raw user pointer.  A kernel address here would hand the file's
+     * contents an arbitrary kernel write; an unmapped one would fault
+     * in ring 0 and panic. */
+    if (!user_range_ok(buf, count > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)count, 1))
+        return -EFAULT;
+
+    if (vp->ops->stat) {
         if (vfs_perm_check(p, vp, R_OK) < 0)
             return -EACCES;
     }
@@ -588,6 +608,9 @@ ssize_t vfs_pread(proc_t *p, int fd, void *buf, size_t count, int64_t offset) {
     if (offset < 0)
         return -EINVAL;
 
+    if (!user_range_ok(buf, count > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)count, 1))
+        return -EFAULT;
+
     if (vp->ops->stat) {
         if (vfs_perm_check(p, vp, R_OK) < 0)
             return -EACCES;
@@ -613,7 +636,7 @@ ssize_t vfs_write(proc_t *p, int fd, const void *buf, size_t count) {
             return -EAGAIN;
     }
 
-    if (vp->ops->stat && vp->type != VCHR && vp->type != VFIFO) {
+    if (vp->ops->stat) {
         if (vfs_perm_check(p, vp, W_OK) < 0)
             return -EACCES;
     }
@@ -621,6 +644,9 @@ ssize_t vfs_write(proc_t *p, int fd, const void *buf, size_t count) {
     /* O_APPEND: every write goes to the current end of the file.
      * All fds on the same vnode share vp->size, so concurrent appends
      * to the same file each land after the previous one. */
+    if (!user_range_ok(buf, count > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)count, 0))
+        return -EFAULT;
+
     int64_t off = (f->flags & O_APPEND) ? vp->size : f->offset;
     ssize_t ret = vp->ops->write(vp, buf, count, off);
     if (ret > 0) {
@@ -648,6 +674,9 @@ ssize_t vfs_pwrite(proc_t *p, int fd, const void *buf, size_t count, int64_t off
         return -ESPIPE;
     if (offset < 0)
         return -EINVAL;
+
+    if (!user_range_ok(buf, count > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)count, 0))
+        return -EFAULT;
 
     if (vp->ops->stat) {
         if (vfs_perm_check(p, vp, W_OK) < 0)
@@ -1216,7 +1245,7 @@ int vfs_ftruncate(proc_t *p, int fd, int64_t length) {
     vnode_t *vp = (vnode_t *)f->vnode_ptr;
     if (!vp) return -EINVAL;
     if (vp->type == VDIR) return -EISDIR;
-    if (vp->ops->stat && vp->type != VCHR && vp->type != VFIFO) {
+    if (vp->ops->stat) {
         if (vfs_perm_check(p, vp, W_OK) < 0)
             return -EACCES;
     }

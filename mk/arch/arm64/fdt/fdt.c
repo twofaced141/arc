@@ -32,10 +32,10 @@
 
 /* fdt.c — Minimal Flattened Device Tree parser for ARM64.
  *
- * Only supports what we need: find PCI ECAM base address from QEMU's DTB.
- * The DTB is placed in RAM by QEMU; its address is passed to the kernel
- * in x0 at boot.  We parse it *after* the MMU is on via identity-mapping
- * (the DTB sits in identity-mapped RAM at 0x40000000+).
+ * Parses DTB for PCI ECAM, CPU, memory, UART and GIC discovery.
+ * The DTB is placed in RAM by the bootloader; its address is passed in
+ * x0 per the Linux arm64 boot protocol (QEMU virt uses the same). We
+ * parse it after the MMU is on via identity-mapping.
  */
 
 #include "fdt.h"
@@ -43,11 +43,13 @@
 #include "string.h"
 #include "bus.h"
 #include "device.h"
+#include "platform.h"
 #include <arc/boot.h>
 
-/* RAM bounds (must match vm/vmm.c). */
-#define RAM_BASE  0x40000000ULL
-#define RAM_SIZE  0x04000000ULL   /* 64 MB */
+/* RAM bounds fallback for fdt_scan_ram (before platform discovery).
+ * Must match ARM64_DEFAULT_* in platform.h. */
+#define RAM_BASE  ARM64_DEFAULT_RAM_BASE
+#define RAM_SIZE  ARM64_DEFAULT_RAM_SIZE
 
 /* Snapshot of the parsed DTB (set by arc_boot_init_fdt, consumed by
  * the platform bus scan). */
@@ -56,6 +58,20 @@ static int saved_off_struct;
 static int saved_off_strings;
 static int saved_size_struct;
 
+#define FDT_WALK_MAX_DEPTH       16
+
+static const uint8_t *fdt_node_find_prop(const uint8_t *fdt,
+                                         int off_struct, int off_strings,
+                                         int struct_size, int node_off,
+                                         const char *prop, int *out_len);
+static int fdt_read_node_reg(const uint8_t *fdt,
+                             int off_struct, int off_strings,
+                             int struct_size, int node_off,
+                             uint64_t *out_addr, uint64_t *out_size,
+                             int parent_addr_cells, int parent_size_cells);
+static int fdt_header_bounds(const uint8_t *fdt,
+                             int *off_struct, int *off_strings,
+                             int *size_struct);
 
 #define FDT_MAGIC          0xD00DFEED
 #define FDT_BEGIN_NODE     0x00000001
@@ -354,7 +370,8 @@ int fdt_get_cpus(const void *dtb, uint64_t *mpidrs, int max) {
     int cpus_off = -1;          /* /cpus props offset */
     int cpus_addr_cells = 1;
 
-    /* Pass 1: find /cpus at depth 1 and read its #address-cells. */
+    /* Pass 1: find /cpus and read its #address-cells.
+     * root depth 1, /cpus depth 2 — accept either for robustness. */
     while (off + 4 <= (int)off_dt_struct + (int)size_dt_struct) {
         uint32_t tok = be32(&fdt[off]);
         if (tok == FDT_BEGIN_NODE) {
@@ -362,10 +379,8 @@ int fdt_get_cpus(const void *dtb, uint64_t *mpidrs, int max) {
             const char *name = (const char *)&fdt[off + 4];
             int name_len = (int)strlen(name);
             int props_off = align4(off + 4 + name_len + 1);
-            if (depth == 1 && cpus_off < 0) {
-                if (strncmp(name, "cpus", 4) == 0)
-                    cpus_off = props_off;
-            }
+            if (cpus_off < 0 && strncmp(name, "cpus", 4) == 0)
+                cpus_off = props_off;
             off = props_off;
         } else if (tok == FDT_PROP) {
             int len = be32(&fdt[off + 4]);
@@ -380,8 +395,10 @@ int fdt_get_cpus(const void *dtb, uint64_t *mpidrs, int max) {
         } else if (tok == FDT_END_NODE) {
             depth--;
             off += 4;
-            if (depth == 0)
+            if (cpus_off >= 0 && depth == 1)
                 break;          /* left /cpus — done with pass 1 */
+            if (depth == 0)
+                break;
         } else if (tok == FDT_END) {
             break;
         } else {
@@ -392,10 +409,11 @@ int fdt_get_cpus(const void *dtb, uint64_t *mpidrs, int max) {
     if (cpus_off < 0)
         return 0;
 
-    /* Pass 2: walk the children of /cpus (depth 2), read reg of
-     * cpu@* nodes as the MPIDR. */
+    /* Pass 2: walk the children of /cpus, read reg of cpu@* nodes.
+     * We are inside /cpus; children are one level deeper. */
     int count = 0;
     off = cpus_off;
+    depth = 1; /* inside /cpus */
     while (off + 4 <= (int)off_dt_struct + (int)size_dt_struct) {
         uint32_t tok = be32(&fdt[off]);
         if (tok == FDT_BEGIN_NODE) {
@@ -403,7 +421,7 @@ int fdt_get_cpus(const void *dtb, uint64_t *mpidrs, int max) {
             const char *name = (const char *)&fdt[off + 4];
             int name_len = (int)strlen(name);
             int props_off = align4(off + 4 + name_len + 1);
-            if (depth == 2 && strncmp(name, "cpu", 3) == 0 && count < max) {
+            if (depth == 2 && strncmp(name, "cpu@", 4) == 0 && count < max) {
                 uint64_t mpidr = 0;
                 int po = props_off;
                 /* read reg within this node */
@@ -436,7 +454,7 @@ int fdt_get_cpus(const void *dtb, uint64_t *mpidrs, int max) {
         } else if (tok == FDT_END_NODE) {
             depth--;
             off += 4;
-            if (depth == 1)
+            if (depth == 0)
                 break;
         } else if (tok == FDT_END) {
             break;
@@ -504,6 +522,243 @@ int fdt_get_pci_ecam(const void *dtb, uint64_t *base, uint64_t *size) {
 
     debug_printf("fdt: PCI ECAM at 0x%lx size 0x%lx\n", *base, *size);
     return 0;
+}
+
+/* --- Platform discovery: replace QEMU virt hardcodes ------------------ */
+
+/* Walk the tree inheriting #address-cells / #size-cells like the platform
+ * bus does.  Finds first node whose compatible contains one of `compats`
+ * and returns its reg addresses using its parent's cells.  For single-reg
+ * devices (UART) only the first tuple is returned. */
+static int fdt_walk_find_compat_reg(const uint8_t *fdt,
+                                    int off_struct, int off_strings, int size_struct,
+                                    const char *compats[], size_t ncompats,
+                                    uint64_t *out_addr, uint64_t *out_size)
+{
+    struct { uint32_t addr_cells; uint32_t size_cells; } walk[FDT_WALK_MAX_DEPTH];
+    int depth = 0;
+    int off = off_struct;
+    walk[0].addr_cells = 2;
+    walk[0].size_cells = 2;
+
+    while (off + 4 <= off_struct + size_struct) {
+        uint32_t tok = be32(&fdt[off]);
+        if (tok == FDT_BEGIN_NODE) {
+            depth++;
+            if (depth >= FDT_WALK_MAX_DEPTH) return -1;
+            const char *name = (const char *)&fdt[off + 4];
+            if (name[0] == '\0') name = "/";
+            int node_props = align4(off + 4 + (int)strlen(name) + 1);
+            walk[depth].addr_cells = walk[depth - 1].addr_cells;
+            walk[depth].size_cells = walk[depth - 1].size_cells;
+
+            /* update from this node's #address-cells/#size-cells */
+            int len = 0;
+            const uint8_t *v = fdt_node_find_prop(fdt, off_struct, off_strings,
+                                                  size_struct, node_props,
+                                                  "#address-cells", &len);
+            if (v && len >= 4) {
+                uint32_t ac = be32(v);
+                if (ac >= 1 && ac <= 2) walk[depth].addr_cells = ac;
+            }
+            v = fdt_node_find_prop(fdt, off_struct, off_strings, size_struct,
+                                   node_props, "#size-cells", &len);
+            if (v && len >= 4) {
+                uint32_t sc = be32(v);
+                if (sc >= 1 && sc <= 2) walk[depth].size_cells = sc;
+            }
+
+            /* check compatible */
+            v = fdt_node_find_prop(fdt, off_struct, off_strings, size_struct,
+                                   node_props, "compatible", &len);
+            if (v && len > 0) {
+                for (size_t ci = 0; ci < ncompats; ci++) {
+                    if (compat_match((const char *)v, len, compats[ci])) {
+                        /* check status != disabled */
+                        int slen = 0;
+                        const uint8_t *sv = fdt_node_find_prop(fdt, off_struct, off_strings,
+                                                               size_struct, node_props,
+                                                               "status", &slen);
+                        if (sv && strncmp((const char *)sv, "disabled", 8) == 0)
+                            break;
+                        int parent_ac = (int)walk[depth - 1].addr_cells;
+                        int parent_sc = (int)walk[depth - 1].size_cells;
+                        uint64_t addr = 0, sz = 0;
+                        if (fdt_read_node_reg(fdt, off_struct, off_strings, size_struct,
+                                              node_props, &addr, &sz,
+                                              parent_ac, parent_sc) == 0) {
+                            if (out_addr) *out_addr = addr;
+                            if (out_size) *out_size = sz;
+                            return 0;
+                        }
+                        break;
+                    }
+                }
+            }
+            off = node_props;
+            continue;
+        }
+        if (tok == FDT_PROP) {
+            int len = be32(&fdt[off + 4]);
+            int val_off = off + 12;
+            off = align4(val_off + len);
+            continue;
+        }
+        if (tok == FDT_END_NODE) { depth--; off += 4; continue; }
+        if (tok == FDT_NOP) { off += 4; continue; }
+        if (tok == FDT_END) break;
+        off += 4;
+    }
+    return -1;
+}
+
+int fdt_get_uart_base(const void *dtb, uint64_t *base)
+{
+    if (!dtb || !base) return -1;
+    const uint8_t *fdt = (const uint8_t *)dtb;
+    if (be32(&fdt[0]) != FDT_MAGIC) return -1;
+    int off_struct, off_strings, size_struct;
+    if (fdt_header_bounds(fdt, &off_struct, &off_strings, &size_struct) < 0) return -1;
+    const char *uart_compats[] = { "arm,pl011" };
+    uint64_t sz = 0;
+    int ret = fdt_walk_find_compat_reg(fdt, off_struct, off_strings, size_struct,
+                                       uart_compats, 1, base, &sz);
+    if (ret == 0) debug_printf("fdt: UART at 0x%lx\n", *base);
+    return ret;
+}
+
+int fdt_get_gic_bases(const void *dtb, uint64_t *gicd, uint64_t *gicc)
+{
+    if (!dtb || !gicd || !gicc) return -1;
+    const uint8_t *fdt = (const uint8_t *)dtb;
+    if (be32(&fdt[0]) != FDT_MAGIC) return -1;
+    int off_struct, off_strings, size_struct;
+    if (fdt_header_bounds(fdt, &off_struct, &off_strings, &size_struct) < 0) return -1;
+
+    struct { uint32_t addr_cells; uint32_t size_cells; } walk[FDT_WALK_MAX_DEPTH];
+    int depth = 0;
+    int off = off_struct;
+    walk[0].addr_cells = 2; walk[0].size_cells = 2;
+    const char *gic_compats[] = { "arm,gic-400", "arm,gic-v2", "arm,cortex-a15-gic", "arm,gic-v3", "arm,gic" };
+
+    while (off + 4 <= off_struct + size_struct) {
+        uint32_t tok = be32(&fdt[off]);
+        if (tok == FDT_BEGIN_NODE) {
+            depth++;
+            if (depth >= FDT_WALK_MAX_DEPTH) return -1;
+            const char *name = (const char *)&fdt[off + 4];
+            if (name[0] == '\0') name = "/";
+            int node_props = align4(off + 4 + (int)strlen(name) + 1);
+            walk[depth].addr_cells = walk[depth - 1].addr_cells;
+            walk[depth].size_cells = walk[depth - 1].size_cells;
+            int len = 0;
+            const uint8_t *v = fdt_node_find_prop(fdt, off_struct, off_strings, size_struct,
+                                                  node_props, "#address-cells", &len);
+            if (v && len >= 4) { uint32_t ac = be32(v); if (ac>=1 && ac<=2) walk[depth].addr_cells = ac; }
+            v = fdt_node_find_prop(fdt, off_struct, off_strings, size_struct,
+                                   node_props, "#size-cells", &len);
+            if (v && len >= 4) { uint32_t sc = be32(v); if (sc>=1 && sc<=2) walk[depth].size_cells = sc; }
+            v = fdt_node_find_prop(fdt, off_struct, off_strings, size_struct,
+                                   node_props, "compatible", &len);
+            if (v && len > 0) {
+                int matched = 0;
+                for (size_t i = 0; i < 5; i++)
+                    if (compat_match((const char *)v, len, gic_compats[i])) { matched = 1; break; }
+                if (matched) {
+                    int slen = 0;
+                    const uint8_t *sv = fdt_node_find_prop(fdt, off_struct, off_strings,
+                                                           size_struct, node_props, "status", &slen);
+                    if (sv && strncmp((const char *)sv, "disabled", 8) == 0) { off = node_props; continue; }
+                    int parent_ac = (int)walk[depth - 1].addr_cells;
+                    int parent_sc = (int)walk[depth - 1].size_cells;
+                    int reg_len = 0;
+                    const uint8_t *reg = fdt_node_find_prop(fdt, off_struct, off_strings,
+                                                            size_struct, node_props, "reg", &reg_len);
+                    if (reg && reg_len >= (parent_ac + parent_sc) * 4) {
+                        int tuple = (parent_ac + parent_sc) * 4;
+                        uint64_t d_addr = 0;
+                        if (parent_ac == 2) d_addr = be64(reg);
+                        else d_addr = be32(reg);
+                        uint64_t c_addr = 0;
+                        if (reg_len >= tuple * 2) {
+                            const uint8_t *p2 = reg + tuple;
+                            if (parent_ac == 2) c_addr = be64(p2);
+                            else c_addr = be32(p2);
+                        } else {
+                            /* GICv3 single-reg or no GICC: synthesize +0x10000 */
+                            c_addr = d_addr + 0x10000;
+                        }
+                        *gicd = d_addr;
+                        *gicc = c_addr;
+                        debug_printf("fdt: GICD 0x%lx GICC 0x%lx\n", *gicd, *gicc);
+                        return 0;
+                    }
+                }
+            }
+            off = node_props;
+            continue;
+        }
+        if (tok == FDT_PROP) { int len = be32(&fdt[off + 4]); off = align4(off + 12 + len); continue; }
+        if (tok == FDT_END_NODE) { depth--; off += 4; continue; }
+        if (tok == FDT_NOP) { off += 4; continue; }
+        if (tok == FDT_END) break;
+        off += 4;
+    }
+    return -1;
+}
+
+int fdt_get_memory(const void *dtb, uint64_t *base, uint64_t *size)
+{
+    if (!dtb || !base || !size) return -1;
+    const uint8_t *fdt = (const uint8_t *)dtb;
+    if (be32(&fdt[0]) != FDT_MAGIC) return -1;
+    int off_struct, off_strings, size_struct;
+    if (fdt_header_bounds(fdt, &off_struct, &off_strings, &size_struct) < 0) return -1;
+
+    struct { uint32_t addr_cells; uint32_t size_cells; } walk[FDT_WALK_MAX_DEPTH];
+    int depth = 0;
+    int off = off_struct;
+    walk[0].addr_cells = 2; walk[0].size_cells = 2;
+
+    while (off + 4 <= off_struct + size_struct) {
+        uint32_t tok = be32(&fdt[off]);
+        if (tok == FDT_BEGIN_NODE) {
+            depth++;
+            if (depth >= FDT_WALK_MAX_DEPTH) return -1;
+            const char *name = (const char *)&fdt[off + 4];
+            if (name[0] == '\0') name = "/";
+            int node_props = align4(off + 4 + (int)strlen(name) + 1);
+            walk[depth].addr_cells = walk[depth - 1].addr_cells;
+            walk[depth].size_cells = walk[depth - 1].size_cells;
+            int len = 0;
+            const uint8_t *v = fdt_node_find_prop(fdt, off_struct, off_strings, size_struct,
+                                                  node_props, "#address-cells", &len);
+            if (v && len >= 4) { uint32_t ac = be32(v); if (ac>=1 && ac<=2) walk[depth].addr_cells = ac; }
+            v = fdt_node_find_prop(fdt, off_struct, off_strings, size_struct,
+                                   node_props, "#size-cells", &len);
+            if (v && len >= 4) { uint32_t sc = be32(v); if (sc>=1 && sc<=2) walk[depth].size_cells = sc; }
+
+            if (strncmp(name, "memory@", 7) == 0 || strcmp(name, "memory") == 0) {
+                int parent_ac = (int)walk[depth - 1].addr_cells;
+                int parent_sc = (int)walk[depth - 1].size_cells;
+                uint64_t b = 0, sz = 0;
+                if (fdt_read_node_reg(fdt, off_struct, off_strings, size_struct,
+                                      node_props, &b, &sz, parent_ac, parent_sc) == 0 && sz != 0) {
+                    *base = b; *size = sz;
+                    debug_printf("fdt: memory 0x%lx size 0x%lx\n", b, sz);
+                    return 0;
+                }
+            }
+            off = node_props;
+            continue;
+        }
+        if (tok == FDT_PROP) { int len = be32(&fdt[off + 4]); off = align4(off + 12 + len); continue; }
+        if (tok == FDT_END_NODE) { depth--; off += 4; continue; }
+        if (tok == FDT_NOP) { off += 4; continue; }
+        if (tok == FDT_END) break;
+        off += 4;
+    }
+    return -1;
 }
 
 
@@ -820,7 +1075,6 @@ struct arc_boot_info *arc_boot_init_fdt(const void *dtb) {
 #define FDT_PLATFORM_MAX_DEVICES 64
 #define FDT_PLATFORM_MAX_NAME    40
 #define FDT_PLATFORM_MAX_COMPAT  64
-#define FDT_WALK_MAX_DEPTH       16
 
 struct fdt_platform_device {
     struct arc_device dev;

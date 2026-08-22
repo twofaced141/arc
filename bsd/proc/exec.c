@@ -140,7 +140,13 @@ static int elf_load_segments_common(struct elf_load_state *st,
         bsd_elf_addr_t page_start = seg_start & ~(bsd_elf_addr_t)(PAGE_SIZE - 1);
         bsd_elf_addr_t page_end = (seg_end_mem + PAGE_SIZE - 1) & ~(bsd_elf_addr_t)(PAGE_SIZE - 1);
 
-        uint32_t page_flags = VMM_PRESENT | VMM_USER;
+        /* W^X: map segments non-executable unless the segment asks for
+         * PF_X.  The loader used to leave every page executable —
+         * including writable data/BSS.  VMM_NX is bit 63, which is
+         * why page_flags is 64-bit now. */
+        uint64_t page_flags = VMM_PRESENT | VMM_USER;
+        if (!(phdrs[i].p_flags & PF_X))
+            page_flags |= VMM_NX;
         if (phdrs[i].p_flags & PF_W)
             page_flags |= VMM_WRITABLE;
 
@@ -151,7 +157,7 @@ static int elf_load_segments_common(struct elf_load_state *st,
         int has_bss = phdrs[i].p_memsz > phdrs[i].p_filesz;
 
         for (bsd_elf_addr_t vaddr = page_start; vaddr < page_end; vaddr += PAGE_SIZE) {
-            uint32_t flags = page_flags;
+            uint64_t flags = page_flags;
 
             if (has_bss && vaddr < seg_end_mem && vaddr + PAGE_SIZE > seg_end_file)
                 flags |= VMM_WRITABLE;
@@ -207,6 +213,13 @@ static int elf_load_interpreter(struct elf_load_state *st) {
     if (!ivp) {
         log_printf(LOG_LEVEL_ERROR, "exec: interpreter not found: %s\r\n", st->interp_path);
         return -ENOENT;
+    }
+
+    /* The interpreter runs with the caller's privileges — require
+     * execute permission instead of loading any readable file. */
+    if (vfs_perm_check(proc_current(), ivp, X_OK) < 0) {
+        vnode_put(ivp);
+        return -EACCES;
     }
 
     elf_ehdr_t iehdr;
@@ -415,9 +428,29 @@ static int exec_collect_strings(char *usr_ptrs, char **kbuf,
  * Returns the new stack pointer, 16-byte aligned.  The stack starts
  * one page below the top: the page containing USER_STACK_TOP is never
  * mapped, so buffers living near sp would otherwise straddle the
- * boundary and get rejected by copy_to_user's range check. */
-static uint64_t exec_build_stack(char *argv_buf, int argc,
-                                 char *envp_buf, int envc) {
+ * boundary and get rejected by copy_to_user's range check.
+ *
+ * Returns 0 on success; -E2BIG when argv+envp would not fit into the
+ * mapped stack (the old unchecked version wrote straight past the
+ * lowest mapped page — a kernel-mode fault and panic). */
+static int exec_build_stack(char *argv_buf, int argc,
+                            char *envp_buf, int envc, uint64_t *out_sp) {
+    /* 32 stack pages minus a safety margin for the program's own
+     * early execution below the initial sp. */
+    const uint64_t STACK_BUDGET = USER_STACK_PAGES * PAGE_SIZE - 4 * PAGE_SIZE;
+    uint64_t used = 0;
+
+    for (int i = 0; i < argc; i++)
+        used += strlen(argv_buf + used) + 1;
+    size_t arglen = used;
+    used = 0;
+    for (int i = 0; i < envc; i++)
+        used += strlen(envp_buf + used) + 1;
+    size_t envlen = used;
+
+    if ((uint64_t)arglen + envlen + 8ull * (argc + envc + 2) > STACK_BUDGET)
+        return -E2BIG;
+
     uint64_t sp = USER_STACK_TOP - 4096;
 
     /* Copy strings, argv first then envp, growing downward.  Record
@@ -459,7 +492,8 @@ static uint64_t exec_build_stack(char *argv_buf, int argc,
     sp -= 8;
     *(uint64_t *)sp = (uint64_t)argc;
 
-    return sp;
+    *out_sp = sp;
+    return 0;
 }
 
 int proc_execve(registers_t *r) {
@@ -506,6 +540,14 @@ int proc_execve(registers_t *r) {
         kfree(argv_buf);
         kfree(envp_buf);
         return -ENOENT;
+    }
+
+    /* exec(2) requires execute permission on the binary itself. */
+    if (vfs_perm_check(p, vp, X_OK) < 0) {
+        vnode_put(vp);
+        kfree(argv_buf);
+        kfree(envp_buf);
+        return -EACCES;
     }
 
     struct elf_load_state st;
@@ -637,11 +679,25 @@ int proc_execve(registers_t *r) {
     mmap_teardown(p);
     p->heap_end = USER_HEAP_START;
     p->mmap_next = USER_MMAP_START;
+    p->mmap_cursor = USER_MMAP_START;   /* shared auto-place cursor */
 
     /* Build the initial user stack: argc, argv[], envp[], strings. */
     uint64_t sp = USER_STACK_TOP;
-    if (argv_buf || argc > 0)
-        sp = exec_build_stack(argv_buf, argc, envp_buf, envc);
+    if (argv_buf || argc > 0) {
+        int serr = exec_build_stack(argv_buf, argc, envp_buf, envc, &sp);
+        if (serr < 0) {
+            /* The new page_dir is already live; tear the image down
+             * rather than run it with a corrupt stack. */
+            vmm_free_directory(st.page_dir);
+            p->page_dir = old_dir;
+            if (p->thread)
+                p->thread->page_dir = old_dir;
+            vmm_switch_directory(old_dir);
+            kfree(argv_buf);
+            kfree(envp_buf);
+            return -E2BIG;
+        }
+    }
     kfree(argv_buf);
     kfree(envp_buf);
 

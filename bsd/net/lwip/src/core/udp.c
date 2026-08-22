@@ -62,6 +62,7 @@
 #include "lwip/stats.h"
 #include "lwip/snmp.h"
 #include "lwip/dhcp.h"
+#include "debug.h"
 
 #include <string.h>
 

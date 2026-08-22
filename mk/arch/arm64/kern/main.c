@@ -45,6 +45,8 @@
 #include "scheduler.h"
 #include "vmm.h"
 #include "fdt.h"
+#include "platform.h"
+#include "cpu.h"
 #include "personality.h"
 #include <arc/boot.h>
 
@@ -55,15 +57,15 @@ uint64_t pci_ecam_size;
 /* DTB pointer saved by startup.s before BSS clear. */
 extern uint64_t boot_dtb_ptr;
 
-#define UART_BASE 0x09000000
-#define UARTDR    (*(volatile uint32_t *)(UART_BASE + 0x000))
-#define UARTFR    (*(volatile uint32_t *)(UART_BASE + 0x018))
+#define UART_BASE arm64_uart_base
+#define UARTDR    (*(volatile uint32_t *)(uintptr_t)(UART_BASE + 0x000))
+#define UARTFR    (*(volatile uint32_t *)(uintptr_t)(UART_BASE + 0x018))
 #define UARTFR_TXFF (1 << 5)
-#define UARTCR    (*(volatile uint32_t *)(UART_BASE + 0x030))
-#define UARTLCR_H (*(volatile uint32_t *)(UART_BASE + 0x02C))
-#define UARTIBRD  (*(volatile uint32_t *)(UART_BASE + 0x024))
-#define UARTFBRD  (*(volatile uint32_t *)(UART_BASE + 0x028))
-#define UARTIMSC  (*(volatile uint32_t *)(UART_BASE + 0x038))
+#define UARTCR    (*(volatile uint32_t *)(uintptr_t)(UART_BASE + 0x030))
+#define UARTLCR_H (*(volatile uint32_t *)(uintptr_t)(UART_BASE + 0x02C))
+#define UARTIBRD  (*(volatile uint32_t *)(uintptr_t)(UART_BASE + 0x024))
+#define UARTFBRD  (*(volatile uint32_t *)(uintptr_t)(UART_BASE + 0x028))
+#define UARTIMSC  (*(volatile uint32_t *)(uintptr_t)(UART_BASE + 0x038))
 
 void uart_init(void) {
     UARTCR = 0;
@@ -103,12 +105,20 @@ void uart_print_hex64(uint64_t v) {
 extern uint32_t _kernel_start;
 extern uint32_t _kernel_end;
 
-#define GICD_BASE   0x08000000
-#define GICD_ICPENDR0 (*(volatile uint32_t *)(GICD_BASE + 0x280))
-#define GICD_ICPENDR1 (*(volatile uint32_t *)(GICD_BASE + 0x284))
+#define GICD_BASE   arm64_gicd_base
+#define GICD_ICPENDR0 (*(volatile uint32_t *)(uintptr_t)(GICD_BASE + 0x280))
+#define GICD_ICPENDR1 (*(volatile uint32_t *)(uintptr_t)(GICD_BASE + 0x284))
 
 void kernel_main(struct arc_boot_info *boot) {
     uint64_t dtb_addr = boot_dtb_ptr;
+
+    /* Platform discovery must precede UART/PMM/VMM/GIC which now use
+     * DT-derived bases (fallback = QEMU virt defaults). */
+    if (!dtb_addr) {
+        dtb_addr = (uint64_t)(uintptr_t)fdt_scan_ram(
+            (uint64_t)(uintptr_t)&_kernel_end);
+    }
+    arm64_platform_init((const void *)(uintptr_t)dtb_addr);
 
     uart_init();
     uart_print("\narc kernel arm64\n");
@@ -161,6 +171,8 @@ void kernel_main(struct arc_boot_info *boot) {
     isr_init();
     exception_init();
     gic_init();
+    ipi_init();
+    cpu_init();
 
     scheduler_init();
     uart_print("scheduler: init done\n");
@@ -184,6 +196,16 @@ void kernel_main(struct arc_boot_info *boot) {
         uart_print("arc: no BSD layer — standalone microkernel\n");
     }
 
+    /* SMP: bring up APs (QEMU: -smp 4) */
+    if (cpu_count() > 1) {
+        int online = cpu_start_all();
+        uart_print("smp: ");
+        uart_print_hex64((uint64_t)(uint32_t)online);
+        uart_print("/");
+        uart_print_hex64((uint64_t)(uint32_t)(cpu_count() - 1));
+        uart_print(" APs online\n");
+    }
+
     uart_print("arc: enabling interrupts\n");
     irq_enable();
 
@@ -200,6 +222,8 @@ void kernel_main_fdt(void) {
         dtb_addr = (uint64_t)(uintptr_t)fdt_scan_ram(
             (uint64_t)(uintptr_t)&_kernel_end);
     }
+
+    arm64_platform_init((const void *)(uintptr_t)dtb_addr);
 
     struct arc_boot_info *bi = arc_boot_init_fdt((const void *)(uintptr_t)dtb_addr);
     if (arc_boot_validate(bi) != 0) {

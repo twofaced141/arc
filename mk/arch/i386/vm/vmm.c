@@ -186,7 +186,7 @@ void vmm_free_directory(page_directory_t *dir) {
     pmm_free_page(dir);
 }
 
-int vmm_map_page(page_directory_t *dir, uint32_t phys, uint32_t virt, uint32_t flags) {
+int vmm_map_page(page_directory_t *dir, uint64_t phys, uint64_t virt, uint64_t flags) {
     uint32_t pd_index = virt >> 22;
     uint32_t pt_index = (virt >> 12) & 0x3FF;
 
@@ -530,6 +530,24 @@ void vmm_temp_unmap(void) {
     invlpg(TEMP_VADDR);
 }
 
+/* Validate a user range without touching it (see amd64 vmm.c). */
+int user_range_ok(const void *uaddr, uint32_t size, int write) {
+    if (size == 0) return 1;
+    if (!uaddr) return 0;
+    uint32_t addr = (uint32_t)uaddr;
+    if (addr > 0xC0000000u || size > 0xC0000000u - addr) return 0;
+    page_directory_t *dir = vmm_get_current_directory();
+    uint32_t first = addr & ~0xFFFu, last = (addr + size - 1) & ~0xFFFu;
+    for (uint32_t page = first; ; page += PAGE_SIZE) {
+        int flags = vmm_get_page_flags(dir, page);
+        if (!(flags & VMM_PRESENT)) return 0;
+        if (!(flags & VMM_USER)) return 0;
+        if (write && !(flags & (VMM_WRITABLE | VMM_COW))) return 0;
+        if (page == last) break;
+    }
+    return 1;
+}
+
 int copy_from_user(void *dst, const void *user_src, uint32_t size) {
     if (size == 0) return 0;
     uint32_t addr = (uint32_t)user_src;
@@ -589,6 +607,13 @@ int strncpy_from_user(char *dst, const char *user_src, uint32_t max_len) {
         if (c == '\0') return (int)(i + 1);
     }
     return -1;
+}
+
+/* Full local TLB flush (used by the IPI_TLB handler on remote CPUs). */
+void vmm_tlb_reload_current(void) {
+    uint32_t cr3;
+    __asm__ __volatile__("mov %%cr3, %0" : "=r"(cr3));
+    __asm__ __volatile__("mov %0, %%cr3" :: "r"(cr3) : "memory");
 }
 
 void vmm_init(void) {

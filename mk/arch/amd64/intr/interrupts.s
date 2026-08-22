@@ -108,7 +108,6 @@ isr_common_stub:
     mov %rsp, %rdi
     call scheduler_switch
     mov %rax, %rsp
-    movq %rsp, syscall_kernel_rsp(%rip)
 
     pop %rax
     pop %rbx
@@ -160,7 +159,6 @@ irq_common_stub:
     mov %rsp, %rdi
     call scheduler_switch
     mov %rax, %rsp
-    movq %rsp, syscall_kernel_rsp(%rip)
 
     pop %rax
     pop %rbx
@@ -181,20 +179,24 @@ irq_common_stub:
     add $16, %rsp
     iretq
 
-/* --- syscall entry for user mode --- */
+/* --- syscall entry for user mode ---
+ *
+ * Per-CPU state is accessed through %gs (kernel GS.base, never
+ * swapped):  %gs:32 = syscall kernel stack, %gs:40 = saved user RSP.
+ * Both live in struct arch_cpu — see the _Static_asserts there. */
 
 .extern scheduler_switch
 
 .global syscall_entry
 syscall_entry:
-    movq %rsp, user_rsp(%rip)
+    movq %rsp, %gs:40
     /* Per-CPU syscall stack: %gs:32 = cpu->arch.syscall_rsp0, kept in
      * sync with the TSS rsp0 of this CPU by tss_set_kernel_stack().
      * (Offset contract enforced by _Static_assert in arch_cpu.h.) */
     movq %gs:32, %rsp
 
     push $0x23
-    push user_rsp(%rip)
+    pushq %gs:40
     push %r11
     push $0x2B
     push %rcx
@@ -231,7 +233,6 @@ syscall_entry:
     mov %rsp, %rdi
     call scheduler_switch
     mov %rax, %rsp
-    movq %rsp, syscall_kernel_rsp(%rip)
 
     pop %rax
     pop %rbx
@@ -296,7 +297,6 @@ thread_yield:
     mov %rsp, %rdi
     call scheduler_switch
     mov %rax, %rsp                          /* switch to new stack    */
-    movq %rsp, syscall_kernel_rsp(%rip)
 
     /* Pop registers from (possibly new) thread's frame */
     pop %rax
@@ -358,10 +358,3 @@ thread_exit_switch:
     add $16, %rsp
     iretq
 
-.data
-.align 8
-.global syscall_kernel_rsp
-syscall_kernel_rsp: .quad 0
-.global user_rsp
-user_rsp: .quad 0
-.text

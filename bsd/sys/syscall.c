@@ -177,6 +177,20 @@ void syscall_init(void) {
     syscall_table[SYS_GETRLIMIT] = sys_getrlimit;
     syscall_table[SYS_SETRLIMIT] = sys_setrlimit;
 
+    /* Networking */
+    syscall_table[SYS_SOCKET]      = sys_socket;
+    syscall_table[SYS_BIND]        = sys_bind;
+    syscall_table[SYS_CONNECT]     = sys_connect;
+    syscall_table[SYS_LISTEN]      = sys_listen;
+    syscall_table[SYS_ACCEPT]      = sys_accept;
+    syscall_table[SYS_GETSOCKNAME] = sys_getsockname;
+    syscall_table[SYS_GETPEERNAME] = sys_getpeername;
+    syscall_table[SYS_SENDTO]      = sys_sendto;
+    syscall_table[SYS_RECVFROM]    = sys_recvfrom;
+    syscall_table[SYS_SETSOCKOPT]  = sys_setsockopt;
+    syscall_table[SYS_GETSOCKOPT]  = sys_getsockopt;
+    syscall_table[SYS_SHUTDOWN]    = sys_shutdown;
+
     log_print(LOG_LEVEL_DEBUG, "syscall: dispatch table initialized\r\n");
 }
 

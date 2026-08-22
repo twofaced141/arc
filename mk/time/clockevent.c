@@ -43,6 +43,9 @@ uint64_t clockevent_get_ticks(void) {
     return ticks;
 }
 
+__attribute__((weak)) void net_timer_tick(void) { }
+
 void clockevent_tick(void) {
     ticks++;
+    net_timer_tick();
 }

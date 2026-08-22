@@ -263,6 +263,24 @@ static void sigreturn_restore_mask(proc_t *p, uint32_t mask) {
             p->signals.blocked[i] = 1;
 }
 
+/* The sigframe lives in user memory, so every field in it is
+ * attacker-controlled.  Segment selectors and architectural flags are
+ * NEVER restored from the frame: a frame carrying CS=0x08 (or the NT
+ * flag) makes the final iretq fault in kernel mode and panics the
+ * machine.  Only RIP/RSP/RAX and the arithmetic flags come back. */
+
+#if defined(__i386__)
+#define USER_CS_SEL      0x1B
+#define USER_SS_SEL      0x23
+/* Keep CF/PF/AF/ZF/SF/DF/IF/OF; force reserved bit 1; drop NT, IOPL,
+ * TF, RF, VM, VIP/VIF/ID. */
+#define EFLAGS_SAFE_MASK 0x00000ED5ull
+#elif defined(__x86_64__)
+#define USER_CS_SEL      0x2B
+#define USER_SS_SEL      0x23
+#define RFLAGS_SAFE_MASK 0x0000000000000ED5ull
+#endif
+
 /* Leave signal-handling state: the interrupted context is resumed from
  * the frame.  sigreturn never returns to the caller. */
 static void sigreturn_done(proc_t *p) {
@@ -297,10 +315,10 @@ int64_t sys_sigreturn(proc_t *p, registers_t *r) {
     }
 
     r->eip     = frame.saved_eip;
-    r->cs      = frame.saved_cs;
-    r->eflags  = frame.saved_eflags;
+    r->cs      = USER_CS_SEL;                 /* never from the frame */
+    r->eflags  = (uint32_t)((frame.saved_eflags & EFLAGS_SAFE_MASK) | 0x2);
     r->useresp = frame.saved_esp;
-    r->ss      = frame.saved_ss;
+    r->ss      = USER_SS_SEL;                 /* never from the frame */
 
     sigreturn_restore_mask(p, frame.saved_mask);
     sigreturn_done(p);
@@ -316,10 +334,10 @@ int64_t sys_sigreturn(proc_t *p, registers_t *r) {
         return -EFAULT;
 
     r->rip    = frame.saved_rip;
-    r->cs     = frame.saved_cs;
-    r->rflags = frame.saved_rflags;
+    r->cs     = USER_CS_SEL;                  /* never from the frame */
+    r->rflags = (frame.saved_rflags & RFLAGS_SAFE_MASK) | 0x2;
     r->rsp    = frame.saved_rsp;
-    r->ss     = frame.saved_ss;
+    r->ss     = USER_SS_SEL;                  /* never from the frame */
 
     /* SA_RESTART: the interrupted syscall is re-executed — restore the
      * argument registers (the syscall instruction will fire again with
@@ -357,7 +375,10 @@ int64_t sys_sigreturn(proc_t *p, registers_t *r) {
         return -EFAULT;
 
     r->lr      = frame.saved_lr;
-    r->spsr    = frame.saved_spsr;
+    /* SPSR comes from user memory: force EL0t + SP_EL0 (M[4:0] = 0) so
+     * a crafted frame cannot ERET into a higher exception level.  Only
+     * the condition flags survive. */
+    r->spsr    = frame.saved_spsr & 0xF0000000ull;
     r->elr     = frame.saved_elr;
     r->sp      = frame.saved_sp;
 

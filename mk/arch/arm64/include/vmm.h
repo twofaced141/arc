@@ -42,6 +42,9 @@
 #define VMM_PRESENT      (1 << 0)
 #define VMM_WRITABLE     (1 << 1)
 #define VMM_USER         (1 << 2)
+/* Shared code uses VMM_NX for no-execute; arm64 vmm_map_page maps it
+ * to PXN/UXN attributes. */
+#define VMM_NX           (1ULL << 63)
 #define VMM_WRITE_THROUGH (1 << 3)
 #define VMM_CACHE_DISABLE (1 << 4)
 #define VMM_ACCESSED     (1 << 5)
@@ -70,7 +73,7 @@ void vmm_free_directory(page_directory_t *dir);
 page_directory_t *vmm_get_current_directory(void);
 page_directory_t *vmm_get_kernel_directory(void);
 
-int vmm_map_page(page_directory_t *dir, uint64_t phys, uint64_t virt, uint32_t flags);
+int vmm_map_page(page_directory_t *dir, uint64_t phys, uint64_t virt, uint64_t flags);
 void vmm_unmap_page(page_directory_t *dir, uint64_t virt);
 uint64_t vmm_get_physical(page_directory_t *dir, uint64_t virt);
 int vmm_get_page_flags(page_directory_t *dir, uint64_t virt);
@@ -90,6 +93,7 @@ void  vmm_temp_unmap(void);
 
 int copy_from_user(void *dst, const void *user_src, uint32_t size);
 int copy_to_user(void *user_dst, const void *src, uint32_t size);
+int user_range_ok(const void *uaddr, uint32_t size, int write);
 int strncpy_from_user(char *dst, const char *user_src, uint32_t max_len);
 
 int vmm_handle_page_fault(registers_t *r, uint64_t fault_addr, uint32_t esr);

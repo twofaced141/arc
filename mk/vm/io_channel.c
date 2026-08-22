@@ -35,6 +35,7 @@
 #include "string.h"
 #include "thread.h"
 #include "scheduler.h"
+#include "vmm.h"
 
 
 static io_channel_t channels[IO_CHANNEL_MAX];
@@ -72,12 +73,43 @@ int io_channel_create(const char *name) {
     ch->head = 0;
     ch->tail = 0;
     ch->count = 0;
+    ch->next_seq = 1;
+    ch->owner_pid = 0;   /* kernel-owned until claimed */
     ch->lock = SPINLOCK_INIT;
 
     spin_unlock_irqrestore(&channel_lock, flags);
 
     log_printf(LOG_LEVEL_DEBUG, "io_channel: created '%s' handle=%d\n", name, h);
     return h;
+}
+
+int io_channel_set_owner(int handle, int pid) {
+    if (handle < 0 || handle >= channel_count || pid <= 0)
+        return -1;
+    uint32_t flags;
+    spin_lock_irqsave(&channel_lock, &flags);
+    /* Only an unowned (freshly created) channel can be claimed — a
+     * duplicate-name lookup must not hand someone else's channel to a
+     * new owner. */
+    if (channels[handle].owner_pid != 0) {
+        spin_unlock_irqrestore(&channel_lock, flags);
+        return -1;
+    }
+    channels[handle].owner_pid = pid;
+    spin_unlock_irqrestore(&channel_lock, flags);
+    return 0;
+}
+
+int io_channel_owner_ok(int handle, int pid) {
+    if (handle < 0 || handle >= channel_count)
+        return 0;
+    uint32_t flags;
+    spin_lock_irqsave(&channel_lock, &flags);
+    /* Kernel-created channels (owner 0) are drivable by the kernel
+     * only — user syscalls must present the owning pid. */
+    int ok = (channels[handle].owner_pid == pid);
+    spin_unlock_irqrestore(&channel_lock, flags);
+    return ok;
 }
 
 int io_channel_lookup(const char *name) {
@@ -107,7 +139,9 @@ int io_channel_request(int handle, struct io_request *req) {
     int slot = ch->tail;
     struct io_channel_entry *entry = &ch->queue[slot];
     memcpy(&entry->req, req, sizeof(*req));
-    entry->req.request_id = (uint64_t)(uintptr_t)entry; /* unique ID */
+    /* Monotonic per-channel sequence number — an address would leak a
+     * kernel heap pointer to userspace via get_request. */
+    entry->req.request_id = ch->next_seq++;
     entry->completed = 0;
     entry->result = 0;
 
@@ -176,8 +210,11 @@ int io_channel_get_request(int handle, struct io_request *user_req) {
 
     spin_unlock_irqrestore(&ch->lock, flags);
 
-    /* Copy request to userspace */
-    memcpy(user_req, &entry->req, sizeof(entry->req));
+    /* Copy request to userspace via copy_to_user — user_req is an
+     * attacker-chosen pointer and a direct memcpy through it would be
+     * an arbitrary kernel write. */
+    if (copy_to_user(user_req, &entry->req, sizeof(entry->req)) < 0)
+        return -1;
     return 1; /* one request returned */
 }
 

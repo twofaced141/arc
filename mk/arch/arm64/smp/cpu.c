@@ -31,22 +31,28 @@
 
 
 /* AArch64 SMP: CPU discovery (Device Tree /cpus), per-CPU access via
- * TPIDR_EL1, GIC SGI IPI backend.  Secondary bringup (PSCI CPU_ON)
- * is Phase 4 — pending. */
+ * TPIDR_EL1, GIC SGI IPI backend.  Secondary bringup via PSCI CPU_ON. */
+#include <stdint.h>
+#include <stddef.h>
 #include "cpu.h"
 #include "fdt.h"
 #include "gic.h"
+#include "platform.h"
+#include "psci.h"
+#include "pmm.h"
+#include "vmm.h"
+#include "memory.h"
 #include "isr.h"
 #include "uart.h"
 #include "thread.h"
-#include <stddef.h>
+#include "clkevt_arm.h"
 
 /* DTB pointer saved by startup.s before BSS clear. */
 extern uint64_t boot_dtb_ptr;
 
 /* GIC v2 SGI: ID 16 is our generic IPI (16-31 are free SGIs). */
 #define IPI_SGI_ID   16
-#define GICD_SGIR    (*(volatile uint32_t *)(GICD_BASE + 0xF00))
+#define GICD_SGIR    (*(volatile uint32_t *)(uintptr_t)(GICD_BASE + 0xF00))
 #define GICD_SGIR_NSATT   (1 << 15)
 #define GICD_SGIR_TARGET(x)  (((x) & 0xFF) << 16)
 
@@ -98,17 +104,65 @@ int arch_percpu_init(struct cpu *cpu) {
     return 0;
 }
 
+/* AP globals consumed by arch_secondary_entry (MMU off, identity-mapped) */
+extern volatile uint64_t ap_stack;
+extern volatile struct cpu *ap_cpu;
+extern volatile uint64_t ap_ttbr;
+extern void arch_secondary_entry(void);
+
 /* ------------------------------------------------------------------ */
-/* Phase 4: PSCI CPU_ON — not implemented yet                          */
+/* Phase 4: PSCI CPU_ON                                                */
 /* ------------------------------------------------------------------ */
 
 int arch_cpu_start(struct cpu *cpu) {
-    (void)cpu;
-    uart_print("smp: PSCI CPU_ON bringup not implemented (arm64)\n");
-    return -1;
+    if (!cpu)
+        return -1;
+
+    /* Allocate per-CPU kernel stack (identity-mapped) */
+    void *stack = pmm_alloc_pages(THREAD_KSTACK_SIZE / PAGE_SIZE);
+    if (!stack) {
+        uart_print("smp: no stack for cpu ");
+        uart_print_hex64(cpu->id);
+        uart_print("\n");
+        return -1;
+    }
+    uint64_t stack_top = (uint64_t)(uintptr_t)stack + THREAD_KSTACK_SIZE;
+    cpu->kernel_stack = stack;
+    cpu->arch.stack_base = stack_top;
+
+    /* Publish for secondary entry (MMU off) */
+    ap_stack = stack_top;
+    ap_cpu = cpu;
+    page_directory_t *kdir = vmm_get_kernel_directory();
+    if (!kdir) {
+        uart_print("smp: no kernel page tables\n");
+        return -1;
+    }
+    ap_ttbr = (uint64_t)(uintptr_t)kdir;
+    __asm__ __volatile__("dsb sy\n\tisb" ::: "memory");
+
+    uint64_t entry = (uint64_t)(uintptr_t)arch_secondary_entry;
+    uart_print("smp: PSCI CPU_ON cpu ");
+    uart_print_hex64(cpu->id);
+    uart_print(" mpidr ");
+    uart_print_hex64(cpu->arch.mpidr);
+    uart_print(" entry ");
+    uart_print_hex64(entry);
+    uart_print("\n");
+
+    int ret = psci_cpu_on(cpu->arch.mpidr, entry, (uint64_t)(uintptr_t)cpu);
+    if (ret != 0) {
+        uart_print("smp: PSCI CPU_ON failed: ");
+        uart_print_hex64((uint64_t)(uint32_t)ret);
+        uart_print("\n");
+        return -1;
+    }
+    return 0;
 }
 
 void arch_ap_entry(struct cpu *cpu) {
+    gic_cpu_init();
+    clkevt_arm_cpu_init();
     cpu_ap_main(cpu);
 }
 

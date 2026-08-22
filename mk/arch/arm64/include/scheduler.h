@@ -36,14 +36,31 @@
 #include <stdint.h>
 #include "isr.h"
 #include "thread.h"
+#include "spinlock.h"
 
-#define BITMAP_SIZE      5
-#define PRIO_ARRAY_BITS  140
+#define BITMAP_SIZE      5       /* 140 bits = 5 * 32 */
+#define PRIO_ARRAY_BITS  140  /* 0-139 priority levels */
 
 struct prio_array {
     int nr_active;
     thread_t *queue[PRIO_ARRAY_BITS];
     uint32_t bitmap[BITMAP_SIZE];
+};
+
+/* Sleeping threads (blocked with a wake-up deadline) park here per-CPU;
+ * each CPU's timer tick wakes the ones whose deadline has passed. */
+#define SLEEP_MAX 256
+
+struct runqueue {
+    spinlock_t lock;
+    unsigned cpu_id;
+    prio_array_t arrays[2];
+    prio_array_t *active;
+    prio_array_t *expired;
+    thread_t *current;
+    thread_t *idle;
+    thread_t *sleep_queue[SLEEP_MAX];
+    int sleep_count;
 };
 
 void scheduler_init(void);
@@ -53,11 +70,20 @@ void scheduler_unblock_thread(thread_t *thread);
 void *scheduler_switch(registers_t *r);
 thread_t *scheduler_current_thread(void);
 
+/* Set nice value (-20 .. +19) for a thread, updates static_prio */
+void scheduler_set_nice(thread_t *t, int nice);
+
 /* Block the calling thread until clockevent ticks reach deadline.
- * Returns 0 when woken, -1 if the sleep was not set up.
+ * Returns 1 if blocked (caller must thread_yield), 0 if deadline passed, -1 on failure.
  */
 int scheduler_sleep_ticks(uint64_t deadline);
 void scheduler_block_current(void);
+
+/* Migrate a thread to a target CPU's runqueue. */
+int thread_migrate(thread_t *thread, unsigned target_cpu);
+
+/* Dump per-CPU runqueue load. */
+void sched_dump_stats(void);
 
 void thread_yield(void);
 

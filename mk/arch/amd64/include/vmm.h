@@ -87,8 +87,9 @@ void vmm_switch_directory(page_directory_t *dir);
 void vmm_free_directory(page_directory_t *dir);
 page_directory_t *vmm_get_current_directory(void);
 page_directory_t *vmm_get_kernel_directory(void);
+void vmm_tlb_reload_current(void);
 
-int vmm_map_page(page_directory_t *dir, uint64_t phys, uint64_t virt, uint32_t flags);
+int vmm_map_page(page_directory_t *dir, uint64_t phys, uint64_t virt, uint64_t flags);
 void vmm_unmap_page(page_directory_t *dir, uint64_t virt);
 uint64_t vmm_get_physical(page_directory_t *dir, uint64_t virt);
 int vmm_get_page_flags(page_directory_t *dir, uint64_t virt);
@@ -108,5 +109,14 @@ void  vmm_temp_unmap(void);
 int copy_from_user(void *dst, const void *user_src, uint32_t size);
 int copy_to_user(void *user_dst, const void *src, uint32_t size);
 int strncpy_from_user(char *dst, const char *user_src, uint32_t max_len);
+
+/* Validate a user pointer range WITHOUT touching it: every covered
+ * page must be present and user-accessible (and writable, or COW —
+ * breakable on access — when write != 0).  Syscall entry points must
+ * call this before handing a user buffer to anything that writes
+ * through it directly; otherwise an attacker-chosen kernel address
+ * becomes an arbitrary read/write primitive.  Returns 1 if the whole
+ * range is safe, 0 otherwise (caller returns -EFAULT). */
+int user_range_ok(const void *uaddr, uint32_t size, int write);
 
 #endif

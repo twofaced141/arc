@@ -44,6 +44,9 @@
 #define LWIP_UDP                1
 #define LWIP_TCP                1
 #define LWIP_RAW                1
+#define LWIP_NETIF_LOOPBACK     1
+#define LWIP_HAVE_LOOPIF        0
+#define LWIP_LOOPBACK_MAX_PBUFS 16
 
 /* ---------- TCP ---------- */
 #define TCP_MSS                 1460

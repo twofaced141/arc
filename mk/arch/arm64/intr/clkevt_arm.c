@@ -96,3 +96,20 @@ void clkevt_arm_init(void) {
 
     uart_print("timer: init done, ~100Hz\n");
 }
+
+void clkevt_arm_cpu_init(void) {
+    /* PPI IRQs are per-CPU banked in GICv2; enable on this CPU and
+     * reprogram the generic timer. timer_period already set by BSP. */
+    gic_enable_irq(TIMER_IRQ);
+    if (timer_period == 0) {
+        uint64_t freq;
+        __asm__ __volatile__("mrs %0, cntfrq_el0" : "=r"(freq));
+        timer_period = (uint32_t)(freq / 100);
+    }
+    __asm__ __volatile__(
+        "msr cntv_tval_el0, %0\n"
+        "msr cntv_ctl_el0, %1\n"
+        :
+        : "r"(timer_period), "r"(1UL)
+        : "memory");
+}

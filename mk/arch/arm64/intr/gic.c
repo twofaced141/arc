@@ -44,6 +44,11 @@ void gic_init(void) {
     uart_print("gic: initialized\n");
 }
 
+void gic_cpu_init(void) {
+    GICC_CTLR = 1;
+    GICC_PMR = 0xFF;
+}
+
 void gic_enable_irq(uint32_t irq) {
     if (irq > 1019) return;
     uint32_t reg = irq / 32;

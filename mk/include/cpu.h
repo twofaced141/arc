@@ -110,6 +110,11 @@ void ipi_handler(enum ipi_type type);
 void cpu_call_process(void);
 void tlb_ipi(void);
 
+/* Flush the TLB on every OTHER online CPU (full CR3 reload via
+ * IPI_TLB).  Required after changing PTEs that may be cached in
+ * remote TLBs — e.g. COW-marking a parent's writable pages in fork. */
+void tlb_flush_others(void);
+
 /* Cross-CPU call (Phase 13). */
 void cpu_call(struct cpu *cpu, void (*fn)(void *), void *arg);
 

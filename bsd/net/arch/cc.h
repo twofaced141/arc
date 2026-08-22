@@ -44,14 +44,24 @@ typedef uint32_t sys_prot_t;
 
 /* Use <string.h> for lwIP mem* */
 #define LWIP_NO_CTYPE_H 0
+/* Prevent lwIP arch.h from redefining ssize_t (we use long from bsd/vfs.h) */
+#define LWIP_NO_UNISTD_H 1
+#ifndef SSIZE_MAX
+#define SSIZE_MAX 2147483647
+#endif
+/* provide ssize_t for lwIP headers that need it (etharp.h etc) */
+#ifndef _SSIZE_T_DEFINED
+typedef long ssize_t;
+#define _SSIZE_T_DEFINED 1
+#endif
 
 /* Compiler hints */
 #define LWIP_UNUSED_ARG(x)  ((void)(x))
 
-/* Diagnostics — freestanding, no log_printf dependency.
- * LWIP_PLATFORM_DIAG is unused when LWIP_DEBUG==0.
- * ASSERT traps; debug builds may override via debug.h if needed. */
-#define LWIP_PLATFORM_DIAG(x)   do { } while(0)
-#define LWIP_PLATFORM_ASSERT(x) do { __builtin_trap(); } while(0)
+/* Diagnostics — log instead of trap so #UD does not panic the kernel.
+ * Original used __builtin_trap() -> ud2 -> panic Invalid Opcode. */
+#include "debug.h"
+#define LWIP_PLATFORM_DIAG(x)   do { log_printf(LOG_LEVEL_ERROR, "lwIP DIAG %s\n", x); } while(0)
+#define LWIP_PLATFORM_ASSERT(x) do { log_printf(LOG_LEVEL_ERROR, "lwIP ASSERT %s:%d: %s\n", __FILE__, __LINE__, (x)); } while(0)
 
 #endif /* ARC_NET_ARCH_CC_H */

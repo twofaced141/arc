@@ -41,5 +41,6 @@
 #define TIMER_IRQ 27
 
 void clkevt_arm_init(void);
+void clkevt_arm_cpu_init(void);
 
 #endif

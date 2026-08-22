@@ -60,7 +60,6 @@
 void gdt_install(void);
 void pic_remap(void);
 void syscall_entry(void);
-extern uint64_t syscall_kernel_rsp;
 
 static void wrmsr(uint32_t msr, uint64_t value) {
     uint32_t lo = (uint32_t)value;
@@ -328,11 +327,16 @@ void mk_init(struct arc_boot_info *boot_info) {
 
     /* Setup syscall/sysret MSRs for user mode entry */
     {
-        uint64_t rsp;
-        __asm__ __volatile__("mov %%rsp, %0" : "=r"(rsp));
-        syscall_kernel_rsp = rsp;
+        /* EFER.SCE enables SYSCALL/SYSRET; EFER.NXE must be ON before
+         * any PTE carries the NX bit (63) — without NXE a set bit 63
+         * is RESERVED and every access through such a page faults
+         * (#PF, RSVD).  The ELF loader and mmap mark data pages NX. */
+        uint32_t lo, hi;
+        __asm__ __volatile__("rdmsr" : "=a"(lo), "=d"(hi) : "c"(0xC0000080ull));
+        lo |= (1u << 0)   /* SCE */
+            | (1u << 11); /* NXE */
+        __asm__ __volatile__("wrmsr" : : "c"(0xC0000080ull), "a"(lo), "d"(hi));
     }
-    wrmsr(0xC0000080, 1);                                              /* EFER.SCE = 1 (enable syscall) */
     wrmsr(0xC0000081, (uint64_t)0x1B << 48 | (uint64_t)0x08 << 32);  /* STAR */
     wrmsr(0xC0000082, (uint64_t)syscall_entry);                       /* LSTAR */
     wrmsr(0xC0000083, 0x200);                                         /* SF_MASK (clear IF) */

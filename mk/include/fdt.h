@@ -56,4 +56,10 @@ int fdt_platform_init(void);
  * Returns the number of CPUs found (up to max), or 0 on failure. */
 int fdt_get_cpus(const void *dtb, uint64_t *mpidrs, int max);
 
+/* Platform discovery — replace QEMU virt hardcodes with DT-driven values.
+ * Each returns 0 on success, -1 if not found / bad FDT. */
+int fdt_get_memory(const void *dtb, uint64_t *base, uint64_t *size);
+int fdt_get_uart_base(const void *dtb, uint64_t *base);
+int fdt_get_gic_bases(const void *dtb, uint64_t *gicd, uint64_t *gicc);
+
 #endif

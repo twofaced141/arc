@@ -91,6 +91,8 @@ typedef struct {
     int                        head;   /* dequeue index (userspace reads) */
     int                        tail;   /* enqueue index (kernel writes)  */
     int                        count;
+    uint64_t                   next_seq;   /* request-id source: NEVER a kernel address */
+    int                        owner_pid;  /* pid that registered the channel; 0 = kernel */
     spinlock_t                 lock;
 } io_channel_t;
 
@@ -100,6 +102,16 @@ typedef struct {
  * on success, -1 on failure. */
 int io_channel_create(const char *name);
 
+/* Record / test channel ownership.  Channels created by sys_io_register
+ * belong to the registering process; every syscall that drives a
+ * channel must verify ownership first, or any process could steal and
+ * complete another driver's requests.  owner_pid == 0 is the kernel
+ * itself (always allowed).  set_owner succeeds only on an unowned
+ * (freshly created) channel — a duplicate name must never transfer an
+ * existing channel to a new "owner".  Returns 0 / -1. */
+int  io_channel_set_owner(int handle, int pid);
+int  io_channel_owner_ok(int handle, int pid);
+
 /* Send a request through a channel.
  * Blocks (scheduler-aware) until the userspace driver completes it.
  * Returns 0 on success, negative on error. */
@@ -108,7 +120,9 @@ int io_channel_request(int handle, struct io_request *req);
 /* Kernel-side lookup by name (used by block_ipc etc.). */
 int io_channel_lookup(const char *name);
 
-/* Internal helpers (called from sys_driver.c dispatch handlers) */
+/* Internal helpers (called from sys_driver.c dispatch handlers).
+ * get_request writes through user_req with copy_to_user; the caller
+ * must have validated nothing — the copy validates the pointer. */
 int io_channel_get_request(int handle, struct io_request *user_req);
 int io_channel_complete(int handle, uint64_t request_id, int result);
 

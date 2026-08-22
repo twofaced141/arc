@@ -43,11 +43,13 @@
  *   - EINTR when a signal is pending,
  *   - ETIMEDOUT when the (optional) relative timeout elapses.
  *
- * The system is currently uniprocessor, so a "compare and enqueue under
- * interrupts-off" window is atomic: no other thread can run during it.
- * FUTEX_WAKE walks the same bucket holding the guard, so a wake cannot
- * be lost between the value check and the sleep.
- */
+ * Synchronization model: every mutation of a futex bucket/queue
+ * (compare-and-link, pop-on-wake, requeue) happens under the global
+ * futex_lock, so a FUTEX_WAKE racing a waiter's value-check + link is
+ * serialized.  A wake that lands BEFORE the waiter parks flips
+ * p->state to PRS_RUNNING, which waitq_sleep_timeout_linked detects
+ * (it refuses to sleep unless still PRS_SLEEP) — no lost wakeups when
+ * multiple CPUs are active. */
 
 #include "bsd/uipc/futex.h"
 #include "bsd/errno.h"

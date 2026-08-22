@@ -377,6 +377,19 @@ static void rq_steal(struct runqueue *rq) {
         }
 
         thread_t *t = pa->queue[top];
+        if (t == srq->current) {
+            /* A dispatched thread stays linked in its priority list
+             * (context_switch rotates it to the tail instead of
+             * dequeuing when peers share the bucket), so the head can
+             * be the remote CPU's live RUNNING thread.  Dequeuing it
+             * would put two CPUs on one kernel stack — take another
+             * member of the same list, or skip this CPU. */
+            if (t->next == t) {
+                spin_unlock_irqrestore(&srq->lock, sflags);
+                continue;
+            }
+            t = t->next;
+        }
         prio_array_dequeue(srq, pa, t, top);
         spin_unlock_irqrestore(&srq->lock, sflags);
 
@@ -720,6 +733,11 @@ void scheduler_add_thread(thread_t *thread) {
     thread->rq = rq;
     prio_array_enqueue(rq, rq->active, thread, thread->prio);
     spin_unlock_irqrestore(&rq->lock, flags);
+
+    /* Nudge the target CPU if it is not us: an idle CPU sits in hlt
+     * and only re-evaluates its queue on the next tick or IPI. */
+    if (rq != rq_current() && cpu_online(cpu_get(rq->cpu_id)))
+        cpu_send_ipi(cpu_get(rq->cpu_id), IPI_RESCHEDULE);
 }
 
 void scheduler_remove_thread(thread_t *thread) {
@@ -779,26 +797,28 @@ int thread_migrate(thread_t *thread, unsigned target_cpu) {
     if (source_rq == target_rq)
         return 0;
 
-    /* Cannot migrate a thread that is currently RUNNING on its CPU.
-     * The thread must be READY (on a runqueue) or we reject. */
-    if (thread->state == THREAD_RUNNING) {
-        struct runqueue *cur_rq = rq_current();
-        if (cur_rq && cur_rq->current == thread)
-            return -1;
-    }
-
-    /* Do not migrate threads that are in the sleep queue (BLOCKED with
-     * a deadline).  They are not on a prio array and have sleep_until set. */
-    if (thread->state == THREAD_BLOCKED && thread->sleep_until)
+    /* Only a READY thread (linked on a runqueue's prio array) may be
+     * migrated.  A RUNNING thread is live on another CPU's stack, and
+     * a BLOCKED thread was pulled off the array with its wake
+     * bookkeeping still pending — moving either corrupts the scheduler
+     * (double enqueue or a wake that never arrives). */
+    if (thread->state != THREAD_READY)
         return -1;
 
-    /* Dequeue from source runqueue. */
+    /* Dequeue from source runqueue.  State, current and array are
+     * re-checked under the source lock: without this a thread that was
+     * dispatched (or blocked) after the fast-path check above could be
+     * dequeued out from under its CPU or enqueued twice. */
     uint32_t sflags;
     spin_lock_irqsave(&source_rq->lock, &sflags);
 
-    if (thread->array) {
-        prio_array_dequeue(source_rq, thread->array, thread, thread->prio);
+    if (thread->state != THREAD_READY || source_rq->current == thread ||
+        !thread->array) {
+        spin_unlock_irqrestore(&source_rq->lock, sflags);
+        return -1;
     }
+
+    prio_array_dequeue(source_rq, thread->array, thread, thread->prio);
     thread->state = THREAD_READY;
     thread->rq = target_rq;
 

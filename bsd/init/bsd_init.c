@@ -295,6 +295,8 @@ void bsd_init(const char *cmdline) {
     ata_init();
     ahci_init();
     pl011_init();
+    extern void net_init(void);
+    net_init();
 
     /* Try to mount ext2 from an embedded initramfs image. */
     extern uint8_t _binary_root_img_start[] __attribute__((weak));
