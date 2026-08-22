@@ -1,6 +1,6 @@
 # bsd/net — networking (lwIP)
 
-`ARC` is a hybrid: `mk/` microkernel + `bsd/` personality. Networking lives in
+Networking lives in
 `bsd/net/`, but the stack itself is vendored `lwIP` (BSD license, compatible
 with `LICENSE` `BSD-3-Clause`).
 
