@@ -54,7 +54,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu qemu-system-arm python3
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            libc6-dev-arm64-cross qemu-system-arm python3
 
       - name: Build kernel
         run: make ARCH=arm64 -j"$(nproc)" arc.bin
