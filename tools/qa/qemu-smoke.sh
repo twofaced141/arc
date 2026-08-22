@@ -77,9 +77,12 @@ case "$ARCH" in
         fi
 
         echo "=== qemu boot (arm64 virt) ==="
+        # -nic none: without it QEMU instantiates a default virtio-net
+        # NIC whose option rom (efi-virtio.rom, shipped by the separate
+        # ipxe-qemu package) may be missing and aborts the whole boot.
         run_qemu qemu-system-aarch64 -machine virt,gic-version=2 -cpu cortex-a57 \
             -m 64 -kernel "$REPO_ROOT/arc.bin" \
-            -display none -serial stdio
+            -display none -serial stdio -nic none
 
         check_marker "arc kernel arm64"
         check_marker "arc: BSD layer initialized"
