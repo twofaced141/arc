@@ -258,26 +258,36 @@ void *scheduler_switch(registers_t *r) {
         ticks++;
         sleep_wake_tick();
 
-        if (current_thread && current_thread->tid != 0 && current_thread->state == THREAD_RUNNING) {
+        /* Save the live frame for ANY interrupted thread, idle included:
+         * context_switch() resumes idle through kernel_esp, so it must
+         * always point at the newest frame on idle's stack.  Resuming the
+         * static bootstrap frame instead makes ESP settle a few bytes
+         * below that frame's own iret tail; the next tick's hardware push
+         * then overwrites the tail's CS/EFLAGS slots and the resume loads
+         * a garbage CS -> #GP(err=0x200).  Only timeslice accounting is
+         * skipped for idle (it must never enter the runqueues). */
+        if (current_thread && current_thread->state == THREAD_RUNNING) {
             current_thread->kernel_esp = (uint32_t)r;
 
-            if (current_thread->time_slice > 0)
-                current_thread->time_slice--;
+            if (current_thread->tid != 0) {
+                if (current_thread->time_slice > 0)
+                    current_thread->time_slice--;
 
-            if (current_thread->time_slice == 0) {
-                current_thread->state = THREAD_READY;
+                if (current_thread->time_slice == 0) {
+                    current_thread->state = THREAD_READY;
 
-                if (current_thread->sleep_avg > 0)
-                    current_thread->sleep_avg -= 3;
-                if (current_thread->sleep_avg < 0)
-                    current_thread->sleep_avg = 0;
+                    if (current_thread->sleep_avg > 0)
+                        current_thread->sleep_avg -= 3;
+                    if (current_thread->sleep_avg < 0)
+                        current_thread->sleep_avg = 0;
 
-                current_thread->prio = effective_prio(current_thread->static_prio,
-                                                      current_thread->sleep_avg);
-                current_thread->time_slice = prio_to_timeslice(current_thread->static_prio);
+                    current_thread->prio = effective_prio(current_thread->static_prio,
+                                                          current_thread->sleep_avg);
+                    current_thread->time_slice = prio_to_timeslice(current_thread->static_prio);
 
-                prio_array_enqueue(expired, current_thread, current_thread->prio);
-                current_thread = NULL;
+                    prio_array_enqueue(expired, current_thread, current_thread->prio);
+                    current_thread = NULL;
+                }
             }
         }
 
@@ -288,9 +298,10 @@ void *scheduler_switch(registers_t *r) {
         uint32_t flags;
         spin_lock_irqsave(&sched_lock, &flags);
 
-        if (current_thread && current_thread->tid != 0) {
+        if (current_thread)
             current_thread->kernel_esp = (uint32_t)r;
 
+        if (current_thread && current_thread->tid != 0) {
             /* Only re-enqueue if the syscall didn't already set a
              * special state (e.g. THREAD_BLOCKED by port_recv). */
             if (current_thread->state == THREAD_RUNNING) {
