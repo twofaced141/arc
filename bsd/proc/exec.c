@@ -554,12 +554,16 @@ int proc_execve(registers_t *r) {
     memset(&st, 0, sizeof(st));
     st.vp = vp;
 
+    /* Declared before the first `goto fail` so every exit path returns
+     * a defined errno; -ENOEXEC covers the unreadable-header case. */
+    int err = -ENOEXEC;
+
     if (elf_read(vp, &st.ehdr, 0, sizeof(st.ehdr)) < 0) {
         vnode_put(vp);
         goto fail;
     }
 
-    int err = elf_validate(&st.ehdr);
+    err = elf_validate(&st.ehdr);
     if (err < 0) {
         log_print(LOG_LEVEL_ERROR, "exec: bad ELF header\r\n");
         vnode_put(vp);
