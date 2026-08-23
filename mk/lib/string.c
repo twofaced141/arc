@@ -82,6 +82,50 @@ int atoi(const char *s) {
     return n * sign;
 }
 
+/* Freestanding: GCC -O2 may synthesize calls to strtol from digit-parsing
+ * loops (e.g. lwIP netif_find), so the kernel must provide one. */
+long strtol(const char *s, char **endptr, int base) {
+    long n = 0;
+    int neg = 0;
+
+    if (base != 0 && (base < 2 || base > 36)) {
+        if (endptr) *endptr = (char *)s;
+        return 0;
+    }
+
+    while (*s == ' ' || (*s >= '\t' && *s <= '\r')) s++;
+    if (*s == '-') { neg = 1; s++; }
+    else if (*s == '+') s++;
+
+    if ((base == 0 || base == 16) && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')
+        && ((s[2] >= '0' && s[2] <= '9') || (s[2] >= 'a' && s[2] <= 'f')
+            || (s[2] >= 'A' && s[2] <= 'F'))) {
+        s += 2;
+        base = 16;
+    }
+    if (base == 0)
+        base = (s[0] == '0') ? 8 : 10;
+
+    for (;;) {
+        int d;
+        if (*s >= '0' && *s <= '9')
+            d = *s - '0';
+        else if (*s >= 'a' && *s <= 'z')
+            d = *s - 'a' + 10;
+        else if (*s >= 'A' && *s <= 'Z')
+            d = *s - 'A' + 10;
+        else
+            break;
+        if (d >= base)
+            break;
+        n = n * base + d;
+        s++;
+    }
+
+    if (endptr) *endptr = (char *)s;
+    return neg ? -n : n;
+}
+
 size_t strlen(const char *s) {
     size_t len = 0;
     while (s[len]) len++;

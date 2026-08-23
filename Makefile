@@ -99,6 +99,7 @@ else
 endif
 
 DEBUG   ?= 0
+OPT     ?= 2
 
 ifeq ($(DEBUG),1)
     DEBUG_FLAGS = -DCONFIG_DEBUG
@@ -107,7 +108,7 @@ endif
 CFLAGS   = -ffreestanding -nostdlib -nostartfiles -nodefaultlibs \
            -Wall -Wextra -std=c17 \
            -fno-pic -no-pie -fno-stack-protector \
-           -fno-asynchronous-unwind-tables $(CFLAGS_X86) -O0 \
+           -fno-asynchronous-unwind-tables $(CFLAGS_X86) -O$(OPT) \
            -fno-builtin \
            $(CC_ARCH) $(DEBUG_FLAGS)
 

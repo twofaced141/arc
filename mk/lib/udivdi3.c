@@ -33,7 +33,8 @@
 /* 64-bit divide/modulo helpers for 32-bit targets (libgcc-compatible).
  * x86_64/aarch64 have native 64-bit divide instructions and never call
  * these, but on i386 the compiler emits __udivdi3/__umoddi3/__divdi3/__moddi3
- * for any uint64_t/int64_t division. */
+ * for any uint64_t/int64_t division.  At -O2 GCC prefers __udivmoddi4,
+ * which computes quotient and remainder in one call. */
 
 #include <stdint.h>
 
@@ -65,6 +66,16 @@ uint64_t __udivdi3(uint64_t n, uint64_t d)
 	uint64_t r;
 
 	return udiv_qr(n, d, &r);
+}
+
+uint64_t __udivmoddi4(uint64_t n, uint64_t d, uint64_t *rem)
+{
+	uint64_t q, r;
+
+	q = udiv_qr(n, d, &r);
+	if (rem)
+		*rem = r;
+	return q;
 }
 
 uint64_t __umoddi3(uint64_t n, uint64_t d)
