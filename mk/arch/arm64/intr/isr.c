@@ -37,6 +37,9 @@
 #include "vmm.h"
 #include "personality.h"
 #include "cpu.h"
+#include "thread.h"
+
+extern thread_t *scheduler_current_thread(void);
 #include <stdint.h>
 
 extern uint64_t scheduler_switch(registers_t *r);
@@ -149,6 +152,22 @@ static void dump_regs(registers_t *r) {
 
 /* AArch64 SVC ABI: x8=sysno(+1024), x0-3=args, ret in x0 */
 static void handle_svc(registers_t *r) {
+    /* TEMP debug: log each thread's FIRST syscall */
+    {
+        static uint32_t seen_tids;
+        thread_t *ct = scheduler_current_thread();
+        uint64_t tid = ct ? ct->tid : 0;
+        if (tid < 32 && !(seen_tids & (1u << tid))) {
+            seen_tids |= (1u << tid);
+            uart_print("SVCFIRST tid=");
+            uart_print_hex64(tid);
+            uart_print(" x0=");
+            uart_print_hex64(r->x[0]);
+            uart_print(" elr=");
+            uart_print_hex64(r->elr);
+            uart_print("\n");
+        }
+    }
     if (bsd_syscall_dispatch)
         r->x[0] = (uint64_t)bsd_syscall_dispatch(r);
 }

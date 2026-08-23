@@ -36,11 +36,22 @@
 #define PAGE_SIZE 4096
 #define PAGE_SHIFT 12
 
-#define USER_BASE          0x0000000041000000ULL
-#define USER_HEAP_START    0x0000000042000000ULL
-#define USER_MMAP_START    0x0000000050000000ULL
-#define USER_STACK_TOP     0x00007FFFFFFFF000ULL
+/* User address space layout.
+ *
+ * All user VAs live in the first 1GB (L0[0] -> L1[0], L2 indices 2..63),
+ * which vmm_create_directory() gives to each process as PRIVATE tables.
+ * Everything at or above 0x40000000 is the kernel's shared RAM window;
+ * device MMIO (GIC, UART, virtio, ECAM) lives in shared L2 slots
+ * 64..96 / 511 of L1[0] and is kernel-access-only.
+ *
+ * Historically these constants pointed into the identity RAM window,
+ * which made every process alias the same physical pages — fork/exec
+ * of a second process executed the first one's binary. */
+#define USER_BASE          0x0000000000400000ULL
+#define USER_HEAP_START    0x0000000000800000ULL
+#define USER_MMAP_START    0x0000000000C00000ULL
+#define USER_STACK_TOP     0x0000000003F00000ULL
 #define USER_STACK_PAGES   32
-#define USER_TLS_VADDR     0x00007FFFFEFFF000ULL
+#define USER_TLS_VADDR     0x0000000003A00000ULL
 
 #endif

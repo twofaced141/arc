@@ -313,6 +313,17 @@ void vmm_init(void) {
 void vmm_init_heap(void) {
 }
 
+/* User VA range inside L1[0], in L2-index units.  VAs 0x00400000 ..
+ * 0x03FFFFFF (ELF base, heap, mmap, stack) get PRIVATE page tables per
+ * process; every other L2 slot of L1[0] is shared with the boot tables
+ * and holds kernel-only mappings:
+ *   L2 64..96  device MMIO window (GIC 0x08000000, UART 0x09000000,
+ *              RTC/GPIO 0x09xxxxxx, virtio-mmio 0x0A000000..)
+ *   L2 511     PCI ECAM window (ECAM_VADDR 0xFFE00000)
+ *   L2 0..1    low core (null guard etc.) — nothing user-visible */
+#define USER_L2_MIN 2
+#define USER_L2_MAX 63
+
 page_directory_t *vmm_create_directory(void) {
     if (!kernel_l1) return NULL;
 
@@ -320,18 +331,38 @@ page_directory_t *vmm_create_directory(void) {
     if (!l0) return NULL;
     memset(l0, 0, sizeof(page_directory_t));
 
+    /* Copy the boot L0: shared kernel/RAM-window/device slots come over
+     * verbatim; the user range is replaced with fresh empty tables so
+     * each address space owns its user PTEs. */
     for (int i = 0; i < 512; i++) {
-        if (initial_l0->entries[i] & DESC_VALID) {
-            uint64_t entry = initial_l0->entries[i];
-            if (entry & DESC_TABLE) {
-                page_directory_t *child = (page_directory_t *)(uintptr_t)(entry & ADDR_MASK);
-                l0->entries[i] = entry;
-                (void)child;
-            } else {
-                l0->entries[i] = entry;
-            }
+        if (!(initial_l0->entries[i] & DESC_VALID))
+            continue;
+        l0->entries[i] = initial_l0->entries[i];
+    }
+
+    uint64_t boot_l0e = l0->entries[0];
+    if (!(boot_l0e & DESC_VALID) || !(boot_l0e & DESC_TABLE))
+        return NULL;
+    page_directory_t *boot_l1 = (page_directory_t *)(uintptr_t)(boot_l0e & ADDR_MASK);
+
+    page_directory_t *user_l1 = (page_directory_t *)pmm_alloc_page();
+    if (!user_l1) return NULL;
+    memset(user_l1, 0, sizeof(page_directory_t));
+
+    for (int j = 0; j < 512; j++) {
+        if (j >= USER_L2_MIN && j <= USER_L2_MAX) {
+            /* Private, filled lazily by exec/demand paging. */
+            page_directory_t *l2 = (page_directory_t *)pmm_alloc_page();
+            if (!l2) return NULL;
+            memset(l2, 0, sizeof(page_directory_t));
+            user_l1->entries[j] = (uint64_t)(uintptr_t)l2 | DESC_VALID | DESC_TABLE | ATTR_AF;
+        } else {
+            /* Shared with boot: devices / low core. */
+            user_l1->entries[j] = boot_l1->entries[j];
         }
     }
+
+    l0->entries[0] = (uint64_t)(uintptr_t)user_l1 | DESC_VALID | DESC_TABLE | ATTR_AF;
 
     return l0;
 }
@@ -500,6 +531,41 @@ int vmm_cow_break(page_directory_t *l0, uint64_t virt) {
     return handle_cow(l0, virt);
 }
 
+/* Ensure the child's L2/L3 tables exist for this index path and return
+ * the child's L3 slot pointer.  The child's user L1 already exists
+ * (vmm_create_directory seeds it with private L2s for the user range). */
+static uint64_t *fork_child_l3(page_directory_t *child_dir, int l0i,
+                               int l1i, int l2i, int l3i) {
+    uint64_t *c_l0e = &child_dir->entries[l0i];
+    if (!(*c_l0e & DESC_VALID)) {
+        page_directory_t *n = (page_directory_t *)pmm_alloc_page();
+        if (!n) return NULL;
+        memset(n, 0, sizeof(page_directory_t));
+        *c_l0e = (uint64_t)(uintptr_t)n | DESC_VALID | DESC_TABLE | ATTR_AF;
+    }
+    page_directory_t *c_l1 = (page_directory_t *)(uintptr_t)(*c_l0e & ADDR_MASK);
+
+    uint64_t *c_l1e = &c_l1->entries[l1i];
+    if (!(*c_l1e & DESC_VALID)) {
+        page_directory_t *n = (page_directory_t *)pmm_alloc_page();
+        if (!n) return NULL;
+        memset(n, 0, sizeof(page_directory_t));
+        *c_l1e = (uint64_t)(uintptr_t)n | DESC_VALID | DESC_TABLE | ATTR_AF;
+    }
+    page_directory_t *c_l2 = (page_directory_t *)(uintptr_t)(*c_l1e & ADDR_MASK);
+
+    uint64_t *c_l2e = &c_l2->entries[l2i];
+    if (!(*c_l2e & DESC_VALID)) {
+        page_directory_t *n = (page_directory_t *)pmm_alloc_page();
+        if (!n) return NULL;
+        memset(n, 0, sizeof(page_directory_t));
+        *c_l2e = (uint64_t)(uintptr_t)n | DESC_VALID | DESC_TABLE | ATTR_AF;
+    }
+    page_directory_t *c_l3 = (page_directory_t *)(uintptr_t)(*c_l2e & ADDR_MASK);
+
+    return &c_l3->entries[l3i];
+}
+
 void vmm_fork_cow_pages(page_directory_t *parent_dir, page_directory_t *child_dir) {
     if (!parent_dir || !child_dir) return;
 
@@ -508,44 +574,44 @@ void vmm_fork_cow_pages(page_directory_t *parent_dir, page_directory_t *child_di
         if (!(parent_dir->entries[l0i] & DESC_TABLE)) continue;
 
         page_directory_t *parent_l1 = (page_directory_t *)(uintptr_t)(parent_dir->entries[l0i] & ADDR_MASK);
-        page_directory_t *child_l1;
-        if (!(child_dir->entries[l0i] & DESC_VALID)) continue;
-        if (!(child_dir->entries[l0i] & DESC_TABLE)) continue;
-        child_l1 = (page_directory_t *)(uintptr_t)(child_dir->entries[l0i] & ADDR_MASK);
 
         for (int l1i = 0; l1i < 512; l1i++) {
             if (!(parent_l1->entries[l1i] & DESC_VALID)) continue;
             if (!(parent_l1->entries[l1i] & DESC_TABLE)) continue;
 
             page_directory_t *parent_l2 = (page_directory_t *)(uintptr_t)(parent_l1->entries[l1i] & ADDR_MASK);
-            page_directory_t *child_l2;
-            if (!(child_l1->entries[l1i] & DESC_VALID)) continue;
-            if (!(child_l1->entries[l1i] & DESC_TABLE)) continue;
-            child_l2 = (page_directory_t *)(uintptr_t)(child_l1->entries[l1i] & ADDR_MASK);
 
             for (int l2i = 0; l2i < 512; l2i++) {
                 if (!(parent_l2->entries[l2i] & DESC_VALID)) continue;
                 if (!(parent_l2->entries[l2i] & DESC_TABLE)) continue;
 
                 page_directory_t *parent_l3 = (page_directory_t *)(uintptr_t)(parent_l2->entries[l2i] & ADDR_MASK);
-                page_directory_t *child_l3;
-                if (!(child_l2->entries[l2i] & DESC_VALID)) continue;
-                if (!(child_l2->entries[l2i] & DESC_TABLE)) continue;
-                child_l3 = (page_directory_t *)(uintptr_t)(child_l2->entries[l2i] & ADDR_MASK);
 
                 for (int l3i = 0; l3i < 512; l3i++) {
                     uint64_t pte = parent_l3->entries[l3i];
                     if (!(pte & DESC_VALID)) continue;
                     if (!(pte & DESC_PAGE)) continue;
                     if (!(pte & ATTR_AP_USER)) continue;
-                    if (pte & ATTR_AP_RO) continue;
 
-                    parent_l3->entries[l3i] = pte | ATTR_AP_RO;
-                    child_l3->entries[l3i] = parent_l3->entries[l3i];
+                    /* Enable COW on pages still writable.  Pages already
+                     * RO (shared via an earlier fork, or genuinely
+                     * read-only segments) are simply mapped into the
+                     * child as-is: handle_cow() breaks them lazily on
+                     * first write. */
+                    if (!(pte & ATTR_AP_RO))
+                        parent_l3->entries[l3i] = pte | ATTR_AP_RO;
+
+                    uint64_t *cpte = fork_child_l3(child_dir, l0i, l1i, l2i, l3i);
+                    if (cpte)
+                        *cpte = parent_l3->entries[l3i];
                 }
             }
         }
     }
+
+    /* Parent's tables were just RO-marked under a live MMU: flush so
+     * stale writable TLB entries cannot write through shared pages. */
+    __asm__ __volatile__("tlbi vmalle1is\n\tdsb ish\n\tisb" ::: "memory");
 }
 
 void vmm_clear_user_pages(page_directory_t *dir) {

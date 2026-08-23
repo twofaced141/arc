@@ -16,6 +16,7 @@
 #include "clockevent.h"
 #include "spinlock.h"
 #include "cpu.h"
+#include "debug.h"
 
 /* One O(1) runqueue per CPU (SMP Phase 12): each CPU schedules its own
  * threads and runs its own idle thread; threads stay on the runqueue
@@ -248,6 +249,26 @@ static void *context_switch(struct runqueue *rq, registers_t *r) {
     thread_t *next = rq->active->queue[top_prio];
     prio_array_dequeue(rq, rq->active, next, top_prio);
 
+    /* TEMP debug: trace picks of tid>=3 and periodic queue dumps */
+    {
+        static unsigned pick3, sw_total;
+        sw_total++;
+        if (next->tid >= 3 && pick3 < 8) {
+            pick3++;
+            log_printf(LOG_LEVEL_INFO,
+                       "PICK3#%u tid=%u st=%d prio=%d nact=%d nexp=%d cur=%u\r\n",
+                       pick3, next->tid, next->state, next->prio,
+                       rq->active->nr_active, rq->expired->nr_active,
+                       rq->current ? rq->current->tid : 0);
+        }
+        if ((sw_total % 20000u) == 0)
+            log_printf(LOG_LEVEL_INFO,
+                       "SW%u cur=%u nact=%d nexp=%d\r\n",
+                       sw_total,
+                       rq->current ? rq->current->tid : 0,
+                       rq->active->nr_active, rq->expired->nr_active);
+    }
+
     if (next->state == THREAD_ZOMBIE || next->state == THREAD_UNUSED)
         return context_switch(rq, r);
 
@@ -375,13 +396,11 @@ void *scheduler_switch(registers_t *r) {
                 prio_array_enqueue(rq, rq->expired, rq->current, rq->current->prio);
                 rq->current = NULL;
             } else {
-                if (rq->current->array == NULL) {
-                    rq->current->state = THREAD_READY;
-                    prio_array_enqueue(rq, rq->active, rq->current, rq->current->prio);
-                } else {
-                    rq->current->state = THREAD_READY;
-                }
-                rq->current = NULL;
+                /* Slice not expired: keep running (amd64 semantics).
+                 * The old code re-enqueued current and forced a switch
+                 * on EVERY tick — a fresh forked thread could then be
+                 * picked while its creator was still mid-syscall. */
+                rq->current->state = THREAD_RUNNING;
             }
         } else if (rq->current->state == THREAD_BLOCKED) {
             rq->current = NULL;
