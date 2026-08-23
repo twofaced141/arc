@@ -125,6 +125,55 @@ int io_channel_lookup(const char *name) {
     return -1;
 }
 
+int io_channel_buf_owned(int pid, uint64_t phys, uint64_t size) {
+    if (pid <= 0 || size == 0)
+        return 0;
+
+    uint32_t tflags;
+    spin_lock_irqsave(&channel_lock, &tflags);
+
+    int found = 0;
+    for (int i = 0; i < channel_count && !found; i++) {
+        io_channel_t *ch = &channels[i];
+        if (ch->owner_pid != pid)
+            continue;
+
+        /* Only the channel lock protects ch->queue entries; take it so
+         * a request completing concurrently cannot vanish mid-scan. */
+        uint32_t qflags;
+        spin_lock_irqsave(&ch->lock, &qflags);
+        for (int q = 0; q < IO_CHANNEL_QUEUE_DEPTH && !found; q++) {
+            struct io_channel_entry *e = &ch->queue[q];
+            if (e->completed || e->req.buf_size == 0)
+                continue;
+            uint64_t start = e->req.buf_phys;
+            uint64_t end   = start + e->req.buf_size;
+            if (phys >= start && size <= end - phys &&
+                phys + size <= end)
+                found = 1;
+        }
+        spin_unlock_irqrestore(&ch->lock, qflags);
+    }
+
+    spin_unlock_irqrestore(&channel_lock, tflags);
+    return found;
+}
+
+int io_channel_owned_by(int pid) {
+    if (pid <= 0)
+        return 0;
+
+    uint32_t flags;
+    spin_lock_irqsave(&channel_lock, &flags);
+    int n = 0;
+    for (int i = 0; i < channel_count; i++) {
+        if (channels[i].owner_pid == pid)
+            n++;
+    }
+    spin_unlock_irqrestore(&channel_lock, flags);
+    return n;
+}
+
 int io_channel_request(int handle, struct io_request *req) {
     if (handle < 0 || handle >= channel_count)
         return -1;

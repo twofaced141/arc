@@ -49,6 +49,11 @@ registers_t *arch_fork_setup_regs(thread_t *child_thread, registers_t *parent) {
     registers_t *child_regs = (registers_t *)(child_thread->kernel_stack_top - sizeof(registers_t));
     memcpy(child_regs, parent, sizeof(registers_t));
     child_regs->x[0] = 0;
+    /* Record where the child's live register frame sits — the
+     * scheduler resumes it via kernel_rsp; leaving this unset made the
+     * first eret jump to elr=0 (Instr Abort) instead of back to
+     * userspace with x0=0 as the fork return value. */
+    child_thread->kernel_rsp = (uint64_t)child_regs;
     return child_regs;
 }
 
@@ -58,6 +63,7 @@ registers_t *arch_clone_setup_regs(thread_t *child_thread, registers_t *parent,
     memcpy(child_regs, parent, sizeof(registers_t));
     child_regs->x[0] = 0;               /* child: clone() returns 0 */
     child_regs->sp = child_stack;
+    child_thread->kernel_rsp = (uint64_t)child_regs;
     return child_regs;
 }
 

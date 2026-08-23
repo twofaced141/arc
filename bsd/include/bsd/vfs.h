@@ -90,6 +90,8 @@ typedef long ssize_t;
 #define DEVFS_NULL   2
 #define DEVFS_ZERO   3
 #define DEVFS_CONSOLE 4
+/* Dynamic block-device nodes start here */
+#define DEVFS_BLOCK_BASE 100
 
 /* File mode bits */
 #define S_IRWXU 00700

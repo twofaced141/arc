@@ -1,10 +1,7 @@
 ; services.rc — long-running daemons (arc init)
 ;
-; Units below are PLACEHOLDERS: the binaries (/sbin/driverd etc.) do not
-; exist in the root image yet.  The service executor is not written yet
-; either, so these only exercise parsing/listing.  Once the executor
-; lands, missing binaries will fail exec and respawn per policy — the
-; correct observable behavior.
+; The service executor spawns each unit after the mounts phase; units
+; are started in file order and supervised (respawn policy applies).
 ;
 ; Field reference:
 ;   (deps A B)      — A and B must be healthy first
@@ -14,10 +11,20 @@
 ;   (ready sleep N) — healthy N seconds after start
 ;   (stdio silent)  — /dev/null instead of the console
 
+; NOTE: no (deps bootfs) here on purpose — these daemons live on the
+; root fs the kernel mounted before init ran, so they must start on
+; machines without extra disks too (arm64 qemu virt has no ahci0p1).
+
 (unit driverd
   (type service)
   (exec /sbin/driverd)
-  (deps bootfs)
+  (respawn on-failure))
+
+; Pilot userspace block driver: RAM disk served over an I/O channel,
+; exposed as /dev/upramd.  Self-tests a write+readback at startup.
+(unit upramd
+  (type service)
+  (exec /sbin/upramd)
   (respawn on-failure))
 
 ;(unit configd

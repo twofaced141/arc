@@ -35,6 +35,7 @@
 #include "bsd/dirent.h"
 #include "bsd/select.h"
 #include "bsd/tty.h"
+#include "bsd/block.h"
 #include "string.h"
 #include "spinlock.h"
 #include "debug.h"
@@ -163,6 +164,77 @@ static devfs_entry_t devfs_entries[] = {
 };
 #define DEVFS_ENTRIES (sizeof(devfs_entries) / sizeof(devfs_entries[0]))
 
+/* ---- Block devices: dynamic nodes backed by block_dev_lookup() ----
+ * Any name registered with block_dev_register() (kernel drivers and
+ * userspace block_ipc channels alike) appears as /dev/<name>. */
+
+static int dev_block_open(vnode_t *vp, int mode) {
+    if (!vp || !block_dev_lookup(vp->name))
+        return -ENXIO;
+    (void)mode;
+    return 0;
+}
+
+static ssize_t dev_block_read(vnode_t *vp, void *buf, size_t count,
+                              int64_t offset) {
+    block_dev_t *dev = block_dev_lookup(vp->name);
+    if (!dev) return -ENXIO;
+
+    uint32_t bsz = dev->block_size;
+    if (bsz == 0) return -EIO;
+    if (offset < 0 || (offset % bsz) != 0)
+        return -EINVAL;
+    uint64_t lba = (uint64_t)offset / bsz;
+    size_t nblocks = count / bsz;
+    if (nblocks == 0)
+        return 0;
+    if (lba + nblocks > dev->num_blocks)
+        nblocks = (size_t)(dev->num_blocks - lba);
+
+    int r = blk_read(dev, lba, buf, nblocks);
+    return (r < 0) ? (ssize_t)r : (ssize_t)(nblocks * bsz);
+}
+
+static ssize_t dev_block_write(vnode_t *vp, const void *buf, size_t count,
+                               int64_t offset) {
+    block_dev_t *dev = block_dev_lookup(vp->name);
+    if (!dev) return -ENXIO;
+
+    uint32_t bsz = dev->block_size;
+    if (bsz == 0) return -EIO;
+    if (offset < 0 || (offset % bsz) != 0)
+        return -EINVAL;
+    uint64_t lba = (uint64_t)offset / bsz;
+    size_t nblocks = count / bsz;
+    if (nblocks == 0)
+        return 0;
+    if (lba + nblocks > dev->num_blocks)
+        nblocks = (size_t)(dev->num_blocks - lba);
+
+    int r = blk_write(dev, lba, buf, nblocks);
+    return (r < 0) ? (ssize_t)r : (ssize_t)(nblocks * bsz);
+}
+
+static struct vnode_ops dev_block_ops = {
+    .open  = dev_block_open,
+    .read  = dev_block_read,
+    .write = dev_block_write,
+};
+
+static vnode_t *devfs_block_lookup(const char *name) {
+    if (!block_dev_lookup(name))
+        return NULL;
+    vnode_t *child = vnode_alloc();
+    if (!child) return NULL;
+    child->type = VBLK;
+    child->ino  = DEVFS_BLOCK_BASE + (int)block_dev_get_count();
+    child->ops  = &dev_block_ops;
+    child->refcount = 1;
+    strncpy(child->name, name, sizeof(child->name) - 1);
+    child->name[sizeof(child->name) - 1] = '\0';
+    return child;
+}
+
 static vnode_t *devfs_dir_lookup(vnode_t *vp, const char *name) {
     (void)vp;
     if (!name) return NULL;
@@ -179,7 +251,9 @@ static vnode_t *devfs_dir_lookup(vnode_t *vp, const char *name) {
             return child;
         }
     }
-    return NULL;
+
+    /* Not a static entry — is it a registered block device? */
+    return devfs_block_lookup(name);
 }
 
 static int devfs_dir_getdents(vnode_t *vp, void *buf, size_t count, int64_t *off) {

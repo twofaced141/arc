@@ -56,6 +56,7 @@
 #define SYS_WAITPID     6
 #define SYS_GETPID      7
 #define SYS_EXECVE      11
+#define SYS_LSEEK       15
 #define SYS_SLEEP       27
 
 #define SYS_PHYS_MAP        31
@@ -275,11 +276,28 @@ static inline long port_out(uint16_t port, uint32_t value, int size) {
 static inline int io_create(const char *name) {
     return (int)syscall2(BSD_SYS(SYS_IO_REGISTER), (long)name);
 }
+
+/* Register a block-flavored channel: the kernel attaches a block
+ * device (named after the channel without the "block/" prefix) whose
+ * read/write are forwarded as io_requests.  num_blocks may exceed 32
+ * bits; it travels as lo+hi halves. */
+static inline int io_create_block(const char *name, uint32_t block_size,
+                                  uint64_t num_blocks) {
+    return (int)syscall5(BSD_SYS(SYS_IO_REGISTER), (long)name,
+                         (long)block_size,
+                         (long)(num_blocks & 0xFFFFFFFFu),
+                         (long)(num_blocks >> 32));
+}
 static inline int io_get_request(int handle, struct io_request *req) {
     return (int)syscall3(BSD_SYS(SYS_IO_GET_REQUEST), handle, (long)req);
 }
 static inline int io_complete(int handle, uint64_t rid, int result) {
-    return (int)syscall4(BSD_SYS(SYS_IO_COMPLETE), handle, rid, result);
+    /* 64-bit request_id travels as lo+hi halves: every ARGn is a
+     * 32-bit register on i386, so full-width args must be split
+     * (same convention as SYS_IO_REGISTER's num_blocks). */
+    return (int)syscall5(BSD_SYS(SYS_IO_COMPLETE), handle,
+                         (long)(rid & 0xFFFFFFFFu),
+                         (long)(rid >> 32), result);
 }
 
 /* ---- Service registry ---- */
@@ -325,6 +343,10 @@ int pci_find(uint8_t cls, uint8_t subcls, int idx, pci_dev_t *dev);
 void puts(const char *s);
 void puthex(uint64_t v);
 void putdec(int64_t v);
+
+/* ---- Freestanding memory ops (implemented in libdriver.c) ---- */
+void *memset(void *dst, int c, size_t n);
+void *memcpy(void *dest, const void *src, size_t n);
 
 /* ---- Fork/exec helpers (for standalone drivers) ---- */
 static inline long driver_fork(void) {

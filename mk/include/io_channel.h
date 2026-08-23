@@ -120,6 +120,17 @@ int io_channel_request(int handle, struct io_request *req);
 /* Kernel-side lookup by name (used by block_ipc etc.). */
 int io_channel_lookup(const char *name);
 
+/* Capability check for phys_map: true if [phys, phys+size) is the data
+ * buffer of a pending (not yet completed) request queued on a channel
+ * owned by pid.  Lets a userspace driver map its request's bounce page
+ * without granting arbitrary-RAM phys_map. */
+int io_channel_buf_owned(int pid, uint64_t phys, uint64_t size);
+
+/* Number of channels owned by pid.  Drivers are identified by owning
+ * either a device session or an I/O channel; used to gate driver-only
+ * resources like contiguous DMA allocations. */
+int io_channel_owned_by(int pid);
+
 /* Internal helpers (called from sys_driver.c dispatch handlers).
  * get_request writes through user_req with copy_to_user; the caller
  * must have validated nothing — the copy validates the pointer. */

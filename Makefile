@@ -152,7 +152,8 @@ USER_LDFLAGS  = -nostdlib $(LD_ARCH)
 # developers but is NOT linked into the root image — build it manually
 # with `make user/drivers/example/example.elf` if you need it.
 USER_PROGS = user/init/init.elf user/tests/sigexec/sigexec.elf \
-             user/drivers/driverd/driverd.elf
+             user/drivers/driverd/driverd.elf \
+             user/drivers/upramd/upramd.elf
 
 .PHONY: all clean user
 
@@ -171,6 +172,10 @@ user/drivers/example/example.elf: user/drivers/example/main.o user/drivers/libdr
 # driverd — device enumeration daemon (walks the kernel device framework)
 user/drivers/driverd/driverd.elf: user/drivers/driverd/main.o user/drivers/libdriver.o user/drivers/driver.ld
 	$(LD) $(USER_LDFLAGS) -T user/drivers/driver.ld -o $@ user/drivers/driverd/main.o user/drivers/libdriver.o
+
+# upramd — pilot userspace block driver (RAM disk over an I/O channel)
+user/drivers/upramd/upramd.elf: user/drivers/upramd/main.o user/drivers/libdriver.o user/drivers/driver.ld
+	$(LD) $(USER_LDFLAGS) -T user/drivers/driver.ld -o $@ user/drivers/upramd/main.o user/drivers/libdriver.o
 
 # Init program (PID 1)
 user/init/init.elf: user/init/init.o user/rc/rcparse.o user/init/init.ld
@@ -200,11 +205,12 @@ arc.elf: $(OBJS) mk/arch/$(ARCH)/boot/linker.ld root.img
 # root.img — ufs initramfs with userspace binaries (all arches)
 ROOT_IMG_DEPS = user/init/init.elf user/tests/sigexec/sigexec.elf \
                 user/drivers/driverd/driverd.elf \
+                user/drivers/upramd/upramd.elf \
                 tools/etc/rc/mounts.rc tools/etc/rc/services.rc
 
 root.img: $(ROOT_IMG_DEPS) tools/mkfs_ufs.py
 	@echo "  GEN     $@"
-	python3 tools/mkfs_ufs.py $@ --add user/init/init.elf:/sbin/init --add user/tests/sigexec/sigexec.elf:/sbin/sigexec --add user/drivers/driverd/driverd.elf:/sbin/driverd --add tools/etc/rc/mounts.rc:/etc/rc/mounts.rc --add tools/etc/rc/services.rc:/etc/rc/services.rc
+	python3 tools/mkfs_ufs.py $@ --add user/init/init.elf:/sbin/init --add user/tests/sigexec/sigexec.elf:/sbin/sigexec --add user/drivers/driverd/driverd.elf:/sbin/driverd --add user/drivers/upramd/upramd.elf:/sbin/upramd --add tools/etc/rc/mounts.rc:/etc/rc/mounts.rc --add tools/etc/rc/services.rc:/etc/rc/services.rc
 
 # Bootable disk image with MBR + 2 partitions (boot + root).
 # CI-only: built by tools/qa/qemu-smoke.sh, not part of the kernel build.

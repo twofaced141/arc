@@ -92,8 +92,13 @@ int64_t sys_phys_map(proc_t *p, registers_t *r) {
     uint64_t virt_page;
 
     /* Capability gate: the range must be an MMIO resource of a device
-     * the process has open (IOConnectMapMemory-style). */
-    if (!dev_handle_has_resource(p, ARC_RES_MMIO, phys_page, map_size))
+     * the process has open (IOConnectMapMemory-style), OR the data
+     * buffer of a pending request on an I/O channel this process owns
+     * (a block driver fetching its bounce page).  Without the second
+     * clause a userspace driver could never touch req.buf_phys; without
+     * the first it could map arbitrary RAM. */
+    if (!dev_handle_has_resource(p, ARC_RES_MMIO, phys_page, map_size) &&
+        !io_channel_buf_owned(p->pid, phys_page, map_size))
         return -1;
 
     /* Containment: the mapping MUST land in the user half.  Without
@@ -140,9 +145,13 @@ int64_t sys_phys_map(proc_t *p, registers_t *r) {
 
 /* ---- 2. DMA buffer allocation ---- */
 
-/* Result struct for dma_alloc — written to user-provided pointer */
+/* Result struct for dma_alloc — written to user-provided pointer.
+ * MUST mirror libdriver.h's dma_buf_t { void *virt; uint32_t phys; }:
+ * virt is pointer-sized so the driver can use it directly; padding it
+ * as two uint32s once glued a bogus high dword onto the pointer and
+ * crashed the driver in memset. */
 typedef struct {
-    uint32_t virt;
+    uintptr_t virt;
     uint32_t phys;
 } dma_alloc_result_t;
 
@@ -153,8 +162,10 @@ int64_t sys_dma_alloc(proc_t *p, registers_t *r) {
     if (!p || !p->page_dir) return -1;
     if (size == 0 || !user_result) return -1;
 
-    /* Capability gate: DMA buffers need at least one open device. */
-    if (!dev_handle_any(p))
+    /* Capability gate: DMA buffers need the caller to look like a
+     * driver — an open device session or an owned I/O channel (the
+     * pilot userspace ramdisk owns a channel but no hardware). */
+    if (!dev_handle_any(p) && io_channel_owned_by(p->pid) == 0)
         return -1;
 
     uint32_t count = (uint32_t)((size + PAGE_SIZE - 1ULL) / PAGE_SIZE);
@@ -194,7 +205,7 @@ int64_t sys_dma_alloc(proc_t *p, registers_t *r) {
 
     /* Write result back to userspace */
     dma_alloc_result_t result;
-    result.virt = (uint32_t)virt;
+    result.virt = (uintptr_t)virt;
     result.phys = (uint32_t)(uintptr_t)phys;
 
     if (copy_to_user(user_result, &result, sizeof(result)) < 0) {
@@ -854,8 +865,10 @@ int64_t sys_io_get_request(proc_t *p, registers_t *r) {
 int64_t sys_io_complete(proc_t *p, registers_t *r) {
     if (!p) return -1;
     int      handle     = (int)ARG1(r);
-    uint64_t request_id = ARG2(r);
-    int      result     = (int)ARG3(r);
+    /* request_id travels as lo+hi halves: ARGn is 32 bits wide on
+     * i386 (matches the libdriver io_complete wrapper). */
+    uint64_t request_id = (uint64_t)ARG2(r) | ((uint64_t)ARG3(r) << 32);
+    int      result     = (int)ARG4(r);
 
     if (!io_channel_owner_ok(handle, p->pid)) return -1;
     return io_channel_complete(handle, request_id, result);

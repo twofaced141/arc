@@ -161,9 +161,17 @@ int block_ipc_attach(int io_handle, const char *name,
         block_dev_t *bdev = &block_ipc_devs[i].bdev;
         memset(bdev, 0, sizeof(*bdev));
 
-        size_t n = strlen(name);
+        /* Channel names are "block/<dev>"; the block device itself is
+         * named by the short form so it lines up with the kernel
+         * drivers' devices (e.g. channel "block/upramd" -> dev
+         * "upramd", exposed as /dev/upramd). */
+        const char *short_name = name;
+        if (strncmp(short_name, "block/", 6) == 0)
+            short_name += 6;
+
+        size_t n = strlen(short_name);
         if (n >= sizeof(bdev->name)) n = sizeof(bdev->name) - 1;
-        memcpy(bdev->name, name, n);
+        memcpy(bdev->name, short_name, n);
         bdev->name[n] = '\0';
 
         bdev->block_size = block_size;
