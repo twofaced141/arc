@@ -1042,6 +1042,12 @@ int64_t sys_sendto(proc_t *p, registers_t *r) {
     int flags = (int)bsd_syscall_arg3(r);
     const struct sockaddr *uaddr = (const struct sockaddr *)bsd_syscall_arg4(r);
     socklen_t ulen = 0;
+    /* Bounce buffers below go through kmalloc(uint32_t): a len above
+     * UINT32_MAX would truncate the allocation while copy_from_user
+     * (size_t) copies the whole range — a heap overflow.  Reject up
+     * front; anything this large never fit the kernel heap anyway. */
+    if (len > 0xFFFFFFFFu)
+        return -EINVAL;
     /* ARG5 is not in registers_t for x86? Use bsd_syscall_arg4 already covers;
      * we pass socklen via stack copy — instead expect 6th arg via extra.
      * For simplicity, if uaddr != NULL we try to copy full sockaddr_in regardless of len.
@@ -1116,6 +1122,10 @@ int64_t sys_recvfrom(proc_t *p, registers_t *r) {
     /* Use the syscall number to detect? simply attempt to read from registers if arch supports */
     /* We signal that if uaddr != NULL but we can't get ulenp, we still fill sockaddr */
     (void)ulenp;
+    /* Same UINT32_MAX bounce-buffer bound as sys_sendto (kmalloc takes
+     * uint32_t; copy_to_user takes the full size_t). */
+    if (len > 0xFFFFFFFFu)
+        return -EINVAL;
     filedesc_t *f = proc_fd_get(p, fd);
     if (!f || !f->used) return -EBADF;
     vnode_t *vp = (vnode_t *)f->vnode_ptr;
