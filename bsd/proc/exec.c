@@ -430,9 +430,13 @@ static int exec_collect_strings(char *usr_ptrs, char **kbuf,
  * mapped, so buffers living near sp would otherwise straddle the
  * boundary and get rejected by copy_to_user's range check.
  *
+ * Every word is written with copy_to_user against the NEW address
+ * space (the caller switches CR3 first): a raw dereference here would
+ * fault in ring 0 and panic on any unmapped stack page, and would let
+ * a short stack mapping turn into a kernel-mode write primitive.
+ *
  * Returns 0 on success; -E2BIG when argv+envp would not fit into the
- * mapped stack (the old unchecked version wrote straight past the
- * lowest mapped page — a kernel-mode fault and panic). */
+ * mapped stack; -EFAULT when a stack page is unexpectedly unmapped. */
 static int exec_build_stack(char *argv_buf, int argc,
                             char *envp_buf, int envc, uint64_t *out_sp) {
     /* 32 stack pages minus a safety margin for the program's own
@@ -451,46 +455,63 @@ static int exec_build_stack(char *argv_buf, int argc,
     if ((uint64_t)arglen + envlen + 8ull * (argc + envc + 2) > STACK_BUDGET)
         return -E2BIG;
 
-    uint64_t sp = USER_STACK_TOP - 4096;
+    /* Stack addresses always fit in a pointer (USER_STACK_TOP is below
+     * the user/kernel split on every arch); uintptr_t keeps the
+     * pointer casts exact on 32- and 64-bit alike.  Slots are
+     * pointer-sized — matching the user ABI on each arch. */
+    uintptr_t sp = (uintptr_t)(USER_STACK_TOP - 4096);
 
-    /* Copy strings, argv first then envp, growing downward.  Record
-     * the user-space address of each string. */
+    /* Copy strings in argv order, growing downward.  Only the recorded
+     * pointers matter, not the order of strings in memory. */
     char *uargv[EXEC_ARG_MAX];
     char *uenvp[EXEC_ARG_MAX];
 
-    for (int i = argc - 1; i >= 0; i--) {
+    for (int i = 0; i < argc; i++) {
         size_t len = strlen(argv_buf) + 1;
         sp -= len;
-        sp &= ~15ULL;
+        sp &= ~(uintptr_t)15;
         uargv[i] = (char *)sp;
-        memcpy((void *)sp, argv_buf, len);
+        if (copy_to_user((void *)sp, argv_buf, len) != 0)
+            return -EFAULT;
         argv_buf += len;
     }
-    for (int i = envc - 1; i >= 0; i--) {
+    for (int i = 0; i < envc; i++) {
         size_t len = strlen(envp_buf) + 1;
         sp -= len;
-        sp &= ~15ULL;
+        sp &= ~(uintptr_t)15;
         uenvp[i] = (char *)sp;
-        memcpy((void *)sp, envp_buf, len);
+        if (copy_to_user((void *)sp, envp_buf, len) != 0)
+            return -EFAULT;
         envp_buf += len;
     }
 
     /* envp array (NULL-terminated), then argv array (NULL-terminated),
      * then argc. */
-    sp -= 8;
-    *(uint64_t *)sp = 0;                    /* envp terminator */
+    uintptr_t w;
+    sp -= sizeof(w);
+    w = 0;                                        /* envp terminator */
+    if (copy_to_user((void *)sp, &w, sizeof(w)) != 0)
+        return -EFAULT;
     for (int i = envc - 1; i >= 0; i--) {
-        sp -= 8;
-        *(uint64_t *)sp = (uint64_t)uenvp[i];
+        sp -= sizeof(w);
+        w = (uintptr_t)uenvp[i];
+        if (copy_to_user((void *)sp, &w, sizeof(w)) != 0)
+            return -EFAULT;
     }
-    sp -= 8;
-    *(uint64_t *)sp = 0;                    /* argv terminator */
+    sp -= sizeof(w);
+    w = 0;                                        /* argv terminator */
+    if (copy_to_user((void *)sp, &w, sizeof(w)) != 0)
+        return -EFAULT;
     for (int i = argc - 1; i >= 0; i--) {
-        sp -= 8;
-        *(uint64_t *)sp = (uint64_t)uargv[i];
+        sp -= sizeof(w);
+        w = (uintptr_t)uargv[i];
+        if (copy_to_user((void *)sp, &w, sizeof(w)) != 0)
+            return -EFAULT;
     }
-    sp -= 8;
-    *(uint64_t *)sp = (uint64_t)argc;
+    sp -= sizeof(w);
+    w = (uintptr_t)(unsigned)argc;
+    if (copy_to_user((void *)sp, &w, sizeof(w)) != 0)
+        return -EFAULT;
 
     *out_sp = sp;
     return 0;
@@ -699,7 +720,7 @@ int proc_execve(registers_t *r) {
             vmm_switch_directory(old_dir);
             kfree(argv_buf);
             kfree(envp_buf);
-            return -E2BIG;
+            return serr;
         }
     }
     kfree(argv_buf);

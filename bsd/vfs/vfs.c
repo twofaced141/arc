@@ -577,8 +577,10 @@ ssize_t vfs_read(proc_t *p, int fd, void *buf, size_t count) {
     /* Buffer validation BEFORE any vnode op touches `buf`: it is a
      * raw user pointer.  A kernel address here would hand the file's
      * contents an arbitrary kernel write; an unmapped one would fault
-     * in ring 0 and panic. */
-    if (!user_range_ok(buf, count > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)count, 1))
+     * in ring 0 and panic.  The FULL count is validated (user_range_ok
+     * takes size_t) — validating a truncated 32-bit prefix while the
+     * op copies the whole 64-bit count would leave the tail unchecked. */
+    if (!user_range_ok(buf, count, 1))
         return -EFAULT;
 
     if (vp->ops->stat) {
@@ -608,7 +610,7 @@ ssize_t vfs_pread(proc_t *p, int fd, void *buf, size_t count, int64_t offset) {
     if (offset < 0)
         return -EINVAL;
 
-    if (!user_range_ok(buf, count > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)count, 1))
+    if (!user_range_ok(buf, count, 1))
         return -EFAULT;
 
     if (vp->ops->stat) {
@@ -644,7 +646,7 @@ ssize_t vfs_write(proc_t *p, int fd, const void *buf, size_t count) {
     /* O_APPEND: every write goes to the current end of the file.
      * All fds on the same vnode share vp->size, so concurrent appends
      * to the same file each land after the previous one. */
-    if (!user_range_ok(buf, count > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)count, 0))
+    if (!user_range_ok(buf, count, 0))
         return -EFAULT;
 
     int64_t off = (f->flags & O_APPEND) ? vp->size : f->offset;
@@ -675,7 +677,7 @@ ssize_t vfs_pwrite(proc_t *p, int fd, const void *buf, size_t count, int64_t off
     if (offset < 0)
         return -EINVAL;
 
-    if (!user_range_ok(buf, count > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)count, 0))
+    if (!user_range_ok(buf, count, 0))
         return -EFAULT;
 
     if (vp->ops->stat) {

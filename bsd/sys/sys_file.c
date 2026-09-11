@@ -336,6 +336,10 @@ int64_t sys_getdents(proc_t *p, registers_t *r) {
     size_t count = (size_t)ARG3(r);
     if (count == 0)
         return 0;
+    /* kmalloc takes uint32_t: cap the bounce buffer so the allocation
+     * size cannot truncate below the count vfs_getdents fills. */
+    if (count > 0xFFFFFFFFu)
+        return -EINVAL;
 
     void *kbuf = kmalloc((uint32_t)count);
     if (!kbuf)
@@ -559,7 +563,7 @@ int64_t sys_poll(proc_t *p, registers_t *r) {
         thread_yield();
     }
 
-    if (copy_to_user(ufds, kfds, (uint32_t)nfds * sizeof(struct pollfd)) < 0)
+    if (copy_to_user(ufds, kfds, (size_t)nfds * sizeof(struct pollfd)) < 0)
         ret = -EFAULT;
     kfree(kfds);
     return ret;

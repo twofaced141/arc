@@ -163,14 +163,16 @@ int64_t sys_sigaction(proc_t *p, registers_t *r) {
     if (!signal_is_valid(sig) || sig == SIGKILL || sig == SIGSTOP)
         return -EINVAL;
 
-    /* Return old action */
+    /* Return old action (before installing the new one: a bad oldact
+     * pointer fails without changing anything, like Linux). */
     if (oldact) {
         sigaction_t old;
         old.sa_handler = p->signals.handler[sig];
         old.sa_mask = p->signals.sa_mask[sig];
         old.sa_flags = (int)p->signals.sa_flags[sig];
         old.sa_restorer = (void *)p->signals.sa_restorer[sig];
-        copy_to_user(oldact, &old, sizeof(sigaction_t));
+        if (copy_to_user(oldact, &old, sizeof(sigaction_t)) != 0)
+            return -EFAULT;
     }
 
     /* Set new action */
@@ -225,7 +227,8 @@ int64_t sys_sigaltstack(proc_t *p, registers_t *r) {
             oss.ss_flags = SS_DISABLE;
         else
             oss.ss_flags = 0;
-        copy_to_user(uoss, &oss, sizeof(stack_t));
+        if (copy_to_user(uoss, &oss, sizeof(stack_t)) != 0)
+            return -EFAULT;
     }
 
     if (uss) {
@@ -413,13 +416,16 @@ int64_t sys_sigprocmask(proc_t *p, registers_t *r) {
     const uint32_t *set    = (const uint32_t *)ARG2(r);
     uint32_t *oldset       = (uint32_t *)ARG3(r);
 
-    /* Return old mask (packed: bit i = blocked[i], i in 1..31) */
+    /* Return old mask (packed: bit i = blocked[i], i in 1..31).
+     * Validated first: a bad oldset fails before the new mask is
+     * applied. */
     if (oldset) {
         uint32_t oldmask = 0;
         for (int i = 1; i < NSIG; i++)
             if (p->signals.blocked[i])
                 oldmask |= (1u << i);
-        copy_to_user(oldset, &oldmask, sizeof(uint32_t));
+        if (copy_to_user(oldset, &oldmask, sizeof(uint32_t)) != 0)
+            return -EFAULT;
     }
 
     /* Apply new mask */

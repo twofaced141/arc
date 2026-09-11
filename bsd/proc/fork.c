@@ -69,7 +69,8 @@ int proc_fork(registers_t *r) {
     thread_t *child_thread = thread_create(bsd_entry(r), child_dir, 1);
     if (!child_thread) {
         log_print(LOG_LEVEL_ERROR, "proc_fork: thread_create failed\r\n");
-        vmm_free_directory(child_dir);
+        /* proc_free releases the private child_dir itself — an
+         * explicit vmm_free_directory here would free it twice. */
         proc_free(child);
         return -ENOMEM;
     }

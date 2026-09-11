@@ -96,8 +96,10 @@ int64_t sys_waitpid(proc_t *p, registers_t *r) {
     int status = 0;
 
     pid_t ret = proc_waitpid(child_pid, &status, options);
-    if (ret > 0 && ustatus)
-        copy_to_user(ustatus, &status, sizeof(int));
+    /* A bad ustatus pointer fails loudly: the child is already reaped,
+     * but reporting success would pretend the status was delivered. */
+    if (ret > 0 && ustatus && copy_to_user(ustatus, &status, sizeof(int)) != 0)
+        return -EFAULT;
     return (int64_t)ret;
 }
 
@@ -284,7 +286,7 @@ int64_t sys_getcwd(proc_t *p, registers_t *r) {
     size_t len = strlen(p->cwd) + 1;
     if (len > size)
         return -ERANGE;
-    if (copy_to_user(buf, p->cwd, (uint32_t)len) != 0)
+    if (copy_to_user(buf, p->cwd, len) != 0)
         return -EFAULT;
     return (int64_t)len;
 }
@@ -371,12 +373,8 @@ int64_t sys_clone(proc_t *p, registers_t *r) {
     if (rc < 0)
         return rc;
 
-    /* The kernel writes the new tid to child_tid before the syscall
-     * returns so the child can publish its own id without racing. */
-    if ((flags & CLONE_CHILD_SETTID) && child_tid) {
-        int32_t ctid = rc;
-        copy_to_user((void *)child_tid, &ctid, sizeof(ctid));
-    }
+    /* NOTE: CLONE_CHILD_SETTID is written inside proc_clone (checked,
+     * failing the clone on EFAULT) — no duplicate write here. */
     return rc;
 }
 

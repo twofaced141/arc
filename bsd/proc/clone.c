@@ -134,15 +134,22 @@ int proc_clone(registers_t *r, unsigned long flags, uintptr_t child_stack,
     if ((flags & CLONE_PARENT_SETTID) && parent_tid) {
         int32_t ctid = child->pid;
         if (copy_to_user((void *)parent_tid, &ctid, sizeof(ctid)) < 0) {
-            if (child->page_dir != parent->page_dir)
-                vmm_free_directory(child->page_dir);
+            /* proc_free releases a private page_dir itself (and keeps
+             * a CLONE_VM-shared one) — no explicit free here, it would
+             * free the directory twice. */
             proc_free(child);
             return -EFAULT;
         }
     }
     if ((flags & CLONE_CHILD_SETTID) && child_tid) {
         int32_t ctid = child->pid;
-        copy_to_user((void *)child_tid, &ctid, sizeof(ctid));
+        /* A bad child_tid pointer fails the clone loudly instead of
+         * silently leaving thread-register memory unwritten (NPTL
+         * would malfunction mysteriously). */
+        if (copy_to_user((void *)child_tid, &ctid, sizeof(ctid)) < 0) {
+            proc_free(child);
+            return -EFAULT;
+        }
     }
 
     /* NOT linked into parent->children: clone threads are not wait-able
