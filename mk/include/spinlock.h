@@ -50,11 +50,22 @@ static inline void spin_lock_irqsave(spinlock_t *lock, uint32_t *flags) {
         "movl $1, %%eax\n\t"
         "xchgl %%eax, %1\n\t"
         "testl %%eax, %%eax\n\t"
-        "jnz 1b\n\t"
+        "jz 2f\n\t"
+        /* Lock is held — polite spin with PAUSE so a sibling SMT
+         * thread (and the interconnect) is not hammered while we
+         * wait.  Re-test without an atomic op first. */
+        "3:\n\t"
+        "pause\n\t"
+        "cmpl $0, %1\n\t"
+        "jnz 3b\n\t"
+        "jmp 1b\n\t"
+        "2:\n\t"
         : "=r"(tmp), "=m"(*lock)
         :
         : "eax", "memory", "cc"
     );
+    /* Upper 32 bits of RFLAGS are reserved-zero on x86-64, so the
+     * uint32_t truncation loses nothing on real hardware. */
     *flags = (uint32_t)tmp;
 }
 
@@ -81,15 +92,21 @@ static inline void spin_lock_irqsave(spinlock_t *lock, uint32_t *flags) {
     *flags = (uint32_t)daif;
 
     /* Atomic test-and-set acquire loop (same semantics as the x86
-     * cli + lock xchgl path). */
+     * cli + lock xchgl path).  YIELD hints the core while spinning. */
     uint32_t old, tmp;
     __asm__ __volatile__(
         "1:\n\t"
         "ldaxr %w0, [%2]\n\t"          /* load-exclusive acquire */
-        "cbnz %w0, 1b\n\t"             /* already held — retry */
+        "cbnz %w0, 2f\n\t"             /* already held — polite wait */
         "mov %w1, #1\n\t"
         "stxr %w0, %w1, [%2]\n\t"      /* store-exclusive */
-        "cbnz %w0, 1b\n\t"             /* lost the race — retry */
+        "cbz %w0, 3f\n\t"              /* won the race — done */
+        "2:\n\t"
+        "yield\n\t"
+        "ldxr %w0, [%2]\n\t"           /* plain load, no exclusive state */
+        "cbnz %w0, 2b\n\t"
+        "b 1b\n\t"
+        "3:\n\t"
         : "=&r"(old), "=&r"(tmp)
         : "r"(lock)
         : "memory");
@@ -118,7 +135,13 @@ static inline void spin_lock_irqsave(spinlock_t *lock, uint32_t *flags) {
         "movl $1, %%eax\n\t"
         "xchgl %%eax, %1\n\t"
         "testl %%eax, %%eax\n\t"
-        "jnz 1b\n\t"
+        "jz 2f\n\t"
+        "3:\n\t"
+        "pause\n\t"
+        "cmpl $0, %1\n\t"
+        "jnz 3b\n\t"
+        "jmp 1b\n\t"
+        "2:\n\t"
         : "=r"(*flags), "=m"(*lock)
         :
         : "eax", "memory", "cc"

@@ -38,6 +38,7 @@
 #include "debug.h"
 #include "vmm.h"
 #include "string.h"
+#include "spinlock.h"
 
 /* The bootloader (amd64 boot.s) identity-maps only the first
  * BOOTSTRAP_BYTES of physical memory, so the dynamic PMM bitmap is
@@ -57,6 +58,13 @@ static uint8_t *bitmap;
 static uint32_t total_pages;
 static uint32_t free_pages;
 static uint16_t *refcounts;
+
+/* SMP: every bitmap/free_pages mutation below runs under this leaf
+ * lock (irqsave — allocators are called from thread, syscall and
+ * page-fault/IRQ context).  Leaf discipline: while holding pmm_lock
+ * take no other lock (heap_lock -> pmm_lock is the only allowed
+ * order, via heap_map_until). */
+static spinlock_t pmm_lock = SPINLOCK_INIT;
 
 extern uint32_t _kernel_end;
 
@@ -287,8 +295,12 @@ void pmm_init(multiboot2_info_t *mboot) {
 }
 
 void *pmm_alloc_page(void) {
-    if (free_pages == 0)
+    uint32_t flags;
+    spin_lock_irqsave(&pmm_lock, &flags);
+    if (free_pages == 0) {
+        spin_unlock_irqrestore(&pmm_lock, flags);
         return (void *)0;
+    }
 
     for (uint32_t i = 0; i < total_pages; i++) {
         if (!bitmap_test(i)) {
@@ -298,15 +310,21 @@ void *pmm_alloc_page(void) {
             free_pages--;
             if (refcounts)
                 refcounts[i] = 1;
+            spin_unlock_irqrestore(&pmm_lock, flags);
             return (void *)(uintptr_t)((uint64_t)i * PAGE_SIZE);
         }
     }
+    spin_unlock_irqrestore(&pmm_lock, flags);
     return (void *)0;
 }
 
 void *pmm_alloc_pages(uint32_t count) {
-    if (count == 0 || free_pages < count)
+    uint32_t flags;
+    spin_lock_irqsave(&pmm_lock, &flags);
+    if (count == 0 || free_pages < count) {
+        spin_unlock_irqrestore(&pmm_lock, flags);
         return NULL;
+    }
 
     for (uint32_t i = 0; i <= total_pages - count; i++) {
         uint32_t j;
@@ -322,21 +340,28 @@ void *pmm_alloc_pages(uint32_t count) {
                 if (refcounts)
                     refcounts[i + k] = 1;
             }
+            spin_unlock_irqrestore(&pmm_lock, flags);
             return (void *)(uintptr_t)((uint64_t)i * PAGE_SIZE);
         }
     }
+    spin_unlock_irqrestore(&pmm_lock, flags);
     return NULL;
 }
 
 void pmm_free_page(void *page) {
+    uint32_t flags;
+    spin_lock_irqsave(&pmm_lock, &flags);
     uintptr_t idx = (uintptr_t)page / PAGE_SIZE;
     if (idx < total_pages && bitmap_test(idx)) {
         bitmap_clear(idx);
         free_pages++;
     }
+    spin_unlock_irqrestore(&pmm_lock, flags);
 }
 
 void pmm_free_pages(void *addr, uint32_t count) {
+    uint32_t flags;
+    spin_lock_irqsave(&pmm_lock, &flags);
     uintptr_t start = (uintptr_t)addr / PAGE_SIZE;
     for (uint32_t i = 0; i < count; i++) {
         if (start + i < total_pages && bitmap_test(start + i)) {
@@ -344,6 +369,7 @@ void pmm_free_pages(void *addr, uint32_t count) {
             free_pages++;
         }
     }
+    spin_unlock_irqrestore(&pmm_lock, flags);
 }
 
 uint32_t pmm_get_free_pages(void) {

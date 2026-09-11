@@ -34,11 +34,16 @@
 #include "memory.h"
 #include "pmm.h"
 #include "platform.h"
+#include "spinlock.h"
 
 extern uint64_t _kernel_end;
 
 static uint64_t next_free;
 static int ready;
+
+/* Same SMP discipline as the x86 bitmap PMM: the bump pointer is
+ * shared by all CPUs, so alloc mutates it under a leaf irqsave lock. */
+static spinlock_t pmm_lock = SPINLOCK_INIT;
 
 void pmm_init(void) {
     uint64_t kend = (uint64_t)&_kernel_end;
@@ -48,10 +53,16 @@ void pmm_init(void) {
 
 void *pmm_alloc_pages(uint32_t count) {
     if (!ready) return 0;
+    uint32_t flags;
+    spin_lock_irqsave(&pmm_lock, &flags);
     uint64_t addr = next_free;
     uint64_t end = addr + count * PAGE_SIZE;
-    if (end > arm64_ram_base + arm64_ram_size) return 0;
+    if (end > arm64_ram_base + arm64_ram_size) {
+        spin_unlock_irqrestore(&pmm_lock, flags);
+        return 0;
+    }
     next_free = end;
+    spin_unlock_irqrestore(&pmm_lock, flags);
     return (void *)addr;
 }
 
