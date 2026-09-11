@@ -17,7 +17,7 @@ isr\num:
 
 ISR_NOERRCODE 0
 ISR_NOERRCODE 1
-ISR_NOERRCODE 2
+/* Vector 2 (NMI) is defined manually below -> isr_nmi_stub */
 ISR_NOERRCODE 3
 ISR_NOERRCODE 4
 ISR_NOERRCODE 5
@@ -75,6 +75,50 @@ IRQ 14, 46
 IRQ 15, 47
 
 .extern isr_handler
+/* NMI entry (vector 2): must NEVER touch the scheduler — it can fire
+ * while the interrupted context holds the runqueue lock with IRQs
+ * disabled (same-CPU deadlock).  Handle and iret directly. */
+.global isr2
+isr2:
+    push $0
+    push $2
+    jmp isr_nmi_stub
+
+isr_nmi_stub:
+    pusha
+    xor %eax, %eax
+    mov %ds, %ax
+    push %eax
+    xor %eax, %eax
+    mov %es, %ax
+    push %eax
+    xor %eax, %eax
+    mov %fs, %ax
+    push %eax
+    xor %eax, %eax
+    mov %gs, %ax
+    push %eax
+    mov $0x10, %ax
+    mov %ax, %ds
+    mov %ax, %es
+    mov %ax, %fs
+    mov %ax, %gs
+    cld
+    push %esp
+    call isr_handler
+    add $4, %esp
+    pop %eax
+    mov %ax, %gs
+    pop %eax
+    mov %ax, %fs
+    pop %eax
+    mov %ax, %es
+    pop %eax
+    mov %ax, %ds
+    popa
+    add $8, %esp
+    iret
+
 isr_common_stub:
     pusha
     xor %eax, %eax
