@@ -78,6 +78,7 @@ static pipe_t *pipe_get(vnode_t *vp) {
 
 
 static int pipe_open(vnode_t *vp, int mode) {
+    (void)mode;
     pipe_t *pp = pipe_get(vp);
     if (!pp)
         return -ENXIO;
@@ -101,18 +102,23 @@ static int pipe_close(vnode_t *vp) {
         pp->readers--;
     else
         pp->writers--;
-    int no_readers = (pp->readers <= 0);
-    int no_writers = (pp->writers <= 0);
+    /* Wakeups AND the free decision run under pp->lock: the two ends
+     * can be closed concurrently, and a waker must never touch pp
+     * after the other closer freed it.  waitq_wake_all takes only the
+     * waitq leaf lock (pp -> wq -> rq order is never inverted), so it
+     * is safe to call with pp->lock held.  The free itself is claimed
+     * here (freed=1) but executed after unlock. */
+    if (pp->writers <= 0)
+        waitq_wake_all(&pp->rq);   /* readers see EOF */
+    if (pp->readers <= 0)
+        waitq_wake_all(&pp->wq);   /* writers see EPIPE */
+    int do_free = (pp->readers <= 0 && pp->writers <= 0 && !pp->freed);
+    if (do_free)
+        pp->freed = 1;
     spin_unlock_irqrestore(&pp->lock, flags);
 
-    if (no_writers)
-        waitq_wake_all(&pp->rq);   /* readers see EOF */
-    if (no_readers)
-        waitq_wake_all(&pp->wq);   /* writers see EPIPE */
-
     /* Both vnodes destroyed — free the shared state. */
-    if (pp->readers <= 0 && pp->writers <= 0 && !pp->freed) {
-        pp->freed = 1;
+    if (do_free) {
         kfree(pp);
         vp->data = NULL;
     }
