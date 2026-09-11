@@ -113,6 +113,7 @@ void syscall_init(void) {
     syscall_table[SYS_IO_REGISTER]      = sys_io_register;
     syscall_table[SYS_IO_GET_REQUEST]   = sys_io_get_request;
     syscall_table[SYS_IO_COMPLETE]      = sys_io_complete;
+    syscall_table[SYS_TTY_INPUT]        = sys_tty_input;
 
     /* Monitoring syscalls */
     syscall_table[SYS_GET_FREE_PAGES]   = sys_get_free_pages;

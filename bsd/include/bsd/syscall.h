@@ -94,6 +94,9 @@ typedef struct proc proc_t;
 #define SYS_DEV_CLOSE        85
 #define SYS_DEV_INFO         86
 
+/* Input injection (userspace keyboard/input drivers) */
+#define SYS_TTY_INPUT        107
+
 /* Stress test / monitoring syscalls */
 #define SYS_GET_FREE_PAGES   81
 #define SYS_GET_TOTAL_PAGES  82
@@ -182,7 +185,7 @@ typedef struct proc proc_t;
 #define SYS_GETSOCKOPT  105
 #define SYS_SHUTDOWN    106
 
-#define SYS_MAX         107
+#define SYS_MAX         108
 
 /* Syscall dispatch */
 void syscall_init(void);
@@ -283,6 +286,7 @@ int64_t sys_dev_info(proc_t *p, registers_t *r);
 int64_t sys_io_register(proc_t *p, registers_t *r);
 int64_t sys_io_get_request(proc_t *p, registers_t *r);
 int64_t sys_io_complete(proc_t *p, registers_t *r);
+int64_t sys_tty_input(proc_t *p, registers_t *r);
 
 /* Monitoring syscalls */
 int64_t sys_get_free_pages(proc_t *p, registers_t *r);

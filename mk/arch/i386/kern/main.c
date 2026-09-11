@@ -330,6 +330,7 @@ void mk_init(struct arc_boot_info *boot_info) {
     pit_init();
     pci_init();
     i8042_init();
+    ata_legacy_init();
     log_print(LOG_LEVEL_DEBUG, "mk: init done\r\n");
 }
 

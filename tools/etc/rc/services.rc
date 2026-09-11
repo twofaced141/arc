@@ -20,11 +20,19 @@
   (exec /sbin/driverd)
   (respawn on-failure))
 
-; Pilot userspace block driver: RAM disk served over an I/O channel,
-; exposed as /dev/upramd.  Self-tests a write+readback at startup.
-(unit upramd
+; Userspace PS/2 keyboard driver: owns the i8042 keyboard interface
+; (ports 0x60/0x64, IRQ1) and injects decoded keys into the console tty.
+(unit kbd
   (type service)
-  (exec /sbin/upramd)
+  (exec /sbin/kbd)
+  (respawn on-failure))
+
+; Userspace ATA PIO block driver: owns the legacy IDE channels
+; (ports 0x1F0/0x170, IRQ14/15) and serves /dev/ataN (+MBR partitions)
+; over I/O channels.
+(unit ata
+  (type service)
+  (exec /sbin/ata)
   (respawn on-failure))
 
 ;(unit configd

@@ -331,6 +331,8 @@ int apic_init(void) {
        IRQ1 feeds the userspace PS/2 keyboard driver. */
     ioapic_unmask_irq(0);  /* PIT timer */
     ioapic_unmask_irq(1);  /* PS/2 keyboard (userspace driver) */
+    ioapic_unmask_irq(14); /* ATA primary channel (userspace driver) */
+    ioapic_unmask_irq(15); /* ATA secondary channel (userspace driver) */
     /* IRQ2 is the cascade — must be unmasked for slave IRQs to pass through
        in PIC mode, but with I/O APIC each slave IRQ is independent.
        Unmask IRQ12 (mouse) as needed later. */

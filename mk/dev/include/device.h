@@ -165,4 +165,11 @@ int  arc_device_reprobe(struct arc_driver *drv);
 /* i8042.c — PS/2 keyboard controller platform device (x86 only). */
 void i8042_init(void);
 
+/* ata_legacy.c — legacy IDE channel platform devices (x86 only).
+ * "ata0": ports 0x1F0-0x1F7 + 0x3F6, IRQ14; "ata1": 0x170-0x177 +
+ * 0x376, IRQ15.  The protocol lives in the userspace ATA driver
+ * (user/drivers/ata); these devices exist so dev_open() grants the
+ * port/IRQ capabilities to exactly one process per channel. */
+void ata_legacy_init(void);
+
 #endif

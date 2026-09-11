@@ -313,6 +313,7 @@ void mk_init(struct arc_boot_info *boot_info) {
     pit_init();
     pci_init();
     i8042_init();
+    ata_legacy_init();
     acpi_init(boot_info);
 
     /* Initialize APIC: LAPIC + I/O APIC, switch from PIC */

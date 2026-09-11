@@ -42,7 +42,6 @@
 #include "bsd/uipc/futex.h"
 #include "bsd/tty.h"
 #include "bsd/block.h"
-#include "bsd/drivers/ata.h"
 #include "bsd/drivers/ahci.h"
 #include "bsd/drivers/serial/pl011.h"
 #include "bsd/part.h"
@@ -292,7 +291,6 @@ void bsd_init(const char *cmdline) {
     sys_driver_init();
     io_channel_init();
     block_ipc_init();
-    ata_init();
     ahci_init();
     pl011_init();
     extern void net_init(void);

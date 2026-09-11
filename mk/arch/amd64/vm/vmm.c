@@ -673,6 +673,11 @@ void page_fault_handler(registers_t *r) {
     if (error_code & 0x4) {
         /* Fault in user mode */
         if (user_fault_handler) {
+            log_printf(LOG_LEVEL_ERROR,
+                       "user PF: cr2=0x%lx rip=0x%lx err=0x%x%s%s\r\n",
+                       fault_addr, r->rip, error_code,
+                       (error_code & 0x1) ? " prot" : " not-present",
+                       (error_code & 0x2) ? " write" : " read");
             user_fault_handler(r, fault_addr, error_code);
             return;
         }

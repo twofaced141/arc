@@ -198,10 +198,14 @@ int io_channel_request(int handle, struct io_request *req) {
     ch->count++;
 
     /* Store the waiting thread's TID so io_channel_complete can wake us.
-     * Block the current thread BEFORE releasing the lock to close the
-     * race where the driver completes the request before we block. */
+     * Park BEFORE releasing the lock (off the runqueue + BLOCKED, the
+     * scheduler's blocking contract) to close the race where the driver
+     * completes the request before we block: the completer needs this
+     * lock to find the entry, so it cannot wake a thread that has not
+     * parked yet — and rq_unblock_locked must never enqueue a thread
+     * that is still linked. */
     entry->waiting_tid = thread_get_tid();
-    thread_current()->state = THREAD_BLOCKED;
+    scheduler_block_current();
 
     spin_unlock_irqrestore(&ch->lock, flags);
 

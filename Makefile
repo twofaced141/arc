@@ -8,6 +8,16 @@ $(error ARCH is not set - build explicitly: make ARCH=amd64 (or i386, arm64))
 endif
 endif
 
+# Reject unknown architectures up front: a typo (ARCH=amd4) would
+# otherwise fall through to the i386 flag branch and — worse — trigger
+# the arch-switch cleanup below, wiping a perfectly good build tree.
+# Arch-independent goals (clean, host tests) are exempt.
+ifneq ($(words $(filter amd64 i386 arm64,$(ARCH))),1)
+ifneq ($(strip $(filter-out clean clean-hosttest hosttest,$(or $(MAKECMDGOALS),all))),)
+$(error Unknown ARCH '$(ARCH)' - supported: amd64, i386, arm64)
+endif
+endif
+
 ifeq ($(ARCH),arm64)
     CROSS_COMPILE ?= aarch64-linux-gnu-
     CC = $(CROSS_COMPILE)gcc
@@ -153,7 +163,39 @@ USER_LDFLAGS  = -nostdlib $(LD_ARCH)
 # with `make user/drivers/example/example.elf` if you need it.
 USER_PROGS = user/init/init.elf user/tests/sigexec/sigexec.elf \
              user/drivers/driverd/driverd.elf \
-             user/drivers/upramd/upramd.elf
+             user/drivers/kbd/kbd.elf \
+             user/drivers/ata/ata.elf
+
+# ---------------------------------------------------------------------
+# Arch-switch safety.  Kernel objects (.o) live next to their sources in
+# directories shared by every ARCH (boot/, mk/vm/, ...), but they are
+# NOT interchangeable: an i386 boot/boot.o cannot link into an amd64
+# kernel and vice versa.  A stamp (.build-arch) records the last-built
+# arch; when the requested ARCH differs, stale objects and images are
+# wiped once — here, at parse time, so it is guaranteed to happen before
+# any recipe runs.  Rebuilding the SAME arch stays fully incremental.
+#
+# Skipped for non-build goals (clean, hosttest) and dry runs (make -n).
+BUILD_STAMP = .build-arch
+
+ARCH_SWITCH_GOALS := $(or $(MAKECMDGOALS),all)
+ifeq ($(strip $(filter-out clean clean-hosttest hosttest,$(ARCH_SWITCH_GOALS))),)
+ARCH_SWITCH_SKIP := 1
+endif
+# make -n must never touch the tree
+ifneq ($(findstring n,$(firstword $(MAKEFLAGS))),)
+ARCH_SWITCH_SKIP := 1
+endif
+
+LAST_ARCH := $(shell cat $(BUILD_STAMP) 2>/dev/null)
+ifeq ($(ARCH_SWITCH_SKIP),)
+ifneq ($(LAST_ARCH),$(ARCH))
+$(info   CLEAN   arch switch -> $(ARCH): removing foreign-arch objects)
+$(shell find . -name '*.o' -delete 2>/dev/null; \
+        rm -f arc.elf arc.iso arc.bin disk.img root.img $(USER_PROGS) 2>/dev/null)
+endif
+$(shell printf '%s\n' '$(ARCH)' > $(BUILD_STAMP))
+endif
 
 .PHONY: all clean user
 
@@ -173,9 +215,13 @@ user/drivers/example/example.elf: user/drivers/example/main.o user/drivers/libdr
 user/drivers/driverd/driverd.elf: user/drivers/driverd/main.o user/drivers/libdriver.o user/drivers/driver.ld
 	$(LD) $(USER_LDFLAGS) -T user/drivers/driver.ld -o $@ user/drivers/driverd/main.o user/drivers/libdriver.o
 
-# upramd — pilot userspace block driver (RAM disk over an I/O channel)
-user/drivers/upramd/upramd.elf: user/drivers/upramd/main.o user/drivers/libdriver.o user/drivers/driver.ld
-	$(LD) $(USER_LDFLAGS) -T user/drivers/driver.ld -o $@ user/drivers/upramd/main.o user/drivers/libdriver.o
+# kbd — userspace PS/2 keyboard driver (i8042 platform device)
+user/drivers/kbd/kbd.elf: user/drivers/kbd/main.o user/drivers/libdriver.o user/drivers/driver.ld
+	$(LD) $(USER_LDFLAGS) -T user/drivers/driver.ld -o $@ user/drivers/kbd/main.o user/drivers/libdriver.o
+
+# ata — userspace ATA PIO block driver (legacy channels)
+user/drivers/ata/ata.elf: user/drivers/ata/main.o user/drivers/libdriver.o user/drivers/driver.ld
+	$(LD) $(USER_LDFLAGS) -T user/drivers/driver.ld -o $@ user/drivers/ata/main.o user/drivers/libdriver.o
 
 # Init program (PID 1)
 user/init/init.elf: user/init/init.o user/rc/rcparse.o user/init/init.ld
@@ -205,12 +251,13 @@ arc.elf: $(OBJS) mk/arch/$(ARCH)/boot/linker.ld root.img
 # root.img — ufs initramfs with userspace binaries (all arches)
 ROOT_IMG_DEPS = user/init/init.elf user/tests/sigexec/sigexec.elf \
                 user/drivers/driverd/driverd.elf \
-                user/drivers/upramd/upramd.elf \
+                user/drivers/kbd/kbd.elf \
+                user/drivers/ata/ata.elf \
                 tools/etc/rc/mounts.rc tools/etc/rc/services.rc
 
 root.img: $(ROOT_IMG_DEPS) tools/mkfs_ufs.py
 	@echo "  GEN     $@"
-	python3 tools/mkfs_ufs.py $@ --add user/init/init.elf:/sbin/init --add user/tests/sigexec/sigexec.elf:/sbin/sigexec --add user/drivers/driverd/driverd.elf:/sbin/driverd --add user/drivers/upramd/upramd.elf:/sbin/upramd --add tools/etc/rc/mounts.rc:/etc/rc/mounts.rc --add tools/etc/rc/services.rc:/etc/rc/services.rc
+	python3 tools/mkfs_ufs.py $@ --add user/init/init.elf:/sbin/init --add user/tests/sigexec/sigexec.elf:/sbin/sigexec --add user/drivers/driverd/driverd.elf:/sbin/driverd --add user/drivers/kbd/kbd.elf:/sbin/kbd --add user/drivers/ata/ata.elf:/sbin/ata --add tools/etc/rc/mounts.rc:/etc/rc/mounts.rc --add tools/etc/rc/services.rc:/etc/rc/services.rc
 
 # Bootable disk image with MBR + 2 partitions (boot + root).
 # CI-only: built by tools/qa/qemu-smoke.sh, not part of the kernel build.
@@ -220,7 +267,7 @@ disk.img: arc.elf root.img tools/qa/mkdisk.sh
 
 clean:
 	find . -name '*.o' -delete
-	rm -f arc.elf arc.iso arc.bin disk.img root.img
+	rm -f arc.elf arc.iso arc.bin disk.img root.img $(BUILD_STAMP)
 	rm -rf iso_root
 	rm -f $(USER_PROGS) user/drivers/null/null.elf
 

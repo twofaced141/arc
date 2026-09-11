@@ -47,6 +47,7 @@
 #endif
 #include "bsd/arch.h"
 #include "bsd/block.h"
+#include "bsd/tty.h"
 #include "pci.h"
 #include "io_channel.h"
 #include "device.h"
@@ -235,7 +236,12 @@ struct irq_sub {
 static struct irq_sub irq_subscribers[IRQ_MAX];
 static spinlock_t irq_lock;
 
-/* Called from the kernel's irq_handler to wake a user-space subscriber */
+/* Called from the kernel's irq_handler to wake a user-space subscriber.
+ *
+ * Every IRQ is recorded as `pending` FIRST, then a parked waiter is
+ * unblocked: waits consume IRQs by counting pending down (semaphore
+ * semantics), so an interrupt racing with a wait can neither be lost
+ * nor double-counted. */
 static int irq_wake_user(uint8_t irq_num) {
     uint32_t flags;
     spin_lock_irqsave(&irq_lock, &flags);
@@ -245,22 +251,18 @@ static int irq_wake_user(uint8_t irq_num) {
         return -1; /* no subscriber */
     }
 
+    if (irq_subscribers[irq_num].pending < 0xFFFFFFFFu)
+        irq_subscribers[irq_num].pending++;
+
     thread_t *t = thread_find(irq_subscribers[irq_num].tid);
-    if (!t || t->state != THREAD_BLOCKED) {
-        /* Nobody parked on this line right now (stale TID, or the
-         * subscriber is running and about to call irq_wait) — record
-         * the event so the next wait returns immediately instead of
-         * blocking forever. */
-        if (irq_subscribers[irq_num].pending < 0xFFFFFFFFu)
-            irq_subscribers[irq_num].pending++;
-        if (!t)
-            irq_subscribers[irq_num].tid = 0;
-        spin_unlock_irqrestore(&irq_lock, flags);
-        return -1;
+    if (t) {
+        if (t->state == THREAD_BLOCKED)
+            scheduler_unblock_thread(t);
+    } else {
+        /* Stale TID — nobody will ever wait on it again. */
+        irq_subscribers[irq_num].tid = 0;
     }
 
-    /* Unblock the thread */
-    scheduler_unblock_thread(t);
     spin_unlock_irqrestore(&irq_lock, flags);
     return 0;
 }
@@ -313,37 +315,38 @@ int64_t sys_irq_wait(proc_t *p, registers_t *r) {
     if (!p || !p->thread) return -1;
 
     uint32_t tid = p->thread->tid;
-    int has_subscription = 0;
 
-    /* Consume a pending IRQ first: an interrupt that fired between the
-     * subscription and this call must not strand us in THREAD_BLOCKED
-     * with nobody left to wake us. */
-    for (int i = 0; i < IRQ_MAX; i++) {
-        if (irq_subscribers[i].tid == tid) {
-            has_subscription = 1;
-            break;
-        }
-    }
-    if (!has_subscription)
-        return 0;
-
-    for (int i = 0; i < IRQ_MAX; i++) {
+    for (;;) {
         uint32_t flags;
         spin_lock_irqsave(&irq_lock, &flags);
-        if (irq_subscribers[i].tid == tid && irq_subscribers[i].pending > 0) {
-            irq_subscribers[i].pending--;
+
+        int has_subscription = 0;
+        for (int i = 0; i < IRQ_MAX; i++) {
+            if (irq_subscribers[i].tid != tid)
+                continue;
+            has_subscription = 1;
+            if (irq_subscribers[i].pending > 0) {
+                irq_subscribers[i].pending--;
+                spin_unlock_irqrestore(&irq_lock, flags);
+                return 0;
+            }
+        }
+
+        if (!has_subscription) {
             spin_unlock_irqrestore(&irq_lock, flags);
             return 0;
         }
-        spin_unlock_irqrestore(&irq_lock, flags);
-    }
 
-    /* Block the current thread.  The IRQ handler will wake us via
-     * scheduler_unblock_thread(); if the IRQ lands before we actually
-     * block, irq_wake_user bumps `pending` above and our next call
-     * consumes it. */
-    p->thread->state = THREAD_BLOCKED;
-    return 0;
+        /* Park for real: off the runqueue + BLOCKED while still under
+         * the subscriber lock.  A concurrent IRQ either finds us parked
+         * (unblocks us) or lands after the wake re-check below — either
+         * way pending>0 and no wakeup is lost. */
+        scheduler_block_current();
+        spin_unlock_irqrestore(&irq_lock, flags);
+
+        thread_yield();
+        /* Woken — rescan; every wake is backed by a pending IRQ. */
+    }
 }
 
 /* ---- 4. x86 IO port access ---- */
@@ -872,6 +875,51 @@ int64_t sys_io_complete(proc_t *p, registers_t *r) {
 
     if (!io_channel_owner_ok(handle, p->pid)) return -1;
     return io_channel_complete(handle, request_id, result);
+}
+
+/* ---- Input injection ---- */
+
+/*
+ * sys_tty_input(char) — inject one byte into the console tty.
+ *
+ * This is how userspace input drivers (the PS/2 keyboard driver, a
+ * future serial/USB HID stack) feed the line discipline.  Capability
+ * gate: the caller must hold an open device handle to a device that
+ * owns at least one IRQ resource — i.e. a real input driver bound to
+ * hardware via dev_open(), not an arbitrary process typing into the
+ * console.
+ */
+int64_t sys_tty_input(proc_t *p, registers_t *r) {
+    if (!p)
+        return -1;
+
+    uint8_t c = (uint8_t)ARG1(r);
+
+    int has_irq_dev = 0;
+    uint32_t flags;
+    spin_lock_irqsave(&dev_handle_lock, &flags);
+    for (int i = 0; i < DEV_HANDLE_MAX && !has_irq_dev; i++) {
+        struct dev_handle *h = &dev_handle_table[i];
+        if (!h->used || h->pid != p->pid)
+            continue;
+
+        struct arc_device *dev = arc_device_find(h->bus, h->name);
+        if (!dev)
+            continue;
+        for (size_t res = 0; res < dev->resource_count; res++) {
+            if (dev->resources[res].type == ARC_RES_IRQ) {
+                has_irq_dev = 1;
+                break;
+            }
+        }
+    }
+    spin_unlock_irqrestore(&dev_handle_lock, flags);
+
+    if (!has_irq_dev)
+        return -1;
+
+    tty_input_char(TTY_CONSOLE, (char)c);
+    return 0;
 }
 
 /* ---- Init ---- */

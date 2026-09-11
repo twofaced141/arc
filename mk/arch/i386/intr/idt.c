@@ -81,9 +81,10 @@ void pic_remap(void) {
     outb(0x21, 0x01); io_wait();
     outb(0xA1, 0x01); io_wait();
 
-    /* Unmask IRQ0 (timer) and IRQ1 (keyboard) on the master PIC. */
-    outb(0x21, 0xFC); io_wait();
-    outb(0xA1, 0xFF); io_wait();
+    /* Unmask IRQ0 (timer), IRQ1 (keyboard), IRQ2 (cascade — required
+     * for the slave PIC) and IRQ14/15 (ATA channels) on the master. */
+    outb(0x21, 0xB8); io_wait();
+    outb(0xA1, 0x3F); io_wait();
 }
 
 void pic_send_eoi(unsigned char irq) {

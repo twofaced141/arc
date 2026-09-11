@@ -76,6 +76,7 @@
 #define SYS_IO_REGISTER     40
 #define SYS_IO_GET_REQUEST  41
 #define SYS_IO_COMPLETE     42
+#define SYS_TTY_INPUT       107
 
 #define BSD_SYS(n) (1024L + (n))
 
@@ -270,6 +271,14 @@ static inline long port_in(uint16_t port, int size) {
 }
 static inline long port_out(uint16_t port, uint32_t value, int size) {
     return syscall4(BSD_SYS(SYS_PORT_OUT), port, value, size);
+}
+
+/* ---- Input injection ----
+ * Feed one byte into the console tty's line discipline (echo, canonical
+ * buffer, readers).  Requires an open device handle whose device owns
+ * an IRQ resource — i.e. only real input drivers may call this. */
+static inline int tty_inject(char c) {
+    return (int)syscall2(BSD_SYS(SYS_TTY_INPUT), (unsigned char)c);
 }
 
 /* ---- I/O Channels ---- */
