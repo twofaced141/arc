@@ -823,8 +823,9 @@ void vmm_fork_cow_pages(page_directory_t *parent_dir, page_directory_t *child_di
      * TLB was invalidated (invlpg above).  A sibling thread of the
      * same address space running on another CPU could keep writing
      * through its stale writable TLB entry — silently corrupting the
-     * COW protocol.  Force a TLB flush on every other CPU. */
-    tlb_flush_others();
+     * COW protocol.  Synchronous shootdown: every other online CPU
+     * reloads its TLB before fork proceeds. */
+    tlb_flush_others_sync();
 }
 
 void vmm_clear_user_pages(page_directory_t *dir) {
@@ -905,16 +906,16 @@ void vmm_temp_unmap(void) {
  * pointer would give ring 0 an arbitrary read/write primitive, and a
  * partially unmapped buffer would fault in kernel mode and panic. */
 
-int user_range_ok(const void *uaddr, uint32_t size, int write) {
+int user_range_ok(const void *uaddr, size_t size, int write) {
     if (size == 0)
         return 1;
     if (!uaddr)
         return 0;
     uint64_t addr = (uint64_t)(uintptr_t)uaddr;
 
-    /* Overflow-safe upper bound check against the user/kernel split.
-     * (size is 32-bit, so only the address terms need guarding.) */
-    if (addr >= USER_STACK_TOP || addr + size > USER_STACK_TOP)
+    /* Overflow-safe upper bound check against the user/kernel split:
+     * size > TOP-addr rejects both out-of-range and wrapped ranges. */
+    if (addr >= USER_STACK_TOP || size > USER_STACK_TOP - addr)
         return 0;
 
     page_directory_t *dir = vmm_get_current_directory();
@@ -933,31 +934,31 @@ int user_range_ok(const void *uaddr, uint32_t size, int write) {
     return 1;
 }
 
-int copy_from_user(void *dst, const void *user_src, uint32_t size) {
+int copy_from_user(void *dst, const void *user_src, size_t size) {
     if (size == 0) return 0;
     if (!user_range_ok(user_src, size, 0)) return -1;
 
-    for (uint32_t i = 0; i < size; i++)
+    for (size_t i = 0; i < size; i++)
         ((uint8_t *)dst)[i] = ((const uint8_t *)(uintptr_t)user_src)[i];
     return 0;
 }
 
-int copy_to_user(void *user_dst, const void *src, uint32_t size) {
+int copy_to_user(void *user_dst, const void *src, size_t size) {
     if (size == 0) return 0;
     if (!user_range_ok(user_dst, size, 1)) return -1;
 
-    for (uint32_t i = 0; i < size; i++)
+    for (size_t i = 0; i < size; i++)
         ((uint8_t *)(uintptr_t)user_dst)[i] = ((const uint8_t *)src)[i];
     return 0;
 }
 
-int strncpy_from_user(char *dst, const char *user_src, uint32_t max_len) {
+int strncpy_from_user(char *dst, const char *user_src, size_t max_len) {
     if (max_len == 0) return -1;
     if (!user_src) return -1;
     uint64_t addr = (uint64_t)(uintptr_t)user_src;
     if (addr >= USER_STACK_TOP) return -1;
     uint64_t avail = USER_STACK_TOP - addr;
-    if (max_len > avail) max_len = (uint32_t)avail;
+    if (max_len > avail) max_len = avail;
     if (max_len == 0) return -1;
 
     page_directory_t *dir = vmm_get_current_directory();
@@ -967,10 +968,14 @@ int strncpy_from_user(char *dst, const char *user_src, uint32_t max_len) {
 
     /* Walk byte by byte and stop at the NUL — a string that ends early
      * must not require pages BEYOND its terminator to be mapped. */
-    for (uint32_t i = 0; i < max_len; i++) {
+    for (size_t i = 0; i < max_len; i++) {
         char c = ((const char *)(uintptr_t)user_src)[i];
         dst[i] = c;
-        if (c == '\0') return (int)(i + 1);
+        if (c == '\0') {
+            if (i + 1 > (size_t)0x7FFFFFFF)
+                return -1;
+            return (int)(i + 1);
+        }
         if (((addr + i + 1) & ~0xFFFULL) != cur_page) {
             cur_page = (addr + i + 1) & ~0xFFFULL;
             flags = vmm_get_page_flags(dir, cur_page);

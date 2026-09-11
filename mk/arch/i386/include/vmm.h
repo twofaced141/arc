@@ -105,9 +105,12 @@ void  kfree(void *addr);
 void *vmm_temp_map(uint32_t phys);
 void  vmm_temp_unmap(void);
 
-int copy_from_user(void *dst, const void *user_src, uint32_t size);
-int copy_to_user(void *user_dst, const void *src, uint32_t size);
-int strncpy_from_user(char *dst, const char *user_src, uint32_t max_len);
-int user_range_ok(const void *uaddr, uint32_t size, int write);
+int copy_from_user(void *dst, const void *user_src, size_t size);
+int copy_to_user(void *user_dst, const void *src, size_t size);
+int strncpy_from_user(char *dst, const char *user_src, size_t max_len);
+int user_range_ok(const void *uaddr, size_t size, int write);
+
+/* Full local TLB flush (used by the IPI_TLB handler on remote CPUs). */
+void vmm_tlb_reload_current(void);
 
 #endif

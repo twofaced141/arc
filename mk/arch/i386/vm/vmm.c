@@ -37,6 +37,7 @@
 #include "memory.h"
 #include "personality.h"
 #include "thread.h"
+#include "cpu.h"
 #include <string.h>
 
 static page_directory_t *kernel_directory;
@@ -152,6 +153,14 @@ void vmm_fork_cow_pages(page_directory_t *parent_dir, page_directory_t *child_di
             child_table->entries[j] = parent_table->entries[j];
         }
     }
+
+    /* Parent pages just became read-only: drop this CPU's stale writable
+     * TLB entries, then synchronously shoot down every other online CPU
+     * (same COW protocol as amd64 — previously there was no flush here
+     * at all, so a sibling thread on another CPU could write through a
+     * stale entry into a now-shared page). */
+    vmm_tlb_reload_current();
+    tlb_flush_others_sync();
 }
 
 void vmm_free_directory(page_directory_t *dir) {
@@ -538,14 +547,14 @@ void vmm_temp_unmap(void) {
 }
 
 /* Validate a user range without touching it (see amd64 vmm.c). */
-int user_range_ok(const void *uaddr, uint32_t size, int write) {
+int user_range_ok(const void *uaddr, size_t size, int write) {
     if (size == 0) return 1;
     if (!uaddr) return 0;
-    uint32_t addr = (uint32_t)uaddr;
+    size_t addr = (size_t)uaddr;
     if (addr > 0xC0000000u || size > 0xC0000000u - addr) return 0;
     page_directory_t *dir = vmm_get_current_directory();
-    uint32_t first = addr & ~0xFFFu, last = (addr + size - 1) & ~0xFFFu;
-    for (uint32_t page = first; ; page += PAGE_SIZE) {
+    size_t first = addr & ~0xFFFu, last = (addr + size - 1) & ~0xFFFu;
+    for (size_t page = first; ; page += PAGE_SIZE) {
         int flags = vmm_get_page_flags(dir, page);
         if (!(flags & VMM_PRESENT)) return 0;
         if (!(flags & VMM_USER)) return 0;
@@ -555,63 +564,67 @@ int user_range_ok(const void *uaddr, uint32_t size, int write) {
     return 1;
 }
 
-int copy_from_user(void *dst, const void *user_src, uint32_t size) {
+int copy_from_user(void *dst, const void *user_src, size_t size) {
     if (size == 0) return 0;
-    uint32_t addr = (uint32_t)user_src;
+    size_t addr = (size_t)user_src;
     if (addr + size < addr) return -1;
     if (addr + size > 0xC0000000) return -1;
 
     page_directory_t *dir = vmm_get_current_directory();
-    uint32_t end_page = (addr + size + PAGE_SIZE - 1) & ~0xFFF;
-    for (uint32_t page = addr & ~0xFFF; page < end_page; page += PAGE_SIZE) {
+    size_t end_page = (addr + size + PAGE_SIZE - 1) & ~0xFFF;
+    for (size_t page = addr & ~0xFFF; page < end_page; page += PAGE_SIZE) {
         if (!vmm_is_page_present(dir, page)) return -1;
         if (!(vmm_get_page_flags(dir, page) & VMM_USER)) return -1;
     }
 
-    for (uint32_t i = 0; i < size; i++)
+    for (size_t i = 0; i < size; i++)
         ((uint8_t *)dst)[i] = ((const uint8_t *)user_src)[i];
     return 0;
 }
 
-int copy_to_user(void *user_dst, const void *src, uint32_t size) {
+int copy_to_user(void *user_dst, const void *src, size_t size) {
     if (size == 0) return 0;
-    uint32_t addr = (uint32_t)user_dst;
+    size_t addr = (size_t)user_dst;
     if (addr + size < addr) return -1;
     if (addr + size > 0xC0000000) return -1;
 
     page_directory_t *dir = vmm_get_current_directory();
-    uint32_t end_page = (addr + size + PAGE_SIZE - 1) & ~0xFFF;
-    for (uint32_t page = addr & ~0xFFF; page < end_page; page += PAGE_SIZE) {
+    size_t end_page = (addr + size + PAGE_SIZE - 1) & ~0xFFF;
+    for (size_t page = addr & ~0xFFF; page < end_page; page += PAGE_SIZE) {
         int flags = vmm_get_page_flags(dir, page);
         if (!(flags & VMM_PRESENT)) return -1;
         if (!(flags & VMM_USER)) return -1;
         if (!(flags & VMM_WRITABLE) && !(flags & VMM_COW)) return -1;
     }
 
-    for (uint32_t i = 0; i < size; i++)
+    for (size_t i = 0; i < size; i++)
         ((uint8_t *)user_dst)[i] = ((const uint8_t *)src)[i];
     return 0;
 }
 
-int strncpy_from_user(char *dst, const char *user_src, uint32_t max_len) {
+int strncpy_from_user(char *dst, const char *user_src, size_t max_len) {
     if (max_len == 0) return -1;
-    uint32_t addr = (uint32_t)user_src;
+    size_t addr = (size_t)user_src;
     if (addr >= 0xC0000000) return -1;
-    uint32_t avail = 0xC0000000 - addr;
+    size_t avail = 0xC0000000 - addr;
     if (max_len > avail) max_len = avail;
     if (max_len == 0) return -1;
 
     page_directory_t *dir = vmm_get_current_directory();
-    uint32_t end_page = (addr + max_len + PAGE_SIZE - 1) & ~0xFFF;
-    for (uint32_t page = addr & ~0xFFF; page < end_page; page += PAGE_SIZE) {
+    size_t end_page = (addr + max_len + PAGE_SIZE - 1) & ~0xFFF;
+    for (size_t page = addr & ~0xFFF; page < end_page; page += PAGE_SIZE) {
         if (!vmm_is_page_present(dir, page)) return -1;
         if (!(vmm_get_page_flags(dir, page) & VMM_USER)) return -1;
     }
 
-    for (uint32_t i = 0; i < max_len; i++) {
+    for (size_t i = 0; i < max_len; i++) {
         char c = ((const char *)user_src)[i];
         dst[i] = c;
-        if (c == '\0') return (int)(i + 1);
+        if (c == '\0') {
+            if (i + 1 > (size_t)0x7FFFFFFF)
+                return -1;
+            return (int)(i + 1);
+        }
     }
     return -1;
 }

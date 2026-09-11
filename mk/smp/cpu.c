@@ -417,6 +417,10 @@ void tlb_ipi(void) {
     vmm_tlb_reload_current();
 }
 
+/* cpu_call_sync is defined below (cross-CPU call section);
+ * forward-declared for the synchronous shootdown. */
+void cpu_call_sync(struct cpu *cpu, void (*fn)(void *), void *arg);
+
 void tlb_flush_others(void) {
     struct cpu *me = cpu_current();
     unsigned n = cpu_count();
@@ -426,6 +430,34 @@ void tlb_flush_others(void) {
             continue;
         /* cpu_send_ipi() marks pending itself; no double-mark. */
         cpu_send_ipi(c, IPI_TLB);
+    }
+}
+
+/* Synchronous TLB shootdown for COW fork: every other online CPU
+ * reloads its TLB before we return, so no sibling thread can keep
+ * writing through a stale writable entry to a page we just marked
+ * read-only.  Built on cpu_call_sync (ack via IPI_CALL) instead of
+ * the fire-and-forget IPI_TLB above.
+ *
+ * Context: process context ONLY, holding no spinlocks — the caller
+ * spins until every target ACKs, and a target that needs a lock we
+ * hold would deadlock.  (Two CPUs flushing concurrently is fine:
+ * targets process IPI_CALL in IRQ context, so cross-flushes complete
+ * instead of deadlocking.)  IRQ/NMI handlers must use the async
+ * tlb_flush_others(). */
+static void tlb_shootdown_fn(void *arg) {
+    (void)arg;
+    tlb_ipi();
+}
+
+void tlb_flush_others_sync(void) {
+    struct cpu *me = cpu_current();
+    unsigned n = cpu_count();
+    for (unsigned i = 0; i < n; i++) {
+        struct cpu *c = cpu_get(i);
+        if (!c || c == me || !cpu_online(c))
+            continue;
+        cpu_call_sync(c, tlb_shootdown_fn, NULL);
     }
 }
 

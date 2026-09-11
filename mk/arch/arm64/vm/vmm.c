@@ -843,18 +843,22 @@ void vmm_temp_unmap(void) {
 
 /* ---- User copy ---- */
 /* Validate a user range without touching it (matches amd64: COW pages
- * count as writable — the fault path breaks them lazily). */
-int user_range_ok(const void *uaddr, uint32_t size, int write) {
+ * count as writable — the fault path breaks them lazily, so a
+ * write-check must accept read-only-present user pages here; the
+ * per-page enforcement happens in copy_to_user's own walk). */
+int user_range_ok(const void *uaddr, size_t size, int write) {
     (void)write;
     if (size == 0) return 1;
     if (!uaddr) return 0;
+    /* Overflow-safe: reject wrapped ranges up front. */
+    if ((uintptr_t)uaddr + size < (uintptr_t)uaddr) return 0;
     page_directory_t *dir = vmm_get_current_directory();
-    for (uint32_t offset = 0; offset < size; ) {
+    for (size_t offset = 0; offset < size; ) {
         uint64_t vaddr = (uint64_t)(uintptr_t)uaddr + offset;
         uint64_t *pte = walk_pt(dir, vaddr, 0);
         if (!pte || !(*pte & DESC_VALID) || !(*pte & ATTR_AP_USER))
             return 0;
-        uint32_t chunk = PAGE_SIZE - (vaddr & 0xFFF);
+        size_t chunk = PAGE_SIZE - (vaddr & 0xFFF);
         if (chunk > size - offset) chunk = size - offset;
         offset += chunk;
     }
@@ -862,15 +866,16 @@ int user_range_ok(const void *uaddr, uint32_t size, int write) {
 }
 
 
-int copy_from_user(void *dst, const void *user_src, uint32_t size) {
+int copy_from_user(void *dst, const void *user_src, size_t size) {
     if (size == 0) return 0;
+    if ((uintptr_t)user_src + size < (uintptr_t)user_src) return -1;
     page_directory_t *dir = vmm_get_current_directory();
-    for (uint32_t offset = 0; offset < size; ) {
+    for (size_t offset = 0; offset < size; ) {
         uint64_t vaddr = (uint64_t)(uintptr_t)user_src + offset;
         uint64_t *pte = walk_pt(dir, vaddr, 0);
         if (!pte || !(*pte & DESC_VALID) || !(*pte & ATTR_AP_USER))
             return -1;
-        uint32_t chunk = PAGE_SIZE - (vaddr & 0xFFF);
+        size_t chunk = PAGE_SIZE - (vaddr & 0xFFF);
         if (chunk > size - offset) chunk = size - offset;
         memcpy((uint8_t *)dst + offset, (uint8_t *)(uintptr_t)vaddr, chunk);
         offset += chunk;
@@ -878,15 +883,16 @@ int copy_from_user(void *dst, const void *user_src, uint32_t size) {
     return 0;
 }
 
-int copy_to_user(void *user_dst, const void *src, uint32_t size) {
+int copy_to_user(void *user_dst, const void *src, size_t size) {
     if (size == 0) return 0;
+    if ((uintptr_t)user_dst + size < (uintptr_t)user_dst) return -1;
     page_directory_t *dir = vmm_get_current_directory();
-    for (uint32_t offset = 0; offset < size; ) {
+    for (size_t offset = 0; offset < size; ) {
         uint64_t vaddr = (uint64_t)(uintptr_t)user_dst + offset;
         uint64_t *pte = walk_pt(dir, vaddr, 0);
         if (!pte || !(*pte & DESC_VALID) || !(*pte & ATTR_AP_USER))
             return -1;
-        uint32_t chunk = PAGE_SIZE - (vaddr & 0xFFF);
+        size_t chunk = PAGE_SIZE - (vaddr & 0xFFF);
         if (chunk > size - offset) chunk = size - offset;
         memcpy((uint8_t *)(uintptr_t)vaddr, (const uint8_t *)src + offset, chunk);
         offset += chunk;
@@ -894,18 +900,24 @@ int copy_to_user(void *user_dst, const void *src, uint32_t size) {
     return 0;
 }
 
-int strncpy_from_user(char *dst, const char *user_src, uint32_t max_len) {
+int strncpy_from_user(char *dst, const char *user_src, size_t max_len) {
     page_directory_t *dir = vmm_get_current_directory();
-    for (uint32_t i = 0; i < max_len; i++) {
+    for (size_t i = 0; i < max_len; i++) {
         uint64_t vaddr = (uint64_t)(uintptr_t)user_src + i;
         uint64_t *pte = walk_pt(dir, vaddr, 0);
         if (!pte || !(*pte & DESC_VALID) || !(*pte & ATTR_AP_USER))
             return -1;
         char c = *(volatile char *)(uintptr_t)vaddr;
         dst[i] = c;
-        if (c == '\0') return (int)i;
+        if (c == '\0') {
+            if (i > (size_t)0x7FFFFFFF)
+                return -1;
+            return (int)i;
+        }
     }
     dst[max_len - 1] = '\0';
+    if (max_len - 1 > (size_t)0x7FFFFFFF)
+        return -1;
     return (int)max_len - 1;
 }
 

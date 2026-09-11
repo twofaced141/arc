@@ -109,9 +109,9 @@ void  kfree(void *addr);
 void *vmm_temp_map(uint64_t phys);
 void  vmm_temp_unmap(void);
 
-int copy_from_user(void *dst, const void *user_src, uint32_t size);
-int copy_to_user(void *user_dst, const void *src, uint32_t size);
-int strncpy_from_user(char *dst, const char *user_src, uint32_t max_len);
+int copy_from_user(void *dst, const void *user_src, size_t size);
+int copy_to_user(void *user_dst, const void *src, size_t size);
+int strncpy_from_user(char *dst, const char *user_src, size_t max_len);
 
 /* Validate a user pointer range WITHOUT touching it: every covered
  * page must be present and user-accessible (and writable, or COW —
@@ -120,6 +120,6 @@ int strncpy_from_user(char *dst, const char *user_src, uint32_t max_len);
  * through it directly; otherwise an attacker-chosen kernel address
  * becomes an arbitrary read/write primitive.  Returns 1 if the whole
  * range is safe, 0 otherwise (caller returns -EFAULT). */
-int user_range_ok(const void *uaddr, uint32_t size, int write);
+int user_range_ok(const void *uaddr, size_t size, int write);
 
 #endif

@@ -143,6 +143,10 @@ int cpu_share_package(const struct cpu *a, const struct cpu *b);
  * IPI_TLB).  Required after changing PTEs that may be cached in
  * remote TLBs — e.g. COW-marking a parent's writable pages in fork. */
 void tlb_flush_others(void);
+/* Synchronous variant: returns only after every other online CPU has
+ * reloaded its TLB (ack via cpu_call_sync).  Process context, no locks
+ * held — see the implementation for the exact contract. */
+void tlb_flush_others_sync(void);
 
 /* Cross-CPU call (Phase 13). */
 void cpu_call(struct cpu *cpu, void (*fn)(void *), void *arg);
