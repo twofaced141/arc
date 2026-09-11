@@ -37,9 +37,11 @@
 #include "memory.h"
 #include "uart.h"
 #include "string.h"
+#include "spinlock.h"
 
 static thread_t threads[MAX_THREADS];
 static uint32_t next_tid = 1;
+static spinlock_t thread_lock = SPINLOCK_INIT;
 
 extern void thread_exit_trampoline(void);
 __asm__(
@@ -59,6 +61,8 @@ void thread_init(void) {
 
 thread_t *thread_create(uint64_t entry, void *page_dir, int user) {
     thread_t *thr = 0;
+    uint32_t flags;
+    spin_lock_irqsave(&thread_lock, &flags);
     for (int i = 0; i < MAX_THREADS; i++) {
         if (threads[i].state == THREAD_UNUSED) {
             thr = &threads[i];
@@ -71,20 +75,24 @@ thread_t *thread_create(uint64_t entry, void *page_dir, int user) {
             break;
         }
     }
-    if (!thr) return 0;
+    if (!thr) { spin_unlock_irqrestore(&thread_lock, flags); return 0; }
 
     thr->tid = next_tid++;
     thr->state = THREAD_READY;
     thr->time_slice = 0;
+    thr->sleep_until = 0;
     thr->static_prio = 120;
     thr->prio = 120;
     thr->sleep_avg = 50;
     thr->next = 0;
     thr->prev = 0;
     thr->array = 0;
+    thr->rq = 0;
+    thr->tls_base = 0;
     thr->task = NULL;
     thr->page_dir = page_dir;
     thr->entry = entry;
+    spin_unlock_irqrestore(&thread_lock, flags);
 
     const char *d = user ? "user_thread" : "kernel_thread";
     int ni = 0;

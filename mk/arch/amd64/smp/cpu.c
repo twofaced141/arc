@@ -72,6 +72,18 @@ static int trampoline_setup(void) {
     if (trampoline_loaded)
         return 0;
 
+    uint64_t pml4 = (uint64_t)(uintptr_t)vmm_get_kernel_directory();
+    /* The 16-bit trampoline loads CR3 with a 32-bit mov (real mode has
+     * no REX 64-bit operand).  The kernel PML4 must live below 4G —
+     * true for our lowmem pmm boot alloc, but assert it here instead
+     * of silently truncating and triple-faulting the AP. */
+    if ((pml4 >> 32) != 0) {
+        log_printf(LOG_LEVEL_ERROR,
+                   "smp: kernel PML4 above 4G (0x%llx), AP bringup impossible\r\n",
+                   (unsigned long long)pml4);
+        return -1;
+    }
+
     memcpy((void *)(uintptr_t)TRAMPOLINE_BASE, _trampoline_start,
            (size_t)(_trampoline_end - _trampoline_start));
 
@@ -85,7 +97,7 @@ static int trampoline_setup(void) {
     *(uint64_t *)(t + TRAMP_OFF_GDT + 2) = gdt_base;
     *(uint16_t *)(t + TRAMP_OFF_IDT)     = idt_limit;
     *(uint64_t *)(t + TRAMP_OFF_IDT + 2) = idt_base;
-    *(uint64_t *)(t + TRAMP_OFF_CR3)     = (uint64_t)(uintptr_t)vmm_get_kernel_directory();
+    *(uint64_t *)(t + TRAMP_OFF_CR3)     = pml4;
 
     trampoline_loaded = 1;
     log_print(LOG_LEVEL_DEBUG, "smp: trampoline loaded at 0x6000\r\n");
@@ -99,18 +111,19 @@ static int trampoline_setup(void) {
 int arch_cpu_discover(void) {
     int n = 0;
 
-    /* MADT Processor Local APIC entries (enabled only).  Kernel CPU id
-     * is the array index — deliberately NOT the APIC ID. */
+    /* MADT Processor Local APIC (type 0) + x2APIC (type 9) entries.
+     * Kernel CPU id is the array index — deliberately NOT the APIC ID.
+     * acpi.c already filtered disabled entries; keep the full 32-bit
+     * ID (no &0xFF truncation — breaks topology and IPI above 255). */
     if (acpi_info.valid && acpi_info.lapic_count > 0) {
         for (int i = 0; i < acpi_info.lapic_count && n < CPU_MAX; i++) {
-            if (!(acpi_info.lapics[i].flags & 1))
-                continue;   /* disabled */
+            uint32_t apic_id = acpi_info.lapics[i].apic_id;
             struct cpu *c = &cpus[n];
             c->id = (unsigned)n;
-            c->hw_id = acpi_info.lapics[i].apic_id;
-            c->arch.apic_id = acpi_info.lapics[i].apic_id;
+            c->arch.apic_id = apic_id;
+            cpu_topo_decode_apic(c, apic_id);
             log_printf(LOG_LEVEL_DEBUG, "smp: cpu %d -> apic id %u\r\n",
-                       n, acpi_info.lapics[i].apic_id);
+                       n, apic_id);
             n++;
         }
     }
@@ -118,8 +131,8 @@ int arch_cpu_discover(void) {
     if (n == 0) {
         /* No MADT / no entries: single-CPU fallback. */
         cpus[0].id = 0;
-        cpus[0].hw_id = 0;
         cpus[0].arch.apic_id = 0;
+        cpu_topo_decode_apic(&cpus[0], 0);
         n = 1;
     }
     return n;
@@ -159,11 +172,15 @@ int arch_cpu_start(struct cpu *cpu) {
     if (trampoline_setup() < 0)
         return -1;
 
-    /* Per-CPU kernel stack (identity-mapped). */
-    uint8_t *stack = (uint8_t *)pmm_alloc_pages(THREAD_KSTACK_SIZE / PAGE_SIZE);
-    if (!stack)
-        return -1;
-    cpu->kernel_stack = stack;
+    /* Per-CPU kernel stack (identity-mapped).  Reuse the suspended
+     * stack on hotplug restart; allocate only once. */
+    uint8_t *stack = (uint8_t *)cpu->kernel_stack;
+    if (!stack) {
+        stack = (uint8_t *)pmm_alloc_pages(THREAD_KSTACK_SIZE / PAGE_SIZE);
+        if (!stack)
+            return -1;
+        cpu->kernel_stack = stack;
+    }
 
     uint8_t *t = (uint8_t *)(uintptr_t)TRAMPOLINE_BASE;
     *(uint64_t *)(t + TRAMP_OFF_STACK) = (uint64_t)(uintptr_t)(stack + THREAD_KSTACK_SIZE);
@@ -171,10 +188,15 @@ int arch_cpu_start(struct cpu *cpu) {
     *(uint64_t *)(t + TRAMP_OFF_ENTRY) = (uint64_t)(uintptr_t)arch_ap_entry;
     *(uint64_t *)(t + TRAMP_OFF_CPU)   = (uint64_t)(uintptr_t)cpu;
 
-    /* INIT -> 10ms -> deassert -> 2x SIPI (Phase 4 handshake). */
+    /* Intel MP spec: INIT assert 10ms -> deassert -> wait 10ms ->
+     * SIPI -> 200us -> SIPI -> 200us.  The old code sent both SIPIs
+     * back-to-back without the post-INIT pause. */
     lapic_send_init(cpu->arch.apic_id);
+    lapic_delay_ms(10);
     lapic_send_sipi(cpu->arch.apic_id, TRAMPOLINE_VECTOR);
+    lapic_delay_us(200);
     lapic_send_sipi(cpu->arch.apic_id, TRAMPOLINE_VECTOR);
+    lapic_delay_us(200);
     return 0;
 }
 

@@ -205,6 +205,8 @@ void kernel_main(struct arc_boot_info *boot) {
         uart_print_hex64((uint64_t)(uint32_t)(cpu_count() - 1));
         uart_print(" APs online\n");
     }
+    cpu_dump_stats();
+    (void)smp_selftest();
 
     uart_print("arc: enabling interrupts\n");
     irq_enable();

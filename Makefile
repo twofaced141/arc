@@ -286,6 +286,7 @@ HOST_TEST_SRCS = mk/tests/host/host_test_main.c \
                  mk/tests/host/host_bitmap_test.c \
                  mk/tests/host/host_elf_test.c \
                  mk/tests/host/host_rcparse_test.c \
+                 mk/tests/host/host_smp_test.c \
                  user/rc/rcparse.c \
                  $(HOST_BSD_SRCS)
 

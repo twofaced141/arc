@@ -62,6 +62,9 @@
 void lapic_send_ipi(uint32_t apic_id, uint8_t vector);
 void lapic_send_init(uint32_t apic_id);
 void lapic_send_sipi(uint32_t apic_id, uint8_t vector);
+void lapic_delay_us(unsigned us);
+void lapic_delay_ms(unsigned ms);
+int lapic_is_x2apic(void);
 
 /* LAPIC SVR bits */
 #define LAPIC_SVR_ENABLE   (1 << 8)

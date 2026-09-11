@@ -60,5 +60,9 @@ void gic_cpu_init(void);
 void gic_enable_irq(uint32_t irq);
 void gic_disable_irq(uint32_t irq);
 void gic_eoi(uint32_t irq);
+/* Send SGI <sgi> to the CPU with MPIDR <mpidr>.  Uses ICC_SGI1R_EL1 on
+ * GICv3 (any Aff), GICD_SGIR on GICv2 (Aff0 only, single cluster). */
+void gic_send_sgi(uint64_t mpidr, unsigned sgi);
+int gic_is_v3(void);
 
 #endif

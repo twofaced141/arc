@@ -40,12 +40,14 @@
 
 #define CPU_MAX 64
 
-/* CPU lifecycle states (Phase 7 handshake) */
+/* CPU lifecycle states (Phase 7 handshake + hotplug Phase 17) */
 enum cpu_state {
     CPU_OFFLINE,
     CPU_STARTING,
     CPU_ONLINE,
     CPU_FAILED,
+    CPU_STOPPING,    /* IPI_STOP in flight, CPU still scheduled */
+    CPU_SUSPENDED,   /* offlined via cpu_offline(), stack/rq kept */
 };
 
 /* Generic IPI types (Phase 8).  Architecture delivers the event;
@@ -59,11 +61,20 @@ enum ipi_type {
 
 struct runqueue;   /* Phase 12: per-CPU runqueue (arch scheduler.h) */
 
+/* Phase 16: topology.  Decoded from APIC ID (x86) or MPIDR (ARM64);
+ * scheduler uses package/core to prefer within-package stealing. */
+struct cpu_topology {
+    unsigned package;   /* socket / cluster (MPIDR Aff2 / APIC package) */
+    unsigned core;      /* core within package (MPIDR Aff1 / APIC core) */
+    unsigned thread;    /* SMT thread within core (MPIDR Aff0 low / APIC SMT) */
+    unsigned smt;       /* 1 if this CPU shares a core with another CPU */
+};
+
 /* Per-CPU state.  Generic fields only — anything arch-specific lives
  * in struct arch_cpu (arch_cpu.h). */
 struct cpu {
     unsigned id;                /* kernel CPU id (0..cpu_count-1) */
-    unsigned hw_id;             /* APIC ID / MPIDR (arch-neutral view) */
+    uint64_t hw_id;             /* full APIC ID / MPIDR (never truncated) */
     volatile enum cpu_state state;
 
     struct thread *current;
@@ -72,6 +83,7 @@ struct cpu {
     void *kernel_stack;
 
     volatile unsigned long ipi_received; /* Phase 11: monotonic IPI count */
+    struct cpu_topology topo;   /* Phase 16: decoded topology */
 
     struct arch_cpu arch;
 };
@@ -106,9 +118,26 @@ void scheduler_init_cpu(struct cpu *cpu);
 
 /* IPI (Phase 8-9). */
 void cpu_send_ipi(struct cpu *cpu, enum ipi_type type);
+void cpu_broadcast_ipi(enum ipi_type type);
+void cpu_wakeup(struct cpu *cpu);
 void ipi_handler(enum ipi_type type);
 void cpu_call_process(void);
 void tlb_ipi(void);
+
+/* Online helpers. */
+unsigned cpu_online_count(void);
+uint64_t cpu_online_mask(void);
+
+/* Hotplug (Phase 17): offline keeps stack/rq for later cpu_start;
+ * BSP (id 0) can never be offlined.  Returns 0 on success. */
+int cpu_offline(struct cpu *cpu);
+int cpu_online_cpu(struct cpu *cpu);
+
+/* Topology (Phase 16): decode helpers shared by all arches. */
+void cpu_topo_decode_apic(struct cpu *cpu, uint32_t apic_id);
+void cpu_topo_decode_mpidr(struct cpu *cpu, uint64_t mpidr);
+int cpu_share_core(const struct cpu *a, const struct cpu *b);
+int cpu_share_package(const struct cpu *a, const struct cpu *b);
 
 /* Flush the TLB on every OTHER online CPU (full CR3 reload via
  * IPI_TLB).  Required after changing PTEs that may be cached in
@@ -117,6 +146,14 @@ void tlb_flush_others(void);
 
 /* Cross-CPU call (Phase 13). */
 void cpu_call(struct cpu *cpu, void (*fn)(void *), void *arg);
+/* Synchronous variant: runs fn(arg) on target, spins until done.
+ * done/arg must stay valid until return.  No-op if target==self. */
+void cpu_call_sync(struct cpu *cpu, void (*fn)(void *), void *arg);
+/* SMP stats for tests / shell. */
+void cpu_dump_stats(void);
+/* Boot selftest: UP checks always, IPI/cpu_call checks on SMP.
+ * Prints "smp: selftest PASS/FAIL (...)".  Returns 0 on PASS. */
+int smp_selftest(void);
 
 /* IPI_RESCHEDULE target (Phase 11). */
 void scheduler_ipi(void);

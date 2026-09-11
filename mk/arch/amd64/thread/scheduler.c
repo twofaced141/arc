@@ -405,6 +405,63 @@ static void rq_steal(struct runqueue *rq) {
     }
 }
 
+/* Phase 15: periodic load balancing.  Called from the tick path every
+ * ~1s (100 ticks): if the busiest online CPU has >=2 more runnable
+ * threads than us, migrate one READY thread over.  Uses thread_migrate()
+ * (strict READY-only) so no extra locking protocol is needed. */
+void scheduler_rebalance(void) {
+    struct runqueue *rq = rq_current();
+    if (!rq || cpu_count() < 2)
+        return;
+    unsigned my_load = (unsigned)rq->active->nr_active +
+                       (unsigned)rq->expired->nr_active;
+    unsigned best_load = my_load;
+    struct runqueue *src = NULL;
+    for (unsigned i = 0; i < cpu_nr; i++) {
+        struct cpu *c = &cpus[i];
+        struct runqueue *r = c->runqueue;
+        if (!r || r == rq || c->state != CPU_ONLINE)
+            continue;
+        /* Prefer same-package victims to keep caches warm. */
+        unsigned load = (unsigned)r->active->nr_active +
+                        (unsigned)r->expired->nr_active;
+        if (load > best_load + 1) {
+            struct cpu *me = cpu_current();
+            int same_pkg = me && cpu_share_package(me, c);
+            if (!src || (same_pkg && best_load <= load)) {
+                best_load = load;
+                src = r;
+            } else if (!same_pkg && !cpu_share_package(cpu_current(), &cpus[src->cpu_id])) {
+                best_load = load;
+                src = r;
+            }
+        }
+    }
+    if (!src || best_load < my_load + 2)
+        return;
+    /* Pick the tail of the busiest queue (lowest prio victim first is
+     * fine; we scan top-down for a READY non-current thread). */
+    uint32_t sflags;
+    spin_lock_irqsave(&src->lock, &sflags);
+    thread_t *victim = NULL;
+    for (int p = 0; p < PRIO_ARRAY_BITS && !victim; p++) {
+        thread_t *head = src->active->queue[p];
+        if (!head)
+            continue;
+        thread_t *t = head;
+        do {
+            if (t != src->current && t->state == THREAD_READY) {
+                victim = t;
+                break;
+            }
+            t = t->next;
+        } while (t != head);
+    }
+    spin_unlock_irqrestore(&src->lock, sflags);
+    if (victim)
+        (void)thread_migrate(victim, rq->cpu_id);
+}
+
 void *scheduler_switch(registers_t *r) {
     /* No nested interrupts while the switch is in flight: a tick landing
      * between context_switch() and the stub's stack swap would write
@@ -431,6 +488,17 @@ void *scheduler_switch(registers_t *r) {
      * path always switches, so it may consume the flag too. */
     if (int_no == 32)
         cpu->arch.need_resched = 0;
+
+    /* ~1s periodic rebalance on each CPU's tick (lock-free, before rq
+     * lock: rebalance takes other rq locks via thread_migrate). */
+    if (int_no == 32) {
+        static unsigned rebalance_ctr[CPU_MAX];
+        unsigned rid = rq->cpu_id;
+        if (rid < CPU_MAX && ++rebalance_ctr[rid] >= 100) {
+            rebalance_ctr[rid] = 0;
+            scheduler_rebalance();
+        }
+    }
 
     if (rq->active->nr_active <= 0)
         rq_steal(rq);

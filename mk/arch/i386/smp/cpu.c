@@ -34,10 +34,19 @@
  * linkable; real per-CPU support is amd64/arm64 only. */
 #include "cpu.h"
 
+struct cpu *arch_cpu_current(void) {
+    return &cpus[0];
+}
+
+void ipi_init(void) {
+    /* No LAPIC IPI on i386 UP — cpu_send_ipi() is a pending-bit-only
+     * no-op; handlers run on next tick via need_resched. */
+}
+
 int arch_cpu_discover(void) {
     cpus[0].id = 0;
-    cpus[0].hw_id = 0;
     cpus[0].arch.apic_id = 0;
+    cpu_topo_decode_apic(&cpus[0], 0);
     return 1;
 }
 

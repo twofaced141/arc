@@ -37,6 +37,8 @@
 #include "debug.h"
 #include "fdt.h"
 #include "platform.h"
+#include "spinlock.h"
+#include "cpu.h"
 
 /* PCI ECAM base discovered from FDT (extern from main.c). */
 extern uint64_t pci_ecam_base;
@@ -95,7 +97,10 @@ extern uint64_t pci_ecam_size;
 #define UART_BASE arm64_uart_base
 
 static page_directory_t *kernel_l1;
-static page_directory_t *current_l1;
+/* Per-CPU active L1 (SMP): each CPU runs its own TTBR0 and the
+ * fault/walk paths must use that CPU's directory.  Indexed by cpu id;
+ * falls back to slot 0 before cpu_init(). */
+static page_directory_t *current_l1[CPU_MAX];
 static page_directory_t *initial_l0;
 
 static int mmu_on;
@@ -277,7 +282,8 @@ void vmm_init(void) {
     debug_print("vmm: MMU enabled!\n");
 
     kernel_l1 = initial_l0;
-    current_l1 = initial_l0;
+    for (int i = 0; i < CPU_MAX; i++)
+        current_l1[i] = initial_l0;
     mmu_on = 1;
 
     debug_print("vmm: init done\n");
@@ -367,6 +373,13 @@ page_directory_t *vmm_create_directory(void) {
     return l0;
 }
 
+static inline unsigned vmm_cpu_id(void) {
+    struct cpu *c = cpu_current();
+    if (c && c->id < (unsigned)CPU_MAX)
+        return c->id;
+    return 0;
+}
+
 void vmm_switch_directory(page_directory_t *dir) {
     if (!dir) return;
 
@@ -378,11 +391,57 @@ void vmm_switch_directory(page_directory_t *dir) {
                          "tlbi vmalle1is\n\t"
                          "dsb ish\n\t"
                          "isb" : : "r"(ttbr0));
-    current_l1 = dir;
+    current_l1[vmm_cpu_id()] = dir;
 }
 
 void vmm_free_directory(page_directory_t *dir) {
-    (void)dir;
+    if (!dir || dir == kernel_l1 || dir == initial_l0)
+        return;
+    /* Only L0[0]/user_l1 is private; everything else is shared with
+     * the boot tables (same table pointers).  For user PTEs: skip
+     * read-only pages — they are either COW-shared with the parent
+     * (fork marks parent writable pages RO) or genuinely read-only
+     * segments; freeing their phys would corrupt the other process
+     * (same policy as amd64, which skips VMM_COW). */
+    if (!(dir->entries[0] & DESC_VALID))
+        goto free_l0;
+    page_directory_t *user_l1 =
+        (page_directory_t *)(uintptr_t)(dir->entries[0] & ADDR_MASK);
+    for (int l1i = 0; l1i < 512; l1i++) {
+        if (!(user_l1->entries[l1i] & DESC_VALID))
+            continue;
+        if (!(user_l1->entries[l1i] & DESC_TABLE))
+            continue;
+        /* Shared kernel/device slots (outside USER_L2_MIN..MAX) use the
+         * same table pointers as boot — never free them. */
+        if (l1i < USER_L2_MIN || l1i > USER_L2_MAX)
+            continue;
+        page_directory_t *l2 =
+            (page_directory_t *)(uintptr_t)(user_l1->entries[l1i] & ADDR_MASK);
+        for (int l2i = 0; l2i < 512; l2i++) {
+            if (!(l2->entries[l2i] & DESC_VALID))
+                continue;
+            if (!(l2->entries[l2i] & DESC_TABLE))
+                continue;
+            page_directory_t *l3 =
+                (page_directory_t *)(uintptr_t)(l2->entries[l2i] & ADDR_MASK);
+            for (int l3i = 0; l3i < 512; l3i++) {
+                uint64_t pte = l3->entries[l3i];
+                if (!(pte & DESC_VALID) || !(pte & DESC_PAGE))
+                    continue;
+                if (!(pte & ATTR_AP_USER))
+                    continue;
+                if (pte & ATTR_AP_RO)
+                    continue;  /* COW-shared or RO segment */
+                pmm_free_page((void *)(uintptr_t)(pte & ADDR_MASK));
+            }
+            pmm_free_page(l3);
+        }
+        pmm_free_page(l2);
+    }
+    pmm_free_page(user_l1);
+free_l0:
+    pmm_free_page(dir);
 }
 
 /* ---- PCI ECAM mapping ---- */
@@ -452,7 +511,10 @@ int vmm_map_pci_ecam(void) {
 }
 
 page_directory_t *vmm_get_current_directory(void) {
-    return current_l1;
+    struct cpu *c = cpu_current();
+    if (c && c->id < (unsigned)CPU_MAX && current_l1[c->id])
+        return current_l1[c->id];
+    return current_l1[0] ? current_l1[0] : kernel_l1;
 }
 
 page_directory_t *vmm_get_kernel_directory(void) {
@@ -671,6 +733,7 @@ extern char __heap_end[];
 static heap_block_t *heap_base;
 static heap_block_t *heap_free_list;
 static int heap_initialized;
+static spinlock_t heap_lock = SPINLOCK_INIT;
 
 static void heap_init(void) {
     heap_base = (heap_block_t *)__heap_start;
@@ -685,6 +748,8 @@ static void heap_init(void) {
 void *kmalloc(uint32_t size) {
     if (size == 0) return NULL;
 
+    uint32_t flags;
+    spin_lock_irqsave(&heap_lock, &flags);
     if (!heap_initialized) heap_init();
 
     size = (size + 3) & ~3;
@@ -715,16 +780,20 @@ void *kmalloc(uint32_t size) {
                 prev->next = block->next;
             else
                 heap_free_list = block->next;
+            spin_unlock_irqrestore(&heap_lock, flags);
             memset((uint8_t *)block + sizeof(heap_block_t), 0, size);
             return (void *)((uint8_t *)block + sizeof(heap_block_t));
         }
         prev = block;
         block = block->next;
     }
+    spin_unlock_irqrestore(&heap_lock, flags);
     return NULL;
 }
 
 void *kcalloc(uint32_t count, uint32_t size) {
+    if (count != 0 && size > 0xFFFFFFFFU / count)
+        return NULL;  /* overflow, matches amd64 */
     uint32_t total = count * size;
     void *p = kmalloc(total);
     if (p) memset(p, 0, total);
@@ -733,27 +802,50 @@ void *kcalloc(uint32_t count, uint32_t size) {
 
 void kfree(void *addr) {
     if (!addr) return;
+    uint32_t flags;
+    spin_lock_irqsave(&heap_lock, &flags);
     heap_block_t *block = (heap_block_t *)((uint8_t *)addr - sizeof(heap_block_t));
-    if (block->magic != HEAP_MAGIC_USED) return;
+    if (block->magic != HEAP_MAGIC_USED) {
+        spin_unlock_irqrestore(&heap_lock, flags);
+        return;
+    }
     block->magic = HEAP_MAGIC_FREE;
     block->next = heap_free_list;
     heap_free_list = block;
+    spin_unlock_irqrestore(&heap_lock, flags);
+}
+
+/* Per-CPU TEMP slots (SMP): parallel COW faults on two CPUs must not
+ * share one mapping.  TEMP_BASE - id*PAGE, 32 slots max. */
+#define TEMP_BASE 0x00007FFFFFFFF000ULL
+#define TEMP_SLOTS_MAX 32
+
+static inline uint64_t vmm_temp_vaddr(void) {
+    unsigned id = vmm_cpu_id();
+    if (id >= TEMP_SLOTS_MAX)
+        id %= TEMP_SLOTS_MAX;
+    return TEMP_BASE - (uint64_t)id * 0x1000ULL;
 }
 
 void *vmm_temp_map(uint64_t phys) {
-    if (vmm_map_page(current_l1 ? current_l1 : kernel_l1, phys, TEMP_VADDR, VMM_PRESENT | VMM_WRITABLE) < 0) {
+    page_directory_t *dir = vmm_get_current_directory();
+    uint64_t vaddr = vmm_temp_vaddr();
+    if (vmm_map_page(dir, phys, vaddr, VMM_PRESENT | VMM_WRITABLE) < 0) {
         return NULL;
     }
-    return (void *)TEMP_VADDR;
+    return (void *)(uintptr_t)vaddr;
 }
 
 void vmm_temp_unmap(void) {
-    vmm_unmap_page(current_l1 ? current_l1 : kernel_l1, TEMP_VADDR);
+    page_directory_t *dir = vmm_get_current_directory();
+    vmm_unmap_page(dir, vmm_temp_vaddr());
 }
 
 /* ---- User copy ---- */
-/* Validate a user range without touching it (see amd64 vmm.c). */
+/* Validate a user range without touching it (matches amd64: COW pages
+ * count as writable — the fault path breaks them lazily). */
 int user_range_ok(const void *uaddr, uint32_t size, int write) {
+    (void)write;
     if (size == 0) return 1;
     if (!uaddr) return 0;
     page_directory_t *dir = vmm_get_current_directory();
@@ -762,8 +854,6 @@ int user_range_ok(const void *uaddr, uint32_t size, int write) {
         uint64_t *pte = walk_pt(dir, vaddr, 0);
         if (!pte || !(*pte & DESC_VALID) || !(*pte & ATTR_AP_USER))
             return 0;
-        if (write && ((*pte) & ATTR_AP_RO))
-            return 0;   /* arm64 COW handled by fault path */
         uint32_t chunk = PAGE_SIZE - (vaddr & 0xFFF);
         if (chunk > size - offset) chunk = size - offset;
         offset += chunk;

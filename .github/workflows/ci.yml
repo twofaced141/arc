@@ -26,6 +26,9 @@ jobs:
       - name: QEMU boot smoke test
         run: tools/qa/qemu-smoke.sh amd64
 
+      - name: QEMU SMP test (4 CPUs)
+        run: tools/qa/qemu-smp.sh amd64 4
+
   # Experimental arch — must still build; boot covered by amd64 disk flow.
   i386:
     runs-on: ubuntu-latest
@@ -62,3 +65,6 @@ jobs:
 
       - name: QEMU boot smoke test (virt)
         run: tools/qa/qemu-smoke.sh arm64
+
+      - name: QEMU SMP test (virt, 4 CPUs)
+        run: tools/qa/qemu-smp.sh arm64 4

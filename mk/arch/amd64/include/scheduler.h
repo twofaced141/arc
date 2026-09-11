@@ -89,6 +89,10 @@ int thread_migrate(thread_t *thread, unsigned target_cpu);
 /* Dump per-CPU runqueue load (for load-balancing verification). */
 void sched_dump_stats(void);
 
+/* Periodic load balancing (Phase 15): migrate one thread from the
+ * busiest CPU when imbalance >= 2.  Called from the tick path. */
+void scheduler_rebalance(void);
+
 /* Yield the CPU from kernel-thread context (defined in interrupts.s) */
 void thread_yield(void);
 

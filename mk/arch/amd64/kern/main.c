@@ -419,6 +419,8 @@ void kernel_main(struct arc_boot_info *boot) {
     if (cpu_count() > 1) {
         sched_dump_stats();
     }
+    cpu_dump_stats();
+    (void)smp_selftest();
 
     log_print(LOG_LEVEL_DEBUG, "arc: interrupts enabled\n");
     __asm__ __volatile__("sti");

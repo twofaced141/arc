@@ -112,6 +112,15 @@ static void apic_delay_us(unsigned us) {
     }
 }
 
+void lapic_delay_us(unsigned us) {
+    apic_delay_us(us);
+}
+
+void lapic_delay_ms(unsigned ms) {
+    while (ms--)
+        apic_delay_us(1000);
+}
+
 /* Calibrate the LAPIC timer bus frequency with a 10 ms one-shot and
  * program a periodic 100 Hz tick on vector 32 (same vector as the
  * BSP's PIT, so the shared IRQ0 handler + scheduler tick logic just
@@ -142,7 +151,43 @@ void lapic_timer_percpu_init(void) {
 #define ICR_PENDING         (1 << 12)
 #define ICR_LEVEL_ASSERT    (1 << 14)
 
+static int lapic_x2apic_enabled = -1;
+
+static inline uint64_t rdmsr64(uint32_t msr) {
+    uint32_t lo, hi;
+    __asm__ __volatile__("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+static inline void wrmsr64(uint32_t msr, uint64_t v) {
+    __asm__ __volatile__("wrmsr" : : "c"(msr),
+                         "a"((uint32_t)v), "d"((uint32_t)(v >> 32)));
+}
+
+/* x2APIC if CPUID.1:ECX[21] and MSR APIC_BASE[10..11]==11b (enabled+x2). */
+int lapic_is_x2apic(void) {
+    if (lapic_x2apic_enabled >= 0)
+        return lapic_x2apic_enabled;
+    uint32_t a, b, c, d;
+    __asm__ __volatile__("cpuid"
+                         : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
+                         : "a"(1), "c"(0));
+    if (!(c & (1u << 21))) {
+        lapic_x2apic_enabled = 0;
+        return 0;
+    }
+    uint64_t base = rdmsr64(0x1B);
+    lapic_x2apic_enabled = ((base & 0xC00) == 0xC00) ? 1 : 0;
+    return lapic_x2apic_enabled;
+}
+
 static void lapic_send_icr(uint32_t apic_id, uint32_t icr) {
+    if (lapic_is_x2apic() && apic_id >= 256) {
+        /* x2APIC MSR 0x830: [63:32]=dest, [7:0]=vector etc. */
+        uint64_t v = ((uint64_t)apic_id << 32) | icr;
+        wrmsr64(0x830, v);
+        return;
+    }
     lapic_write(LAPIC_REG_ICR1, apic_id << 24);        /* physical dest */
     lapic_write(LAPIC_REG_ICR0, icr);
     while (lapic_read(LAPIC_REG_ICR0) & ICR_PENDING)
@@ -151,6 +196,11 @@ static void lapic_send_icr(uint32_t apic_id, uint32_t icr) {
 
 /* Fixed delivery: used for the generic IPI vector. */
 void lapic_send_ipi(uint32_t apic_id, uint8_t vector) {
+    if (lapic_is_x2apic()) {
+        uint64_t v = ((uint64_t)apic_id << 32) | ICR_DELIVERY_FIXED | vector;
+        wrmsr64(0x830, v);
+        return;
+    }
     lapic_send_icr(apic_id, ICR_DELIVERY_FIXED | vector);
 }
 

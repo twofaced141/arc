@@ -85,6 +85,9 @@ int thread_migrate(thread_t *thread, unsigned target_cpu);
 /* Dump per-CPU runqueue load. */
 void sched_dump_stats(void);
 
+/* Periodic load balancing (Phase 15). */
+void scheduler_rebalance(void);
+
 void thread_yield(void);
 
 #endif

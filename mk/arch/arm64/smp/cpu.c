@@ -50,11 +50,11 @@
 /* DTB pointer saved by startup.s before BSS clear. */
 extern uint64_t boot_dtb_ptr;
 
-/* GIC v2 SGI: ID 16 is our generic IPI (16-31 are free SGIs). */
-#define IPI_SGI_ID   16
-#define GICD_SGIR    (*(volatile uint32_t *)(uintptr_t)(GICD_BASE + 0xF00))
-#define GICD_SGIR_NSATT   (1 << 15)
-#define GICD_SGIR_TARGET(x)  (((x) & 0xFF) << 16)
+/* Generic IPI uses SGI 15 (SGIs are IDs 0-15; 16-31 are PPIs and
+ * cannot be generated via SGIR/ICC_SGI1R — the old ID 16 silently
+ * truncated to SGI 0 while the handler listened on 16, so no IPI was
+ * ever delivered).  Delivery goes through gic_send_sgi(). */
+#define IPI_SGI_ID   15
 
 /* ------------------------------------------------------------------ */
 /* Phase 1: discovery from Device Tree                                 */
@@ -72,21 +72,27 @@ int arch_cpu_discover(void) {
         /* No DTB / no /cpus: single-CPU fallback with the real MPIDR. */
         uint64_t mpidr;
         __asm__ __volatile__("mrs %0, mpidr_el1" : "=r"(mpidr));
+        /* Mask off MT/RES bits, keep full Aff2:Aff1:Aff0. */
+        mpidr &= 0x00FFFFFFULL;
         cpus[0].id = 0;
-        cpus[0].hw_id = (unsigned)(mpidr & 0xFF);
         cpus[0].arch.mpidr = mpidr;
+        cpu_topo_decode_mpidr(&cpus[0], mpidr);
         uart_print("smp: no DTB cpus, fallback 1 cpu\n");
         return 1;
     }
 
+    /* NOTE: fdt_get_cpus() skips status=disabled nodes (see fdt.c).
+     * Keep the full MPIDR — truncating to &0xFF aliases Aff1/Aff2 and
+     * breaks SGI targeting and topology on clustered systems. */
     for (int i = 0; i < n; i++) {
+        uint64_t mpidr = mpidrs[i] & 0x00FFFFFFULL;
         cpus[i].id = (unsigned)i;
-        cpus[i].hw_id = (unsigned)(mpidrs[i] & 0xFF);
-        cpus[i].arch.mpidr = mpidrs[i];
+        cpus[i].arch.mpidr = mpidr;
+        cpu_topo_decode_mpidr(&cpus[i], mpidr);
         uart_print("smp: cpu ");
         uart_print_hex64(i);
         uart_print(" -> mpidr ");
-        uart_print_hex64(mpidrs[i]);
+        uart_print_hex64(mpidr);
         uart_print("\n");
     }
     return n;
@@ -118,19 +124,25 @@ int arch_cpu_start(struct cpu *cpu) {
     if (!cpu)
         return -1;
 
-    /* Allocate per-CPU kernel stack (identity-mapped) */
-    void *stack = pmm_alloc_pages(THREAD_KSTACK_SIZE / PAGE_SIZE);
+    /* Reuse the suspended stack on hotplug restart; allocate once. */
+    void *stack = cpu->kernel_stack;
     if (!stack) {
-        uart_print("smp: no stack for cpu ");
-        uart_print_hex64(cpu->id);
-        uart_print("\n");
-        return -1;
+        stack = pmm_alloc_pages(THREAD_KSTACK_SIZE / PAGE_SIZE);
+        if (!stack) {
+            uart_print("smp: no stack for cpu ");
+            uart_print_hex64(cpu->id);
+            uart_print("\n");
+            return -1;
+        }
+        cpu->kernel_stack = stack;
     }
     uint64_t stack_top = (uint64_t)(uintptr_t)stack + THREAD_KSTACK_SIZE;
-    cpu->kernel_stack = stack;
     cpu->arch.stack_base = stack_top;
 
-    /* Publish for secondary entry (MMU off) */
+    /* Publish for secondary entry (MMU off).  cpu_start_all() is
+     * sequential, so the ap_* singletons are safe: the AP copies
+     * stack/cpu/TTBR to registers before the BSP starts the next CPU.
+     * Parallel cpu_start() callers must serialize externally. */
     ap_stack = stack_top;
     ap_cpu = cpu;
     page_directory_t *kdir = vmm_get_kernel_directory();
@@ -153,8 +165,10 @@ int arch_cpu_start(struct cpu *cpu) {
     int ret = psci_cpu_on(cpu->arch.mpidr, entry, (uint64_t)(uintptr_t)cpu);
     if (ret != 0) {
         uart_print("smp: PSCI CPU_ON failed: ");
+        uart_print(psci_strerror(ret));
+        uart_print(" (");
         uart_print_hex64((uint64_t)(uint32_t)ret);
-        uart_print("\n");
+        uart_print(")\n");
         return -1;
     }
     return 0;
@@ -188,7 +202,13 @@ void arch_cpu_mark_pending(struct cpu *cpu, unsigned type) {
 
 void arch_cpu_send_ipi(struct cpu *cpu, unsigned type) {
     (void)type;
-    GICD_SGIR = GICD_SGIR_NSATT | GICD_SGIR_TARGET(cpu->hw_id) | IPI_SGI_ID;
+    if (!cpu)
+        return;
+    /* GICv2 SGIR can only target Aff0 (8 CPUs, single cluster).
+     * gic_send_sgi() uses ICC_SGI1R on GICv3 systems and falls back
+     * to SGIR with an Aff0 check otherwise. */
+    extern void gic_send_sgi(uint64_t mpidr, unsigned sgi);
+    gic_send_sgi(cpu->arch.mpidr, IPI_SGI_ID);
 }
 
 /* Acquire-exchange of the pending-IPI mask.  GCC emits a libatomic
@@ -226,7 +246,7 @@ static void ipi_irq_handler(registers_t *r) {
 
 void ipi_init(void) {
     register_interrupt_handler(IPI_SGI_ID, ipi_irq_handler);
-    uart_print("smp: IPI SGI 16 installed\n");
+    uart_print("smp: IPI SGI 15 installed\n");
 }
 
 /* ------------------------------------------------------------------ */

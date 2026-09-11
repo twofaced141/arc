@@ -99,6 +99,7 @@ typedef struct {
 #define MADT_ENTRY_IO_SAPIC         6
 #define MADT_ENTRY_LOCAL_SAPIC      7
 #define MADT_ENTRY_PLATFORM_IS      8
+#define MADT_ENTRY_X2APIC           9   /* Processor Local x2APIC */
 #define MADT_ENTRY_GICC             10  /* Generic Interrupt Controller (ARM) */
 
 typedef struct {
@@ -208,8 +209,8 @@ typedef struct {
 
     int      lapic_count;
     struct {
-        uint8_t  apic_id;
-        uint8_t  flags;         /* bit 0 = enabled */
+        uint32_t apic_id;       /* full APIC/x2APIC ID (never truncated) */
+        uint32_t flags;         /* bit 0 = enabled, bit 1 = online capable */
     } lapics[64];
 
     /* FADT / DSDT */

@@ -37,9 +37,9 @@
 
 struct cpu;
 
-/* Per-CPU arch state (i386).  The kernel is not (yet) per-CPU aware on
- * i386 — the fields exist so generic code compiles; cpu_current()
- * always returns CPU 0. */
+/* Per-CPU arch state (i386).  UP-only: a single CPU, no AP bringup.
+ * cpu_current() always returns &cpus[0] — the old %fs:0 load read
+ * garbage because FS.base is never programmed on i386. */
 struct arch_cpu {
     struct cpu *self;
     uint32_t apic_id;
@@ -48,11 +48,7 @@ struct arch_cpu {
     uint64_t stack_base;
 };
 
-static inline struct cpu *arch_cpu_current(void) {
-    struct cpu *self;
-    __asm__ __volatile__("movl %%fs:0, %0" : "=r"(self));
-    return self;
-}
+struct cpu *arch_cpu_current(void);
 
 static inline void arch_cpu_relax(void) {
     __asm__ __volatile__("pause");

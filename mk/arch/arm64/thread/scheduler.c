@@ -366,6 +366,16 @@ void *scheduler_switch(registers_t *r) {
      * cross-CPU wakeups waited for the next tick.  Both switch points
      * below consume it instead (any preemption satisfies it). */
 
+    /* ~1s periodic rebalance (lock-free, before rq lock). */
+    {
+        static unsigned rebalance_ctr[CPU_MAX];
+        unsigned rid = rq->cpu_id;
+        if (rid < CPU_MAX && ++rebalance_ctr[rid] >= 100) {
+            rebalance_ctr[rid] = 0;
+            scheduler_rebalance();
+        }
+    }
+
     if (rq->active->nr_active == 0)
         rq_steal(rq);
 
@@ -541,6 +551,11 @@ void scheduler_add_thread(thread_t *thread) {
     thread->rq = rq;
     prio_array_enqueue(rq, rq->active, thread, thread->prio);
     spin_unlock_irqrestore(&rq->lock, flags);
+
+    /* Nudge the target CPU if it is not us: an idle CPU sits in wfi
+     * and only re-evaluates its queue on the next tick or IPI. */
+    if (rq != rq_current() && cpu_online(cpu_get(rq->cpu_id)))
+        cpu_send_ipi(cpu_get(rq->cpu_id), IPI_RESCHEDULE);
 }
 
 void scheduler_remove_thread(thread_t *thread) {
@@ -575,6 +590,10 @@ void scheduler_unblock_thread(thread_t *thread) {
         cpu_send_ipi(cpu_get(rq->cpu_id), IPI_RESCHEDULE);
 }
 
+/* Strict READY-only migrate (matches amd64): a RUNNING thread is live
+ * on another CPU's stack, a BLOCKED thread has pending wake bookkeeping
+ * — moving either corrupts the scheduler.  Re-checked under the source
+ * lock against dispatch races. */
 int thread_migrate(thread_t *thread, unsigned target_cpu) {
     if (!thread) return -1;
     if (target_cpu >= cpu_nr || target_cpu >= CPU_MAX) return -1;
@@ -588,20 +607,17 @@ int thread_migrate(thread_t *thread, unsigned target_cpu) {
     if (!source_rq) return -1;
     if (source_rq == target_rq) return 0;
 
-    if (thread->state == THREAD_RUNNING) {
-        struct runqueue *cur_rq = rq_current();
-        if (cur_rq && cur_rq->current == thread)
-            return -1;
-    }
-
-    if (thread->state == THREAD_BLOCKED && thread->sleep_until)
+    if (thread->state != THREAD_READY)
         return -1;
 
     uint32_t sflags;
     spin_lock_irqsave(&source_rq->lock, &sflags);
-    if (thread->array) {
-        prio_array_dequeue(source_rq, thread->array, thread, thread->prio);
+    if (thread->state != THREAD_READY || source_rq->current == thread ||
+        !thread->array) {
+        spin_unlock_irqrestore(&source_rq->lock, sflags);
+        return -1;
     }
+    prio_array_dequeue(source_rq, thread->array, thread, thread->prio);
     thread->state = THREAD_READY;
     thread->rq = target_rq;
     spin_unlock_irqrestore(&source_rq->lock, sflags);
@@ -630,9 +646,64 @@ void sched_dump_stats(void) {
             uart_print("sched: cpu no rq\n");
             continue;
         }
-        uart_print("sched: cpu load\n");
-        (void)rq;
+        uart_print("sched: cpu");
+        uart_print_hex64(i);
+        uart_print(" load ");
+        uart_print_hex64(rq->active ? (uint64_t)rq->active->nr_active : 0);
+        uart_print("+");
+        uart_print_hex64(rq->expired ? (uint64_t)rq->expired->nr_active : 0);
+        uart_print("+");
+        uart_print_hex64((uint64_t)rq->sleep_count);
+        uart_print(" cur tid ");
+        uart_print_hex64(rq->current ? (uint64_t)rq->current->tid : 9999);
+        uart_print("\n");
     }
+}
+
+extern int thread_migrate(thread_t *thread, unsigned target_cpu);
+
+/* Phase 15: periodic rebalance (matches amd64 policy). */
+void scheduler_rebalance(void) {
+    struct runqueue *rq = rq_current();
+    if (!rq || cpu_count() < 2)
+        return;
+    unsigned my_load = (unsigned)rq->active->nr_active +
+                       (unsigned)rq->expired->nr_active;
+    struct runqueue *src = NULL;
+    unsigned best_load = my_load;
+    for (unsigned i = 0; i < cpu_nr; i++) {
+        struct cpu *c = &cpus[i];
+        struct runqueue *r = c->runqueue;
+        if (!r || r == rq || c->state != CPU_ONLINE)
+            continue;
+        unsigned load = (unsigned)r->active->nr_active +
+                        (unsigned)r->expired->nr_active;
+        if (load > best_load + 1) {
+            best_load = load;
+            src = r;
+        }
+    }
+    if (!src || best_load < my_load + 2)
+        return;
+    uint32_t sflags;
+    spin_lock_irqsave(&src->lock, &sflags);
+    thread_t *victim = NULL;
+    for (int p = 0; p < PRIO_ARRAY_BITS && !victim; p++) {
+        thread_t *head = src->active->queue[p];
+        if (!head)
+            continue;
+        thread_t *t = head;
+        do {
+            if (t != src->current && t->state == THREAD_READY) {
+                victim = t;
+                break;
+            }
+            t = t->next;
+        } while (t != head);
+    }
+    spin_unlock_irqrestore(&src->lock, sflags);
+    if (victim)
+        (void)thread_migrate(victim, rq->cpu_id);
 }
 
 void scheduler_set_nice(thread_t *t, int nice) {

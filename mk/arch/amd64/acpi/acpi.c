@@ -54,11 +54,26 @@ acpi_info_t acpi_info;
 static const void *phys_ptr(uint64_t phys, uint32_t size) {
     if (phys < IDENTITY_MAP_SIZE && phys + size <= IDENTITY_MAP_SIZE)
         return (const void *)(KERNEL_BASE + phys);
-    return vmm_temp_map(phys);
+    /* vmm_temp_map() maps the containing page at the slot base; add the
+     * intra-page offset.  ACPI tables are <4K and SeaBIOS aligns them so
+     * they never straddle a page — assert single-page containment. */
+    uint64_t off = phys & 0xFFFULL;
+    if (off + size > 0x1000U) {
+        log_printf(LOG_LEVEL_ERROR,
+                   "acpi: table spans pages (phys=0x%llx size=%u), unsupported\r\n",
+                   (unsigned long long)phys, size);
+        return NULL;
+    }
+    void *base = vmm_temp_map(phys & ~0xFFFULL);
+    if (!base)
+        return NULL;
+    return (const void *)((uint8_t *)base + off);
 }
 
 static void phys_ptr_done(const void *ptr) {
     uint64_t addr = (uint64_t)ptr;
+    /* temp slots are page bases; an offset pointer still lies within the
+     * slot page (TEMP-32*PAGE .. TEMP+PAGE).  Unmap if outside identity. */
     if (addr < KERNEL_BASE || addr >= KERNEL_BASE + IDENTITY_MAP_SIZE)
         vmm_temp_unmap();
 }
@@ -158,65 +173,118 @@ static uint64_t find_table_in_sdt(uint64_t sdt_phys, const char *sig, int entry_
     int entry_count = (hdr_copy.length - sizeof(sdt_header_t)) / entry_size;
     uint32_t read_size = entry_count * entry_size;
 
+    {
+        char sdt_sig[5];
+        memcpy(sdt_sig, hdr_copy.signature, 4);
+        sdt_sig[4] = '\0';
+        log_printf(LOG_LEVEL_INFO, "acpi: SDT %s len=%u entries=%d\n",
+                   sdt_sig, hdr_copy.length, entry_count);
+    }
+
     uint64_t result = 0;
 
+    /* NOTE: phys_ptr() uses a single per-CPU temp slot — a nested
+     * phys_ptr() call remaps the same slot.  Copy the entry array to
+     * the stack first, release the mapping, then walk the copy. */
     if (entry_size == 8) {
         /* XSDT: 64-bit entries */
-        const uint64_t *entries = (const uint64_t *)phys_ptr(sdt_phys + sizeof(sdt_header_t), read_size);
-        if (!entries) return 0;
+        uint64_t xsdt_entries[64];
+        int ncopy = entry_count;
+        if (ncopy > 64)
+            ncopy = 64;
+        {
+            const uint64_t *entries =
+                (const uint64_t *)phys_ptr(sdt_phys + sizeof(sdt_header_t),
+                                           (uint32_t)ncopy * 8);
+            if (!entries) return 0;
+            memcpy(xsdt_entries, entries, (size_t)ncopy * 8);
+            phys_ptr_done(entries);
+        }
 
-        for (int i = 0; i < entry_count; i++) {
-            if (entries[i] == 0) continue;
+        for (int i = 0; i < ncopy; i++) {
+            if (xsdt_entries[i] == 0) continue;
 
-            const sdt_header_t *thdr = (const sdt_header_t *)phys_ptr(entries[i], sizeof(sdt_header_t));
+            const sdt_header_t *thdr =
+                (const sdt_header_t *)phys_ptr(xsdt_entries[i], sizeof(sdt_header_t));
             if (!thdr) continue;
 
             char sig_buf[5];
             memcpy(sig_buf, thdr->signature, 4);
             sig_buf[4] = '\0';
             phys_ptr_done(thdr);
+            log_printf(LOG_LEVEL_INFO, "acpi: XSDT[%d] %s\n", i, sig_buf);
 
             if (memcmp(sig_buf, sig, 4) == 0) {
-                result = entries[i];
+                result = xsdt_entries[i];
                 break;
             }
         }
-        phys_ptr_done(entries);
     } else {
         /* RSDT: 32-bit entries */
-        const uint32_t *entries = (const uint32_t *)phys_ptr(sdt_phys + sizeof(sdt_header_t), read_size);
-        if (!entries) return 0;
+        uint32_t rsdt_entries[64];
+        int ncopy = entry_count;
+        if (ncopy > 64)
+            ncopy = 64;
+        {
+            const uint32_t *entries =
+                (const uint32_t *)phys_ptr(sdt_phys + sizeof(sdt_header_t),
+                                           (uint32_t)ncopy * 4);
+            if (!entries) return 0;
+            memcpy(rsdt_entries, entries, (size_t)ncopy * 4);
+            phys_ptr_done(entries);
+        }
 
-        for (int i = 0; i < entry_count; i++) {
-            if (entries[i] == 0) continue;
+        for (int i = 0; i < ncopy; i++) {
+            if (rsdt_entries[i] == 0) continue;
 
-            const sdt_header_t *thdr = (const sdt_header_t *)phys_ptr(entries[i], sizeof(sdt_header_t));
+            const sdt_header_t *thdr =
+                (const sdt_header_t *)phys_ptr(rsdt_entries[i], sizeof(sdt_header_t));
             if (!thdr) continue;
 
             char sig_buf[5];
             memcpy(sig_buf, thdr->signature, 4);
             sig_buf[4] = '\0';
             phys_ptr_done(thdr);
+            log_printf(LOG_LEVEL_INFO, "acpi: RSDT[%d] %s @0x%x\n",
+                       i, sig_buf, rsdt_entries[i]);
 
             if (memcmp(sig_buf, sig, 4) == 0) {
-                result = entries[i];
+                result = rsdt_entries[i];
                 break;
             }
         }
-        phys_ptr_done(entries);
     }
 
     return result;
 }
 
 
-static void parse_madt(uint64_t madt_phys) {
-    const sdt_header_t *hdr = (const sdt_header_t *)phys_ptr(madt_phys, sizeof(sdt_header_t));
-    if (!hdr) return;
+/* Copy len bytes from physical memory to dest, one temp-mapped page
+ * at a time.  ACPI tables (MADT/FADT/DSDT) routinely span pages and a
+ * single temp slot cannot cover them.  Returns 0 on success. */
+static int acpi_copy_phys(uint64_t phys, void *dest, uint32_t len) {
+    uint8_t *d = (uint8_t *)dest;
+    while (len > 0) {
+        uint64_t page_off = phys & 0xFFFULL;
+        uint32_t chunk = 0x1000U - (uint32_t)page_off;
+        if (chunk > len)
+            chunk = len;
+        const uint8_t *p = (const uint8_t *)phys_ptr(phys, chunk);
+        if (!p)
+            return -1;
+        memcpy(d, p, chunk);
+        phys_ptr_done(p);
+        phys += chunk;
+        d += chunk;
+        len -= chunk;
+    }
+    return 0;
+}
 
+static void parse_madt(uint64_t madt_phys) {
     sdt_header_t hdr_copy;
-    memcpy(&hdr_copy, hdr, sizeof(sdt_header_t));
-    phys_ptr_done(hdr);
+    if (acpi_copy_phys(madt_phys, &hdr_copy, sizeof(hdr_copy)) < 0)
+        return;
 
     if (memcmp(hdr_copy.signature, MADT_SIGNATURE, 4) != 0) {
         log_print(LOG_LEVEL_ERROR, "acpi: MADT signature mismatch\r\n");
@@ -225,9 +293,15 @@ static void parse_madt(uint64_t madt_phys) {
 
     uint32_t madt_size = hdr_copy.length;
     if (madt_size < sizeof(madt_t)) return;
+    if (madt_size > 4096) {
+        log_printf(LOG_LEVEL_ERROR, "acpi: MADT too large (%u)\r\n", madt_size);
+        return;
+    }
 
-    const madt_t *madt = (const madt_t *)phys_ptr(madt_phys, madt_size);
-    if (!madt) return;
+    static uint8_t madt_buf[4096];
+    if (acpi_copy_phys(madt_phys, madt_buf, madt_size) < 0)
+        return;
+    const madt_t *madt = (const madt_t *)madt_buf;
 
     uint32_t lapic_addr = madt->local_apic_addr;
     int entry_offset = sizeof(madt_t);
@@ -268,9 +342,28 @@ static void parse_madt(uint64_t madt_phys) {
             if (len >= 8 && acpi_info.lapic_count < 64) {
                 uint8_t apic_id = ((const uint8_t *)mentry)[3];
                 uint32_t lapic_flags = *(const uint32_t *)(((const uint8_t *)mentry) + 4);
+                /* ACPI: bit0 = enabled, bit1 = online capable.
+                 * Count if either is set (Linux behaviour). */
+                if (!(lapic_flags & 0x3))
+                    break;
                 int idx = acpi_info.lapic_count++;
                 acpi_info.lapics[idx].apic_id = apic_id;
-                acpi_info.lapics[idx].flags   = (uint8_t)lapic_flags;
+                acpi_info.lapics[idx].flags   = lapic_flags;
+            }
+            break;
+        }
+        case MADT_ENTRY_X2APIC: {
+            /* Layout: type(1), len(1), reserved(2), x2apic_id(4), flags(4), acpi_id(4) */
+            if (len >= 16 && acpi_info.lapic_count < 64) {
+                uint32_t x2id = *(const uint32_t *)(((const uint8_t *)mentry) + 4);
+                uint32_t x2flags = *(const uint32_t *)(((const uint8_t *)mentry) + 8);
+                if (!(x2flags & 0x3))
+                    break;
+                int idx = acpi_info.lapic_count++;
+                acpi_info.lapics[idx].apic_id = x2id;
+                acpi_info.lapics[idx].flags   = x2flags;
+                log_printf(LOG_LEVEL_DEBUG, "acpi: x2APIC id=%u flags=0x%x\r\n",
+                           x2id, x2flags);
             }
             break;
         }
@@ -287,7 +380,7 @@ static void parse_madt(uint64_t madt_phys) {
         entry_offset += len;
     }
 
-    phys_ptr_done(madt);
+    /* madt is a stack copy (acpi_copy_phys) — nothing to unmap. */
 
     /* Store parsed info (acpi_info already zeroed in acpi_init) */
     acpi_info.valid           = 1;
@@ -301,12 +394,9 @@ static void parse_madt(uint64_t madt_phys) {
 
 
 static void parse_fadt(uint64_t fadt_phys) {
-    const sdt_header_t *hdr = (const sdt_header_t *)phys_ptr(fadt_phys, sizeof(sdt_header_t));
-    if (!hdr) return;
-
     sdt_header_t hdr_copy;
-    memcpy(&hdr_copy, hdr, sizeof(sdt_header_t));
-    phys_ptr_done(hdr);
+    if (acpi_copy_phys(fadt_phys, &hdr_copy, sizeof(hdr_copy)) < 0)
+        return;
 
     if (memcmp(hdr_copy.signature, FADT_SIGNATURE, 4) != 0)
         return;
@@ -314,9 +404,15 @@ static void parse_fadt(uint64_t fadt_phys) {
     uint32_t fadt_len = hdr_copy.length;
     if (fadt_len < sizeof(fadt_t))
         return;
+    if (fadt_len > 4096) {
+        log_printf(LOG_LEVEL_ERROR, "acpi: FADT too large (%u)\r\n", fadt_len);
+        return;
+    }
 
-    const fadt_t *fadt = (const fadt_t *)phys_ptr(fadt_phys, fadt_len);
-    if (!fadt) return;
+    static uint8_t fadt_buf[4096];
+    if (acpi_copy_phys(fadt_phys, fadt_buf, fadt_len) < 0)
+        return;
+    const fadt_t *fadt = (const fadt_t *)fadt_buf;
 
     /* DSDT address — prefer 64-bit if available */
     if (fadt->x_dsdt != 0) {
@@ -365,7 +461,7 @@ static void parse_fadt(uint64_t fadt_phys) {
         }
     }
 
-    phys_ptr_done(fadt);
+    /* fadt is a stack copy — nothing to unmap. */
 
     log_printf(LOG_LEVEL_INFO, "acpi: FADT parsed DSDT=0x%x reset={reg=0x%lx,val=0x%x} pmtmr=0x%x/%u\r\n",
                  acpi_info.dsdt_addr,
@@ -393,9 +489,35 @@ static void probe_dsdt(void) {
 
     acpi_info.dsdt_length = hdr_copy.length;
 
-    if (acpi_checksum(hdr, hdr_copy.length) != 0) {
-        log_print(LOG_LEVEL_ERROR, "acpi: DSDT checksum failed\r\n");
-        return;
+    /* hdr was released by phys_ptr_done() above — checksum the table
+     * page-by-page straight from physical memory instead of the
+     * dangling pointer.  DSDT/AML blobs are tens of KB and always span
+     * pages, so a single temp mapping cannot cover them. */
+    {
+        uint8_t sum = 0;
+        uint32_t remaining = hdr_copy.length;
+        uint64_t cur = dsdt_phys;
+        int ok = 1;
+        while (remaining > 0) {
+            uint64_t page_off = cur & 0xFFFULL;
+            uint32_t chunk = 0x1000U - (uint32_t)page_off;
+            if (chunk > remaining)
+                chunk = remaining;
+            const uint8_t *p =
+                (const uint8_t *)phys_ptr(cur, chunk);
+            if (!p) { ok = 0; break; }
+            for (uint32_t i = 0; i < chunk; i++)
+                sum += p[i];
+            phys_ptr_done(p);
+            cur += chunk;
+            remaining -= chunk;
+        }
+        if (!ok)
+            return;
+        if (sum != 0) {
+            log_print(LOG_LEVEL_ERROR, "acpi: DSDT checksum failed\r\n");
+            return;
+        }
     }
 
     log_printf(LOG_LEVEL_DEBUG, "acpi: DSDT at 0x%lx length=%u\r\n",
