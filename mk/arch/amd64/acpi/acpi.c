@@ -49,10 +49,16 @@ acpi_info_t acpi_info;
 
 /* Map a physical address for reading. Returns a virtual pointer,
    or NULL if the address cannot be accessed.
-   LIMITATION: temp_map uses a single 4K slot — the caller must
+   LIMITATION: temp_map uses a single per-CPU 4K slot — the caller must
    finish reading before the next phys_ptr call. */
 static const void *phys_ptr(uint64_t phys, uint32_t size) {
-    if (phys < IDENTITY_MAP_SIZE && phys + size <= IDENTITY_MAP_SIZE)
+    if (size == 0)
+        return NULL;
+    /* Wrap-safe: a firmware phys near 2^64 must not wrap into low mem
+     * and alias the identity window. */
+    if (phys + size < phys)
+        return NULL;
+    if (phys + size <= IDENTITY_MAP_SIZE)
         return (const void *)(KERNEL_BASE + phys);
     /* vmm_temp_map() maps the containing page at the slot base; add the
      * intra-page offset.  ACPI tables are <4K and SeaBIOS aligns them so
@@ -109,13 +115,51 @@ static int rsdp_copy_from(uint64_t phys, rsdp_t *out) {
 
     if (r->revision >= 2) {
         uint32_t len = r->length;
-        if (len < sizeof(rsdp_t)) {
+        /* Real RSDPs are 36 bytes; bound the firmware-controlled
+         * length so the extended checksum below cannot walk off into
+         * unmapped memory (the mapping above covers sizeof only —
+         * checksumming len bytes through it would be an OOB read). */
+        if (len < sizeof(rsdp_t) || len > 256) {
             phys_ptr_done(r);
             return -1;
         }
-        if (acpi_checksum(r, len) != 0) {
+        if (len == sizeof(rsdp_t)) {
+            if (acpi_checksum(r, len) != 0) {
+                phys_ptr_done(r);
+                return -1;
+            }
+        } else {
+            /* Longer-than-known revision: release the single-slot
+             * mapping FIRST (a nested phys_ptr would remap the same
+             * slot and dangle r), then checksum page-by-page. */
             phys_ptr_done(r);
-            return -1;
+            uint8_t sum = 0;
+            uint32_t remaining = len;
+            uint64_t cur = phys;
+            while (remaining > 0) {
+                if (cur + 0x1000ULL < cur)
+                    return -1;
+                uint64_t page_off = cur & 0xFFFULL;
+                uint32_t chunk = 0x1000U - (uint32_t)page_off;
+                if (chunk > remaining)
+                    chunk = remaining;
+                if (cur + chunk < cur)
+                    return -1;
+                const uint8_t *p =
+                    (const uint8_t *)phys_ptr(cur, chunk);
+                if (!p) return -1;
+                for (uint32_t i = 0; i < chunk; i++)
+                    sum += p[i];
+                phys_ptr_done(p);
+                cur += chunk;
+                remaining -= chunk;
+            }
+            if (sum != 0)
+                return -1;
+            /* Re-map to copy out (length already validated). */
+            r = (const rsdp_t *)phys_ptr(phys, sizeof(rsdp_t));
+            if (!r)
+                return -1;
         }
     }
 
@@ -170,8 +214,15 @@ static uint64_t find_table_in_sdt(uint64_t sdt_phys, const char *sig, int entry_
         memcmp(hdr_copy.signature, "XSDT", 4) != 0)
         return 0;
 
+    /* Firmware-controlled length: reject underflow (length < header
+     * would wrap entry_count to billions) and absurd sizes. */
+    if (hdr_copy.length < sizeof(sdt_header_t) ||
+        hdr_copy.length > ACPI_MAX_DSDT_LEN)
+        return 0;
+    if (entry_size != 4 && entry_size != 8)
+        return 0;
+
     int entry_count = (hdr_copy.length - sizeof(sdt_header_t)) / entry_size;
-    uint32_t read_size = entry_count * entry_size;
 
     {
         char sdt_sig[5];
@@ -263,12 +314,18 @@ static uint64_t find_table_in_sdt(uint64_t sdt_phys, const char *sig, int entry_
  * at a time.  ACPI tables (MADT/FADT/DSDT) routinely span pages and a
  * single temp slot cannot cover them.  Returns 0 on success. */
 static int acpi_copy_phys(uint64_t phys, void *dest, uint32_t len) {
+    if (!dest) return -1;
+    if (len == 0) return 0;
     uint8_t *d = (uint8_t *)dest;
     while (len > 0) {
+        if (phys + 0x1000ULL < phys)
+            return -1;
         uint64_t page_off = phys & 0xFFFULL;
         uint32_t chunk = 0x1000U - (uint32_t)page_off;
         if (chunk > len)
             chunk = len;
+        if (phys + chunk < phys)
+            return -1;
         const uint8_t *p = (const uint8_t *)phys_ptr(phys, chunk);
         if (!p)
             return -1;
@@ -318,6 +375,8 @@ static void parse_madt(uint64_t madt_phys) {
 
         switch (type) {
         case MADT_ENTRY_IO_APIC: {
+            if (len < sizeof(madt_ioapic_t))
+                break;
             const madt_ioapic_t *ioapic = (const madt_ioapic_t *)mentry;
             ioapic_addr     = ioapic->ioapic_addr;
             ioapic_gsi_base = ioapic->gsi_base;
@@ -326,6 +385,8 @@ static void parse_madt(uint64_t madt_phys) {
             break;
         }
         case MADT_ENTRY_ISO: {
+            if (len < sizeof(madt_iso_t))
+                break;
             const madt_iso_t *iso = (const madt_iso_t *)mentry;
             if (acpi_info.iso_count < 16) {
                 int idx = acpi_info.iso_count++;
@@ -475,6 +536,11 @@ static void probe_dsdt(void) {
     uint64_t dsdt_phys = acpi_info.x_dsdt ? acpi_info.x_dsdt : (uint64_t)acpi_info.dsdt_addr;
     if (!dsdt_phys) return;
 
+    /* Start clean: any failure below must leave dsdt_length == 0 so
+     * aml_init refuses to parse (previously a checksum failure left
+     * the stale length behind and the corrupt table was parsed). */
+    acpi_info.dsdt_length = 0;
+
     const sdt_header_t *hdr = (const sdt_header_t *)phys_ptr(dsdt_phys, sizeof(sdt_header_t));
     if (!hdr) return;
 
@@ -487,22 +553,37 @@ static void probe_dsdt(void) {
         return;
     }
 
-    acpi_info.dsdt_length = hdr_copy.length;
+    /* Firmware-controlled length: must clear the header, must fit the
+     * hardening cap, and must not wrap the address range (otherwise
+     * the checksum walk below would roam physical memory). */
+    if (hdr_copy.length <= sizeof(sdt_header_t) ||
+        hdr_copy.length > ACPI_MAX_DSDT_LEN) {
+        log_printf(LOG_LEVEL_ERROR, "acpi: insane DSDT length (%u)\r\n",
+                   hdr_copy.length);
+        return;
+    }
+    if (dsdt_phys + hdr_copy.length < dsdt_phys) {
+        log_print(LOG_LEVEL_ERROR, "acpi: DSDT range wraps\r\n");
+        return;
+    }
 
     /* hdr was released by phys_ptr_done() above — checksum the table
      * page-by-page straight from physical memory instead of the
      * dangling pointer.  DSDT/AML blobs are tens of KB and always span
-     * pages, so a single temp mapping cannot cover them. */
+     * pages, so a single temp mapping cannot cover them.  Length and
+     * range were validated above, so this walk is bounded. */
     {
         uint8_t sum = 0;
         uint32_t remaining = hdr_copy.length;
         uint64_t cur = dsdt_phys;
         int ok = 1;
         while (remaining > 0) {
+            if (cur + 0x1000ULL < cur) { ok = 0; break; }
             uint64_t page_off = cur & 0xFFFULL;
             uint32_t chunk = 0x1000U - (uint32_t)page_off;
             if (chunk > remaining)
                 chunk = remaining;
+            if (cur + chunk < cur) { ok = 0; break; }
             const uint8_t *p =
                 (const uint8_t *)phys_ptr(cur, chunk);
             if (!p) { ok = 0; break; }
@@ -519,6 +600,9 @@ static void probe_dsdt(void) {
             return;
         }
     }
+
+    /* Commit only after every check passed. */
+    acpi_info.dsdt_length = hdr_copy.length;
 
     log_printf(LOG_LEVEL_DEBUG, "acpi: DSDT at 0x%lx length=%u\r\n",
                  (unsigned long)dsdt_phys, acpi_info.dsdt_length);
@@ -615,12 +699,22 @@ int acpi_init(struct arc_boot_info *boot) {
         }
 
         if (found) {
-            acpi_info.s5_slp_typa = (uint8_t)s5_vals[0];
-            acpi_info.s5_slp_typb = (uint8_t)s5_vals[1];
+            /* SLP_TYPx is a 3-bit field (bits 12:10 of PM1_CNT).  A
+             * sloppy DSDT can carry wider values; writing them raw
+             * would set reserved PM1_CNT bits with chipset-undefined
+             * effects, so mask and warn. */
+            if (s5_vals[0] > 7 || s5_vals[1] > 7) {
+                log_printf(LOG_LEVEL_WARN,
+                           "acpi: _S5 values out of range {%u, %u}, masking to 3 bits\r\n",
+                           (unsigned int)s5_vals[0],
+                           (unsigned int)s5_vals[1]);
+            }
+            acpi_info.s5_slp_typa = (uint8_t)(s5_vals[0] & 7);
+            acpi_info.s5_slp_typb = (uint8_t)(s5_vals[1] & 7);
             acpi_info.s5_valid = 1;
             log_printf(LOG_LEVEL_DEBUG, "acpi: _S5 = {%u, %u}\r\n",
-                         (unsigned int)s5_vals[0],
-                         (unsigned int)s5_vals[1]);
+                         acpi_info.s5_slp_typa,
+                         acpi_info.s5_slp_typb);
         } else {
             log_print(LOG_LEVEL_WARN, "acpi: _S5 not found\n");
         }
@@ -635,18 +729,45 @@ void acpi_shutdown(void) {
         return;
     }
 
+    /* The PM1_CNT ports come straight from the FADT.  A garbage port
+     * (zero, or truncated from a 32-bit field that does not fit an
+     * x86 I/O port) would scribble on unrelated hardware — refuse it
+     * instead of blindly outw'ing.  SLP_TYP is masked to its 3-bit
+     * field again, defensively. */
+    if (acpi_info.pm1a_cnt_blk > 0xFFFF) {
+        log_printf(LOG_LEVEL_ERROR, "acpi: bogus PM1a_CNT port 0x%x, refusing shutdown\r\n",
+                   acpi_info.pm1a_cnt_blk);
+        return;
+    }
+    uint16_t pm1a_port = (uint16_t)acpi_info.pm1a_cnt_blk;
+    uint16_t pm1b_port = 0;
+    int use_pm1b = 0;
+    if (acpi_info.pm1b_cnt_blk) {
+        if (acpi_info.pm1b_cnt_blk > 0xFFFF) {
+            log_printf(LOG_LEVEL_WARN, "acpi: bogus PM1b_CNT port 0x%x, using PM1a only\r\n",
+                       acpi_info.pm1b_cnt_blk);
+        } else {
+            pm1b_port = (uint16_t)acpi_info.pm1b_cnt_blk;
+            use_pm1b = 1;
+        }
+    }
+    if (acpi_info.pm1_cnt_len && acpi_info.pm1_cnt_len != 2) {
+        log_printf(LOG_LEVEL_WARN, "acpi: odd PM1_CNT length %u (expected 2)\r\n",
+                   acpi_info.pm1_cnt_len);
+    }
+
     log_printf(LOG_LEVEL_DEBUG, "acpi: shutdown (SLP_TYPa=%u SLP_TYPb=%u PM1a=0x%x PM1b=0x%x)\r\n",
-                 acpi_info.s5_slp_typa, acpi_info.s5_slp_typb,
-                 acpi_info.pm1a_cnt_blk, acpi_info.pm1b_cnt_blk);
+                 acpi_info.s5_slp_typa & 7, acpi_info.s5_slp_typb & 7,
+                 pm1a_port, use_pm1b ? pm1b_port : 0);
 
     __asm__ __volatile__("cli");
 
-    uint16_t pm1a_val = ((uint16_t)acpi_info.s5_slp_typa << 10) | (1 << 13);
-    outw(acpi_info.pm1a_cnt_blk, pm1a_val);
+    uint16_t pm1a_val = ((uint16_t)(acpi_info.s5_slp_typa & 7) << 10) | (1 << 13);
+    outw(pm1a_port, pm1a_val);
 
-    if (acpi_info.pm1b_cnt_blk) {
-        uint16_t pm1b_val = ((uint16_t)acpi_info.s5_slp_typb << 10) | (1 << 13);
-        outw(acpi_info.pm1b_cnt_blk, pm1b_val);
+    if (use_pm1b) {
+        uint16_t pm1b_val = ((uint16_t)(acpi_info.s5_slp_typb & 7) << 10) | (1 << 13);
+        outw(pm1b_port, pm1b_val);
     }
 
     for (volatile int i = 0; i < 100000000; i++)

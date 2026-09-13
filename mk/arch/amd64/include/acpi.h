@@ -192,6 +192,12 @@ typedef struct {
 #define DSDT_SIGNATURE "DSDT"
 #define SSDT_SIGNATURE "SSDT"
 
+/* Hardening caps for firmware-supplied tables.  Real DSDTs are tens of
+ * KB; anything above 1MB is either corrupt or a DoS attempt (giant
+ * kmalloc, endless checksum walk, endless parse loop).  Shared by
+ * acpi.c (table validation) and aml.c (AML copy/parse budget). */
+#define ACPI_MAX_DSDT_LEN   (1u << 20)   /* 1 MB total incl. SDT header */
+
 
 typedef struct {
     /* MADT / APIC */

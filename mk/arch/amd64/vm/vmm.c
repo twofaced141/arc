@@ -217,16 +217,23 @@ void vmm_init(void) {
 /* === Kernel heap (first-fit with headers, pages mapped on demand) === */
 
 typedef struct heap_block {
-    uint64_t size;
-    struct heap_block *next;
+    uint64_t size; /* low bit = HEAP_BLOCK_FREE */
+    union {
+        struct heap_block *next; /* valid when FREE */
+        uint64_t magic;          /* valid when allocated */
+    };
 } heap_block_t;
 
+#define HEAP_MAGIC_USED    0x4845415055534544ULL
 #define HEAP_BLOCK_FREE    1
 #define HEAP_SIZE_MASK    (~1ULL)
 #define HEAP_HEADER_SIZE   sizeof(heap_block_t)
 #define HEAP_ALIGNMENT     16
 #define HEAP_ALIGN(sz)     (((sz) + (HEAP_ALIGNMENT - 1)) & ~(HEAP_ALIGNMENT - 1))
 #define HEAP_MIN_BLOCK     (HEAP_ALIGN(HEAP_HEADER_SIZE + HEAP_ALIGNMENT))
+/* Cap freelist walks: heap is 256MB / 32B min-block = 8M blocks max.
+ * Anything longer is a cycle from corruption. */
+#define HEAP_MAX_WALK      (8 * 1024 * 1024)
 
 static heap_block_t *heap_free_list;
 static uint64_t heap_mapped_end;
@@ -238,24 +245,55 @@ static int heap_map_until(uint64_t addr) {
         void *phys = pmm_alloc_page();
         if (!phys) return -1;
         if (vmm_map_page(kernel_pml4, (uint64_t)(uintptr_t)phys, heap_mapped_end,
-                         VMM_PRESENT | VMM_WRITABLE) < 0)
+                         VMM_PRESENT | VMM_WRITABLE) < 0) {
+            pmm_free_page(phys);
             return -1;
+        }
         heap_mapped_end += PAGE_SIZE;
     }
     return 0;
 }
 
+/* Block header sane without touching beyond it? Caller must have
+ * range-checked b against [HEAP_START, heap_brk) first. */
+static int heap_size_sane(uint64_t sz, uint64_t baddr) {
+    uint64_t body = sz & HEAP_SIZE_MASK;
+    if (body < HEAP_MIN_BLOCK)
+        return 0;
+    if (body & (HEAP_ALIGNMENT - 1))
+        return 0;
+    if (body > heap_brk - baddr)
+        return 0;
+    return 1;
+}
+
 static void heap_coalesce(heap_block_t *b) {
-    heap_block_t *next = (heap_block_t *)((uint8_t *)b + (b->size & HEAP_SIZE_MASK));
-    if ((uint64_t)next < heap_brk && (next->size & HEAP_BLOCK_FREE)) {
-        b->size = (b->size & HEAP_SIZE_MASK) + (next->size & HEAP_SIZE_MASK);
-        b->next = next->next;
-    }
+    uint64_t body = b->size & HEAP_SIZE_MASK;
+    heap_block_t *next = (heap_block_t *)((uint8_t *)b + body);
+    /* Only merge the list successor: any other FREE-tagged header at
+     * the adjacent address is corruption, not a merge candidate. */
+    if (next != b->next)
+        return;
+    if ((uint64_t)(uintptr_t)next + HEAP_HEADER_SIZE > heap_brk)
+        return;
+    if ((uint64_t)(uintptr_t)next & (HEAP_ALIGNMENT - 1))
+        return;
+    uint64_t nsize = next->size;
+    if (!(nsize & HEAP_BLOCK_FREE))
+        return;
+    if (!heap_size_sane(nsize, (uint64_t)(uintptr_t)next))
+        return;
+    /* Preserve the FREE tag: the merged block stays on the free list,
+     * and every walker relies on the tag (dropping it made merged
+     * blocks look allocated). */
+    b->size = (body + (nsize & HEAP_SIZE_MASK)) | HEAP_BLOCK_FREE;
+    b->next = next->next;
 }
 
 /* Retract heap_brk past free blocks that end exactly at brk, then unmap
  * and return to the PMM every page above the new page-aligned brk.
- * Caller must hold heap_lock. */
+ * Caller must hold heap_lock. Corrupt list entries are left alone
+ * instead of being trusted for brk math. */
 static void heap_shrink(void) {
     for (;;) {
         heap_block_t *prev = NULL;
@@ -263,8 +301,18 @@ static void heap_shrink(void) {
         heap_block_t *tail = NULL;
         heap_block_t *tail_prev = NULL;
 
-        while (cur) {
-            if ((uint8_t *)cur + (cur->size & HEAP_SIZE_MASK) == (uint8_t *)heap_brk) {
+        for (uint64_t steps = 0; cur && steps < HEAP_MAX_WALK; steps++) {
+            uint64_t caddr = (uint64_t)(uintptr_t)cur;
+            if (caddr < HEAP_START || caddr + HEAP_HEADER_SIZE > heap_brk ||
+                (caddr & (HEAP_ALIGNMENT - 1)))
+                break; /* corrupt list: stop, don't move brk */
+            uint64_t csize = cur->size & HEAP_SIZE_MASK;
+            if (!(cur->size & HEAP_BLOCK_FREE))
+                break; /* allocated block linked: corrupt */
+            if (csize < HEAP_MIN_BLOCK || (csize & (HEAP_ALIGNMENT - 1)) ||
+                csize > heap_brk - caddr)
+                break;
+            if ((uint8_t *)cur + csize == (uint8_t *)(uintptr_t)heap_brk) {
                 tail = cur;
                 tail_prev = prev;
                 break;
@@ -311,36 +359,53 @@ void *kmalloc(uint32_t size) {
     heap_block_t *prev = NULL;
     heap_block_t *b = heap_free_list;
 
-    while (b) {
-        uint64_t block_size = b->size & HEAP_SIZE_MASK;
+    for (uint64_t steps = 0; b && steps < HEAP_MAX_WALK; steps++) {
+        uint64_t baddr = (uint64_t)(uintptr_t)b;
+        if (baddr < HEAP_START || baddr + HEAP_HEADER_SIZE > heap_brk ||
+            (baddr & (HEAP_ALIGNMENT - 1)))
+            break; /* freelist corrupt: fall through to brk */
+        uint64_t raw = b->size;
+        if (!(raw & HEAP_BLOCK_FREE))
+            break; /* allocated block linked: corrupt */
+        uint64_t block_size = raw & HEAP_SIZE_MASK;
+        if (block_size < HEAP_MIN_BLOCK || (block_size & (HEAP_ALIGNMENT - 1)) ||
+            block_size > heap_brk - baddr)
+            break;
+        heap_block_t *bnext = b->next;
+        if (bnext && ((uint64_t)(uintptr_t)bnext < HEAP_START ||
+                      (uint64_t)(uintptr_t)bnext > heap_brk ||
+                      ((uint64_t)(uintptr_t)bnext & (HEAP_ALIGNMENT - 1)) ||
+                      (uint64_t)(uintptr_t)bnext <= baddr))
+            break;
         if (block_size >= need) {
             uint64_t remaining = block_size - need;
             if (remaining >= HEAP_MIN_BLOCK) {
-                b->size = need | 0;
                 heap_block_t *split = (heap_block_t *)((uint8_t *)b + need);
                 split->size = remaining | HEAP_BLOCK_FREE;
-                split->next = b->next;
+                split->next = bnext;
                 if (prev)
                     prev->next = split;
                 else
                     heap_free_list = split;
+                b->size = need;
             } else {
-                b->size = block_size | 0;
                 if (prev)
-                    prev->next = b->next;
+                    prev->next = bnext;
                 else
-                    heap_free_list = b->next;
+                    heap_free_list = bnext;
+                b->size = block_size;
             }
+            b->magic = HEAP_MAGIC_USED;
             spin_unlock_irqrestore(&heap_lock, flags);
             return (void *)((uint8_t *)b + HEAP_HEADER_SIZE);
         }
         prev = b;
-        b = b->next;
+        b = bnext;
     }
 
     uint64_t addr = heap_brk;
     uint64_t new_brk = addr + need;
-    if (new_brk >= HEAP_END) {
+    if (new_brk < addr || new_brk > HEAP_END) {
         spin_unlock_irqrestore(&heap_lock, flags);
         return NULL;
     }
@@ -352,8 +417,8 @@ void *kmalloc(uint32_t size) {
     heap_brk = new_brk;
 
     heap_block_t *block = (heap_block_t *)(uintptr_t)addr;
-    block->size = need | 0;
-    block->next = NULL;
+    block->size = need;
+    block->magic = HEAP_MAGIC_USED;
     spin_unlock_irqrestore(&heap_lock, flags);
     return (void *)((uint8_t *)block + HEAP_HEADER_SIZE);
 }
@@ -377,22 +442,61 @@ void kfree(void *addr) {
     if (!addr)
         return;
 
+    /* Cheap pre-check without dereferencing: rejects NULL-adjacent
+     * and wild pointers before the header is touched. */
+    uint64_t paddr = (uint64_t)(uintptr_t)addr;
+    if (paddr < HEAP_START + HEAP_HEADER_SIZE || paddr >= heap_brk ||
+        (paddr & (HEAP_ALIGNMENT - 1)) != (HEAP_HEADER_SIZE & (HEAP_ALIGNMENT - 1))) {
+        log_printf(LOG_LEVEL_ERROR, "kfree: wild pointer %p\r\n", addr);
+        return;
+    }
+
     uint32_t flags;
     spin_lock_irqsave(&heap_lock, &flags);
 
     heap_block_t *b = (heap_block_t *)((uint8_t *)addr - HEAP_HEADER_SIZE);
-    uint64_t block_size = b->size & HEAP_SIZE_MASK;
-
-    b->size = block_size | HEAP_BLOCK_FREE;
+    uint64_t baddr = (uint64_t)(uintptr_t)b;
+    if (baddr < HEAP_START || baddr + HEAP_HEADER_SIZE > heap_brk ||
+        (baddr & (HEAP_ALIGNMENT - 1))) {
+        spin_unlock_irqrestore(&heap_lock, flags);
+        log_printf(LOG_LEVEL_ERROR, "kfree: bad header %p\r\n", addr);
+        return;
+    }
+    uint64_t raw = b->size;
+    if ((raw & HEAP_BLOCK_FREE) || b->magic != HEAP_MAGIC_USED) {
+        /* Covers double-free (FREE bit set, magic clobbered by next
+         * pointer) and wild payload pointers. */
+        spin_unlock_irqrestore(&heap_lock, flags);
+        log_printf(LOG_LEVEL_ERROR, "kfree: double-free or corrupt %p\r\n", addr);
+        return;
+    }
+    uint64_t block_size = raw & HEAP_SIZE_MASK;
+    if (!heap_size_sane(raw, baddr)) {
+        spin_unlock_irqrestore(&heap_lock, flags);
+        log_printf(LOG_LEVEL_ERROR, "kfree: bad size %p\r\n", addr);
+        return;
+    }
 
     heap_block_t *prev = NULL;
     heap_block_t *cur = heap_free_list;
 
-    while (cur && (uint64_t)cur < (uint64_t)b) {
+    for (uint64_t steps = 0; cur && steps < HEAP_MAX_WALK; steps++) {
+        uint64_t caddr = (uint64_t)(uintptr_t)cur;
+        if (caddr < HEAP_START || caddr + HEAP_HEADER_SIZE > heap_brk ||
+            (caddr & (HEAP_ALIGNMENT - 1)))
+            break;
+        if (caddr == baddr) { /* already linked: double-free */
+            spin_unlock_irqrestore(&heap_lock, flags);
+            log_printf(LOG_LEVEL_ERROR, "kfree: double-free %p\r\n", addr);
+            return;
+        }
+        if (caddr > baddr)
+            break;
         prev = cur;
         cur = cur->next;
     }
 
+    b->size = block_size | HEAP_BLOCK_FREE;
     b->next = cur;
     if (prev)
         prev->next = b;
@@ -400,7 +504,7 @@ void kfree(void *addr) {
         heap_free_list = b;
 
     heap_coalesce(b);
-    if (prev && (uint64_t)prev + (prev->size & HEAP_SIZE_MASK) == (uint64_t)b)
+    if (prev && (uint64_t)(uintptr_t)prev + (prev->size & HEAP_SIZE_MASK) == baddr)
         heap_coalesce(prev);
 
     heap_shrink();
