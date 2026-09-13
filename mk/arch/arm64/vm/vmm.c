@@ -319,14 +319,17 @@ void vmm_init(void) {
 void vmm_init_heap(void) {
 }
 
-/* User VA range inside L1[0], in L2-index units.  VAs 0x00400000 ..
- * 0x03FFFFFF (ELF base, heap, mmap, stack) get PRIVATE page tables per
- * process; every other L2 slot of L1[0] is shared with the boot tables
- * and holds kernel-only mappings:
+/* User VA range inside L1[0], in L2-index units.  VAs 0x00000000 ..
+ * 0x07FFFFFF (null guard, ELF base, heap, mmap, stack) get PRIVATE L3
+ * tables per process (fresh L2 per directory, L3s created on demand);
+ * every other L2 slot of L1[0] shares the boot tables' L3s and holds
+ * kernel-only mappings:
  *   L2 64..96  device MMIO window (GIC 0x08000000, UART 0x09000000,
  *              RTC/GPIO 0x09xxxxxx, virtio-mmio 0x0A000000..)
  *   L2 511     PCI ECAM window (ECAM_VADDR 0xFFE00000)
- *   L2 0..1    low core (null guard etc.) — nothing user-visible */
+ * NOTE: these bounds apply to the L2 *inside L1[0]* (vmm_create_directory
+ * splits that one level); the L1 loop below reuses the same constant
+ * names for the high 1GB slots, where [2..63] are likewise private. */
 #define USER_L2_MIN 2
 #define USER_L2_MAX 63
 
@@ -355,7 +358,36 @@ page_directory_t *vmm_create_directory(void) {
     if (!user_l1) return NULL;
     memset(user_l1, 0, sizeof(page_directory_t));
 
-    for (int j = 0; j < 512; j++) {
+    /* L1[0] covers VA 0..1GB, i.e. the whole user range AND the low
+     * device MMIO (GIC/UART/virtio/ECAM).  It gets a PRIVATE L2 whose
+     * low slots (L2 0..63, covering VA 0..128MB incl. all of
+     * USER_BASE/heap/mmap/stack) are private per process, while the
+     * high slots (devices) keep sharing boot's L3 tables.  Sharing all
+     * of L1[0] (as before) made every process alias one another's user
+     * PTEs: a child's exec overwrote its parent's text mappings, so the
+     * parent resumed into the child's binary (UNDEF faults, doubled
+     * service output, stalled spawns — SMP-visible). */
+    {
+        page_directory_t *user_l2 = (page_directory_t *)pmm_alloc_page();
+        if (!user_l2) return NULL;
+        memset(user_l2, 0, sizeof(page_directory_t));
+        page_directory_t *boot_l2 = NULL;
+        if ((boot_l1->entries[0] & DESC_VALID) &&
+            (boot_l1->entries[0] & DESC_TABLE))
+            boot_l2 = (page_directory_t *)(uintptr_t)(boot_l1->entries[0] & ADDR_MASK);
+        for (int k = 0; k < 512; k++) {
+            if (k <= USER_L2_MAX) {
+                /* Private, filled lazily by exec/demand paging/COW. */
+                continue;
+            }
+            /* Shared with boot: device MMIO windows. */
+            if (boot_l2)
+                user_l2->entries[k] = boot_l2->entries[k];
+        }
+        user_l1->entries[0] = (uint64_t)(uintptr_t)user_l2 | DESC_VALID | DESC_TABLE | ATTR_AF;
+    }
+
+    for (int j = 1; j < 512; j++) {
         if (j >= USER_L2_MIN && j <= USER_L2_MAX) {
             /* Private, filled lazily by exec/demand paging. */
             page_directory_t *l2 = (page_directory_t *)pmm_alloc_page();
@@ -407,7 +439,35 @@ void vmm_free_directory(page_directory_t *dir) {
         goto free_l0;
     page_directory_t *user_l1 =
         (page_directory_t *)(uintptr_t)(dir->entries[0] & ADDR_MASK);
-    for (int l1i = 0; l1i < 512; l1i++) {
+    /* L1[0] has a private L2: free its private L3s (L2 0..USER_L2_MAX)
+     * with the same writable-only policy; slots above are shared
+     * device tables and must survive. */
+    if ((user_l1->entries[0] & DESC_VALID) &&
+        (user_l1->entries[0] & DESC_TABLE)) {
+        page_directory_t *user_l2 =
+            (page_directory_t *)(uintptr_t)(user_l1->entries[0] & ADDR_MASK);
+        for (int l2i = 0; l2i <= USER_L2_MAX; l2i++) {
+            if (!(user_l2->entries[l2i] & DESC_VALID))
+                continue;
+            if (!(user_l2->entries[l2i] & DESC_TABLE))
+                continue;
+            page_directory_t *l3 =
+                (page_directory_t *)(uintptr_t)(user_l2->entries[l2i] & ADDR_MASK);
+            for (int l3i = 0; l3i < 512; l3i++) {
+                uint64_t pte = l3->entries[l3i];
+                if (!(pte & DESC_VALID) || !(pte & DESC_PAGE))
+                    continue;
+                if (!(pte & ATTR_AP_USER))
+                    continue;
+                if (pte & ATTR_AP_RO)
+                    continue;  /* COW-shared or RO segment */
+                pmm_free_page((void *)(uintptr_t)(pte & ADDR_MASK));
+            }
+            pmm_free_page(l3);
+        }
+        pmm_free_page(user_l2);
+    }
+    for (int l1i = 1; l1i < 512; l1i++) {
         if (!(user_l1->entries[l1i] & DESC_VALID))
             continue;
         if (!(user_l1->entries[l1i] & DESC_TABLE))

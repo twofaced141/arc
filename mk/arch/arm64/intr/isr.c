@@ -31,6 +31,8 @@
 
 
 #include "isr.h"
+#include "bsd/arch.h"
+#include "bsd/proc.h"
 #include "gic.h"
 #include "clkevt_arm.h"
 #include "uart.h"
@@ -97,6 +99,18 @@ void irq_enable(void) {
 
 static void dump_regs(registers_t *r) {
     uart_print("\n=== EXCEPTION DUMP ===\n");
+    {
+        struct cpu *c = cpu_current();
+        thread_t *t = scheduler_current_thread();
+        proc_t *p = proc_current();
+        uart_print("cpu=");
+        uart_print_hex64(c ? c->id : 99);
+        uart_print(" tid=");
+        uart_print_hex64(t ? (uint64_t)t->tid : 9999);
+        uart_print(" pid=");
+        uart_print_hex64(p ? (uint64_t)(int64_t)p->pid : -1);
+        uart_print("\n");
+    }
     for (int i = 0; i < 30; i += 4) {
         uart_print("x");
         if (i < 10) uart_putchar('0' + i);
@@ -150,24 +164,21 @@ static void dump_regs(registers_t *r) {
     uart_print("=== END DUMP ===\n");
 }
 
-/* AArch64 SVC ABI: x8=sysno(+1024), x0-3=args, ret in x0 */
+/* AArch64 SVC ABI: x0=sysno(+1024), x1-6=args, ret in x0.
+ *
+ * ELR handling: advance past the svc ONLY when ELR still points at it.
+ * Real hardware reports ELR at the svc, but QEMU (observed 11.0.3,
+ * cortex-a57 and max) delivers ELR already past it — a blind +4 then
+ * skips a userspace instruction per syscall (garbled I/O, failed fork
+ * self-test, eventual jump to 0).  Probing the trapped instruction
+ * keeps both behaviours correct: fork children (resumed past the svc
+ * with x0=0) and sigreturn-restarted frames (rewound onto the svc)
+ * also land correctly either way. */
 static void handle_svc(registers_t *r) {
-    /* TEMP debug: log each thread's FIRST syscall */
-    {
-        static uint32_t seen_tids;
-        thread_t *ct = scheduler_current_thread();
-        uint64_t tid = ct ? ct->tid : 0;
-        if (tid < 32 && !(seen_tids & (1u << tid))) {
-            seen_tids |= (1u << tid);
-            uart_print("SVCFIRST tid=");
-            uart_print_hex64(tid);
-            uart_print(" x0=");
-            uart_print_hex64(r->x[0]);
-            uart_print(" elr=");
-            uart_print_hex64(r->elr);
-            uart_print("\n");
-        }
-    }
+    uint32_t w = 0;
+    if (copy_from_user(&w, (const void *)r->elr, 4) == 0 &&
+        (w & 0xFFE0001FULL) == 0xD4000001ULL)
+        r->elr += BSD_SYSCALL_INS_LEN;
     if (bsd_syscall_dispatch)
         r->x[0] = (uint64_t)bsd_syscall_dispatch(r);
 }

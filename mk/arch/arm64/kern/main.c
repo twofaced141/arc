@@ -33,6 +33,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "uart.h"
+#include "debug.h"
 #include "isr.h"
 #include "gic.h"
 #include "clksrc_arm.h"
@@ -196,14 +197,13 @@ void kernel_main(struct arc_boot_info *boot) {
         uart_print("arc: no BSD layer — standalone microkernel\n");
     }
 
-    /* SMP: bring up APs (QEMU: -smp 4) */
+    /* SMP: bring up APs (QEMU: -smp 4).
+     * Single locked log_printf: APs print their own online lines
+     * concurrently, and split uart_prints would interleave mid-line. */
     if (cpu_count() > 1) {
         int online = cpu_start_all();
-        uart_print("smp: ");
-        uart_print_hex64((uint64_t)(uint32_t)online);
-        uart_print("/");
-        uart_print_hex64((uint64_t)(uint32_t)(cpu_count() - 1));
-        uart_print(" APs online\n");
+        log_printf(LOG_LEVEL_INFO, "smp: %u/%u APs online\r\n",
+                   (unsigned)online, cpu_count() - 1);
     }
     cpu_dump_stats();
     (void)smp_selftest();

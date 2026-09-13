@@ -249,26 +249,6 @@ static void *context_switch(struct runqueue *rq, registers_t *r) {
     thread_t *next = rq->active->queue[top_prio];
     prio_array_dequeue(rq, rq->active, next, top_prio);
 
-    /* TEMP debug: trace picks of tid>=3 and periodic queue dumps */
-    {
-        static unsigned pick3, sw_total;
-        sw_total++;
-        if (next->tid >= 3 && pick3 < 8) {
-            pick3++;
-            log_printf(LOG_LEVEL_INFO,
-                       "PICK3#%u tid=%u st=%d prio=%d nact=%d nexp=%d cur=%u\r\n",
-                       pick3, next->tid, next->state, next->prio,
-                       rq->active->nr_active, rq->expired->nr_active,
-                       rq->current ? rq->current->tid : 0);
-        }
-        if ((sw_total % 20000u) == 0)
-            log_printf(LOG_LEVEL_INFO,
-                       "SW%u cur=%u nact=%d nexp=%d\r\n",
-                       sw_total,
-                       rq->current ? rq->current->tid : 0,
-                       rq->active->nr_active, rq->expired->nr_active);
-    }
-
     if (next->state == THREAD_ZOMBIE || next->state == THREAD_UNUSED)
         return context_switch(rq, r);
 
@@ -435,9 +415,30 @@ void *scheduler_switch(registers_t *r) {
         return nxt;
     }
 
-    /* Check need_resched for non-tick IPI path. */
+    /* Check need_resched for non-tick IPI path.  A RUNNING current
+     * that still owns its slice must be requeued first: replacing it
+     * via context_switch() without requeueing leaks it as
+     * RUNNING-not-current (never scheduled again — every
+     * IPI-preemption orphaned one thread). */
     if (cpu && cpu->arch.need_resched) {
         cpu->arch.need_resched = 0;
+        if (rq->current && rq->current->tid != 0 &&
+            rq->current->state == THREAD_RUNNING) {
+            if (rq->current->sleep_avg > 0)
+                rq->current->sleep_avg -= 3;
+            if (rq->current->sleep_avg < 0)
+                rq->current->sleep_avg = 0;
+            rq->current->state = THREAD_READY;
+            rq->current->prio = effective_prio(rq->current->static_prio,
+                                               rq->current->sleep_avg);
+            rq->current->time_slice = prio_to_timeslice(rq->current->static_prio);
+            if (rq->current->array == rq->active)
+                prio_array_dequeue(rq, rq->active, rq->current, rq->current->prio);
+            else if (rq->current->array)
+                prio_array_dequeue(rq, rq->current->array, rq->current, rq->current->prio);
+            prio_array_enqueue(rq, rq->expired, rq->current, rq->current->prio);
+            rq->current = NULL;
+        }
         void *nxt = context_switch(rq, r);
         spin_unlock_irqrestore(&rq->lock, flags);
         return nxt;
