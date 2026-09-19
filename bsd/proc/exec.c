@@ -296,7 +296,7 @@ static int elf_setup_stack(proc_t *proc, struct elf_load_state *st) {
 
         bsd_elf_addr_t vaddr = stack_top - (si + 1) * PAGE_SIZE;
         vmm_map_page(st->page_dir, (bsd_elf_addr_t)(uintptr_t)phys, vaddr,
-                     VMM_PRESENT | VMM_WRITABLE | VMM_USER);
+                     VMM_PRESENT | VMM_WRITABLE | VMM_USER | VMM_NX);
     }
 
     return 0;
@@ -314,7 +314,7 @@ static int elf_setup_tls(struct elf_load_state *st) {
 
     vmm_temp_unmap();
     vmm_map_page(st->page_dir, (bsd_elf_addr_t)(uintptr_t)tls_phys,
-                 USER_TLS_VADDR, VMM_PRESENT | VMM_WRITABLE | VMM_USER);
+                 USER_TLS_VADDR, VMM_PRESENT | VMM_WRITABLE | VMM_USER | VMM_NX);
     return 0;
 }
 

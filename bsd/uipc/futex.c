@@ -132,6 +132,11 @@ int futex_wait(uintptr_t uaddr, uint32_t val, uint64_t deadline_ticks) {
      * unlocked (and will FUTEX_WAKE), we must not sleep and lose it. */
     uint32_t cur = 0;
     if (copy_from_user(&cur, (void *)uaddr, sizeof(cur)) != 0) {
+        /* Allocated an empty queue above; drop it so a faulting
+         * address does not leak one entry per call (fd-exhaustion
+         * style DoS). */
+        if (q->nwaiters == 0)
+            futex_remove_q(idx, q);
         spin_unlock_irqrestore(&futex_lock, flags);
         return -EFAULT;
     }

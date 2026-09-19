@@ -80,16 +80,23 @@ static void kill_deliver(proc_t *target, int sig, proc_t *sender,
     /* Stop/continue signals update the wait-visible state */
     if (sig == SIGSTOP || sig == SIGTSTP || sig == SIGTTIN || sig == SIGTTOU) {
         target->stopped = 1;
+        target->continued = 0;
         target->exit_sig = (uint8_t)sig;
         target->state = PRS_STOPPED;
         proc_t *parent = proc_find(target->ppid);
         if (parent)
             waitq_wake_all(&parent->waitq);
     } else if (sig == SIGCONT) {
+        int was_stopped = target->stopped;
         target->stopped = 0;
         target->exit_sig = 0;
         if (target->state == PRS_STOPPED)
             target->state = PRS_NORMAL;
+        if (was_stopped)
+            target->continued = 1;
+        proc_t *parent = proc_find(target->ppid);
+        if (parent)
+            waitq_wake_all(&parent->waitq);
     }
 
     /* SIGKILL is immediate for the caller itself; for other processes

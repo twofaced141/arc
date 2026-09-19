@@ -135,7 +135,7 @@ typedef struct {
 
 typedef struct dma_buf {
     void     *virt;
-    uint32_t  phys;
+    uint64_t  phys;
 } dma_buf_t;
 
 /* I/O request (must match kernel's io_request) */

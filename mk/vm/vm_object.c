@@ -418,7 +418,7 @@ int vm_object_user_paged_fault(vm_object_t *obj, uint64_t offset,
         prot |= VM_PROT_WRITE;
 
     uint64_t phys_addr;
-    int ret = vm_pager_send_fault(obj->paging_port, (uint64_t)obj, offset, prot, &phys_addr);
+    int ret = vm_pager_send_fault(obj->paging_port, (uint64_t)(uintptr_t)obj, offset, prot, &phys_addr);
     if (ret < 0)
         return ret;
 

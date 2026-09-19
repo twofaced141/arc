@@ -33,6 +33,8 @@
 #include "bsd/tty.h"
 #include "bsd/errno.h"
 #include "bsd/select.h"
+#include "bsd/proc.h"
+#include "bsd/signal.h"
 #include "vmm.h"
 #include "debug.h"
 #include "string.h"
@@ -47,6 +49,50 @@ static void tty_apply_lflags(tty_t *t) {
     t->isig   = (t->term.c_lflag & ISIG)   ? 1 : 0;
 }
 
+static void tty_send_signal(tty_t *t, int sig) {
+    if (!t || t->pgrp == 0)
+        return;
+    /* Deliver to every process in foreground group.  Use pending flag
+     * and wake, so blocked reads are interrupted (EINTR) and SIG_DFL
+     * termination is handled at next kernel entry.  Reuse kill logic
+     * for permission — here we are the tty, not a process, so we deliver
+     * unconditionally to the group (kernel-originated). */
+    extern proc_t *proc_find(pid_t);
+    // Avoid including proc internal lock here: iterate via proc_find for each
+    // possible pid would be O(N^2). Instead walk via proc table snapshot.
+    // Simple: try pids up to PROC_MAX.
+    for (int pid = 1; pid < PROC_MAX; pid++) {
+        proc_t *p = proc_find(pid);
+        if (!p || p->pgrp != t->pgrp)
+            continue;
+        if (sig == SIGINT || sig == SIGQUIT || sig == SIGTSTP) {
+            // Use generic pending; stop/continue state handled in kill path
+            p->signals.pending[sig] = 1;
+            if (sig == SIGTSTP || sig == SIGSTOP) {
+                p->stopped = 1;
+                p->state = PRS_STOPPED;
+                p->exit_sig = (uint8_t)sig;
+                proc_t *parent = proc_find(p->ppid);
+                if (parent) waitq_wake_all(&parent->waitq);
+            } else if (sig == SIGCONT) {
+                int was = p->stopped;
+                p->stopped = 0;
+                if (p->state == PRS_STOPPED) p->state = PRS_NORMAL;
+                if (was) p->continued = 1;
+                proc_t *parent = proc_find(p->ppid);
+                if (parent) waitq_wake_all(&parent->waitq);
+            } else if (sig == SIGINT || sig == SIGQUIT) {
+                // nothing extra
+            }
+            proc_wakeup(p);
+            waitq_wake_all(&p->waitq);
+        } else {
+            p->signals.pending[sig] = 1;
+            proc_wakeup(p);
+        }
+    }
+}
+
 void tty_init(void) {
     memset(ttys, 0, sizeof(ttys));
     for (int i = 0; i < TTY_COUNT; i++) {
@@ -57,6 +103,13 @@ void tty_init(void) {
         ttys[i].in_tail = 0;
         ttys[i].open_count = 0;
         ttys[i].term.c_lflag = ISIG | ICANON | ECHO;
+        ttys[i].term.c_cc[VINTR] = 0x03; /* Ctrl-C */
+        ttys[i].term.c_cc[VQUIT] = 0x1C; /* Ctrl-\ */
+        ttys[i].term.c_cc[VSUSP] = 0x1A; /* Ctrl-Z */
+        ttys[i].term.c_cc[VEOF]  = 0x04; /* Ctrl-D */
+        ttys[i].term.c_cc[VEOL]  = 0;
+        ttys[i].term.c_cc[VERASE] = 0x7F; /* DEL */
+        ttys[i].term.c_cc[VKILL] = 0x15; /* Ctrl-U */
         ttys[i].winsize.ws_row = 25;
         ttys[i].winsize.ws_col = 80;
         tty_apply_lflags(&ttys[i]);
@@ -237,6 +290,22 @@ int tty_ioctl(tty_t *t, int cmd, void *data) {
 void tty_input_char(int minor, char c) {
     tty_t *t = tty_lookup(minor);
     if (!t) return;
+
+    /* ISIG: generate signals from special characters (POSIX). */
+    if (t->isig) {
+        if (c != 0 && c == t->term.c_cc[VINTR]) {
+            tty_send_signal(t, SIGINT);
+            return;
+        }
+        if (c != 0 && c == t->term.c_cc[VQUIT]) {
+            tty_send_signal(t, SIGQUIT);
+            return;
+        }
+        if (c != 0 && c == t->term.c_cc[VSUSP]) {
+            tty_send_signal(t, SIGTSTP);
+            return;
+        }
+    }
 
     int next = (t->in_head + 1) % 256;
     if (next == t->in_tail)

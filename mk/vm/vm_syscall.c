@@ -55,9 +55,12 @@ int sys_vm_create_shared(uint64_t size) {
     task_t *cur = task_current();
     if (!cur) return -1;
 
-    /* Round up to page boundary */
+    /* Round up to page boundary, rejecting overflow (size near 2^64
+     * wrapped to 0 and created a zero-size object). */
     if (size == 0) return -1;
+    if (size > ~0ULL - (PAGE_SIZE - 1)) return -1;
     size = (size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1ULL);
+    if (size == 0) return -1;
 
     vm_object_t *obj = vm_object_create_shared(size);
     if (!obj) return -1;
@@ -88,7 +91,9 @@ int sys_vm_create_phys(uint64_t phys_base, uint64_t size) {
     }
 
     if (size == 0) return -1;
+    if (size > ~0ULL - (PAGE_SIZE - 1)) return -1;
     size = (size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1ULL);
+    if (size == 0) return -1;
 
     vm_object_t *obj = vm_object_create_phys(phys_base, size);
     if (!obj) return -1;
@@ -136,6 +141,12 @@ int sys_vm_map(uint64_t handle, uint64_t addr, uint32_t prot) {
         debug_print("vm_syscall: map invalid handle\r\n");
         return -1;
     }
+    if (obj->size == 0) return -1;
+
+    /* Containment: the whole [addr, addr+size) must lie in the user
+     * half.  Without this a task maps over kernel-half vm_entries. */
+    if (addr < USER_BASE) return -1;
+    if (obj->size > USER_STACK_TOP - addr) return -1;
 
     /* Only respect READ/WRITE/EXEC from userspace */
     prot &= VM_PROT_ALL;
@@ -159,7 +170,10 @@ int sys_vm_unmap(uint64_t addr, uint64_t size) {
 
     if (addr & (PAGE_SIZE - 1)) return -1;
     if (size == 0) return -1;
+    if (size > ~0ULL - (PAGE_SIZE - 1)) return -1;
     size = (size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1ULL);
+    if (size == 0) return -1;
+    if (addr < USER_BASE || size > USER_STACK_TOP - addr) return -1;
 
     int ret = vm_map_unmap(cur->map, addr, size);
     debug_printf("vm_syscall: unmap addr=0x%lx size=0x%lx -> %d\r\n", addr, size, ret);
@@ -173,7 +187,10 @@ int sys_vm_protect(uint64_t addr, uint64_t size, uint32_t prot) {
 
     if (addr & (PAGE_SIZE - 1)) return -1;
     if (size == 0) return -1;
+    if (size > ~0ULL - (PAGE_SIZE - 1)) return -1;
     size = (size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1ULL);
+    if (size == 0) return -1;
+    if (addr < USER_BASE || size > USER_STACK_TOP - addr) return -1;
 
     prot &= VM_PROT_ALL;
 

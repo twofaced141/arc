@@ -119,6 +119,9 @@ void        port_release(ipc_port_t *port);
 int         port_send(ipc_port_t *port, const ipc_msg_t *msg, task_t *sender);
 int         port_recv(ipc_port_t *port, ipc_msg_t *msg);
 int         port_notify(ipc_port_t *port);
+/* Resolve a cspace slot snapshot to a referenced port (takes one ref,
+ * caller must port_release). Exported for vm_pager foreign-handle use. */
+ipc_port_t *port_from_cslot(cslot_t *cs, uint32_t need_rights);
 
 /* ================================================================
  * Syscalls

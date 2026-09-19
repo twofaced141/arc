@@ -214,314 +214,7 @@ void vmm_init(void) {
     log_print(LOG_LEVEL_INFO, "vmm: identity map 0-64MB\r\n");
 }
 
-/* === Kernel heap (first-fit with headers, pages mapped on demand) === */
-
-typedef struct heap_block {
-    uint64_t size; /* low bit = HEAP_BLOCK_FREE */
-    union {
-        struct heap_block *next; /* valid when FREE */
-        uint64_t magic;          /* valid when allocated */
-    };
-} heap_block_t;
-
-#define HEAP_MAGIC_USED    0x4845415055534544ULL
-#define HEAP_BLOCK_FREE    1
-#define HEAP_SIZE_MASK    (~1ULL)
-#define HEAP_HEADER_SIZE   sizeof(heap_block_t)
-#define HEAP_ALIGNMENT     16
-#define HEAP_ALIGN(sz)     (((sz) + (HEAP_ALIGNMENT - 1)) & ~(HEAP_ALIGNMENT - 1))
-#define HEAP_MIN_BLOCK     (HEAP_ALIGN(HEAP_HEADER_SIZE + HEAP_ALIGNMENT))
-/* Cap freelist walks: heap is 256MB / 32B min-block = 8M blocks max.
- * Anything longer is a cycle from corruption. */
-#define HEAP_MAX_WALK      (8 * 1024 * 1024)
-
-static heap_block_t *heap_free_list;
-static uint64_t heap_mapped_end;
-static uint64_t heap_brk;
-static spinlock_t heap_lock = SPINLOCK_INIT;
-
-static int heap_map_until(uint64_t addr) {
-    while (heap_mapped_end < addr) {
-        void *phys = pmm_alloc_page();
-        if (!phys) return -1;
-        if (vmm_map_page(kernel_pml4, (uint64_t)(uintptr_t)phys, heap_mapped_end,
-                         VMM_PRESENT | VMM_WRITABLE) < 0) {
-            pmm_free_page(phys);
-            return -1;
-        }
-        heap_mapped_end += PAGE_SIZE;
-    }
-    return 0;
-}
-
-/* Block header sane without touching beyond it? Caller must have
- * range-checked b against [HEAP_START, heap_brk) first. */
-static int heap_size_sane(uint64_t sz, uint64_t baddr) {
-    uint64_t body = sz & HEAP_SIZE_MASK;
-    if (body < HEAP_MIN_BLOCK)
-        return 0;
-    if (body & (HEAP_ALIGNMENT - 1))
-        return 0;
-    if (body > heap_brk - baddr)
-        return 0;
-    return 1;
-}
-
-static void heap_coalesce(heap_block_t *b) {
-    uint64_t body = b->size & HEAP_SIZE_MASK;
-    heap_block_t *next = (heap_block_t *)((uint8_t *)b + body);
-    /* Only merge the list successor: any other FREE-tagged header at
-     * the adjacent address is corruption, not a merge candidate. */
-    if (next != b->next)
-        return;
-    if ((uint64_t)(uintptr_t)next + HEAP_HEADER_SIZE > heap_brk)
-        return;
-    if ((uint64_t)(uintptr_t)next & (HEAP_ALIGNMENT - 1))
-        return;
-    uint64_t nsize = next->size;
-    if (!(nsize & HEAP_BLOCK_FREE))
-        return;
-    if (!heap_size_sane(nsize, (uint64_t)(uintptr_t)next))
-        return;
-    /* Preserve the FREE tag: the merged block stays on the free list,
-     * and every walker relies on the tag (dropping it made merged
-     * blocks look allocated). */
-    b->size = (body + (nsize & HEAP_SIZE_MASK)) | HEAP_BLOCK_FREE;
-    b->next = next->next;
-}
-
-/* Retract heap_brk past free blocks that end exactly at brk, then unmap
- * and return to the PMM every page above the new page-aligned brk.
- * Caller must hold heap_lock. Corrupt list entries are left alone
- * instead of being trusted for brk math. */
-static void heap_shrink(void) {
-    for (;;) {
-        heap_block_t *prev = NULL;
-        heap_block_t *cur = heap_free_list;
-        heap_block_t *tail = NULL;
-        heap_block_t *tail_prev = NULL;
-
-        for (uint64_t steps = 0; cur && steps < HEAP_MAX_WALK; steps++) {
-            uint64_t caddr = (uint64_t)(uintptr_t)cur;
-            if (caddr < HEAP_START || caddr + HEAP_HEADER_SIZE > heap_brk ||
-                (caddr & (HEAP_ALIGNMENT - 1)))
-                break; /* corrupt list: stop, don't move brk */
-            uint64_t csize = cur->size & HEAP_SIZE_MASK;
-            if (!(cur->size & HEAP_BLOCK_FREE))
-                break; /* allocated block linked: corrupt */
-            if (csize < HEAP_MIN_BLOCK || (csize & (HEAP_ALIGNMENT - 1)) ||
-                csize > heap_brk - caddr)
-                break;
-            if ((uint8_t *)cur + csize == (uint8_t *)(uintptr_t)heap_brk) {
-                tail = cur;
-                tail_prev = prev;
-                break;
-            }
-            prev = cur;
-            cur = cur->next;
-        }
-        if (!tail)
-            break;
-
-        heap_brk = (uint64_t)(uintptr_t)tail;
-        if (tail_prev)
-            tail_prev->next = tail->next;
-        else
-            heap_free_list = tail->next;
-    }
-
-    uint64_t keep = (heap_brk + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
-    uint64_t floor = HEAP_START + HEAP_INITIAL_PAGES * PAGE_SIZE;
-    if (keep < floor)
-        keep = floor;
-
-    while (heap_mapped_end > keep) {
-        uint64_t addr = heap_mapped_end - PAGE_SIZE;
-        uint64_t phys = vmm_get_physical(kernel_pml4, addr);
-        vmm_unmap_page(kernel_pml4, addr);
-        if (phys)
-            pmm_free_page((void *)(uintptr_t)phys);
-        heap_mapped_end -= PAGE_SIZE;
-    }
-}
-
-void *kmalloc(uint32_t size) {
-    if (size == 0)
-        return NULL;
-
-    uint32_t flags;
-    spin_lock_irqsave(&heap_lock, &flags);
-
-    uint64_t need = HEAP_HEADER_SIZE + HEAP_ALIGN(size);
-    if (need < HEAP_MIN_BLOCK)
-        need = HEAP_MIN_BLOCK;
-
-    heap_block_t *prev = NULL;
-    heap_block_t *b = heap_free_list;
-
-    for (uint64_t steps = 0; b && steps < HEAP_MAX_WALK; steps++) {
-        uint64_t baddr = (uint64_t)(uintptr_t)b;
-        if (baddr < HEAP_START || baddr + HEAP_HEADER_SIZE > heap_brk ||
-            (baddr & (HEAP_ALIGNMENT - 1)))
-            break; /* freelist corrupt: fall through to brk */
-        uint64_t raw = b->size;
-        if (!(raw & HEAP_BLOCK_FREE))
-            break; /* allocated block linked: corrupt */
-        uint64_t block_size = raw & HEAP_SIZE_MASK;
-        if (block_size < HEAP_MIN_BLOCK || (block_size & (HEAP_ALIGNMENT - 1)) ||
-            block_size > heap_brk - baddr)
-            break;
-        heap_block_t *bnext = b->next;
-        if (bnext && ((uint64_t)(uintptr_t)bnext < HEAP_START ||
-                      (uint64_t)(uintptr_t)bnext > heap_brk ||
-                      ((uint64_t)(uintptr_t)bnext & (HEAP_ALIGNMENT - 1)) ||
-                      (uint64_t)(uintptr_t)bnext <= baddr))
-            break;
-        if (block_size >= need) {
-            uint64_t remaining = block_size - need;
-            if (remaining >= HEAP_MIN_BLOCK) {
-                heap_block_t *split = (heap_block_t *)((uint8_t *)b + need);
-                split->size = remaining | HEAP_BLOCK_FREE;
-                split->next = bnext;
-                if (prev)
-                    prev->next = split;
-                else
-                    heap_free_list = split;
-                b->size = need;
-            } else {
-                if (prev)
-                    prev->next = bnext;
-                else
-                    heap_free_list = bnext;
-                b->size = block_size;
-            }
-            b->magic = HEAP_MAGIC_USED;
-            spin_unlock_irqrestore(&heap_lock, flags);
-            return (void *)((uint8_t *)b + HEAP_HEADER_SIZE);
-        }
-        prev = b;
-        b = bnext;
-    }
-
-    uint64_t addr = heap_brk;
-    uint64_t new_brk = addr + need;
-    if (new_brk < addr || new_brk > HEAP_END) {
-        spin_unlock_irqrestore(&heap_lock, flags);
-        return NULL;
-    }
-
-    if (heap_map_until(new_brk) < 0) {
-        spin_unlock_irqrestore(&heap_lock, flags);
-        return NULL;
-    }
-    heap_brk = new_brk;
-
-    heap_block_t *block = (heap_block_t *)(uintptr_t)addr;
-    block->size = need;
-    block->magic = HEAP_MAGIC_USED;
-    spin_unlock_irqrestore(&heap_lock, flags);
-    return (void *)((uint8_t *)block + HEAP_HEADER_SIZE);
-}
-
-void *kcalloc(uint32_t count, uint32_t size) {
-    /* Guard the multiplication: an overflowed total would allocate a
-     * tiny buffer while every caller assumes the full count*size. */
-    if (count != 0 && size != 0 && size > 0xFFFFFFFFu / count)
-        return NULL;
-    uint32_t total = count * size;
-    void *ptr = kmalloc(total);
-    if (ptr) {
-        uint8_t *p = (uint8_t *)ptr;
-        for (uint32_t i = 0; i < total; i++)
-            p[i] = 0;
-    }
-    return ptr;
-}
-
-void kfree(void *addr) {
-    if (!addr)
-        return;
-
-    /* Cheap pre-check without dereferencing: rejects NULL-adjacent
-     * and wild pointers before the header is touched. */
-    uint64_t paddr = (uint64_t)(uintptr_t)addr;
-    if (paddr < HEAP_START + HEAP_HEADER_SIZE || paddr >= heap_brk ||
-        (paddr & (HEAP_ALIGNMENT - 1)) != (HEAP_HEADER_SIZE & (HEAP_ALIGNMENT - 1))) {
-        log_printf(LOG_LEVEL_ERROR, "kfree: wild pointer %p\r\n", addr);
-        return;
-    }
-
-    uint32_t flags;
-    spin_lock_irqsave(&heap_lock, &flags);
-
-    heap_block_t *b = (heap_block_t *)((uint8_t *)addr - HEAP_HEADER_SIZE);
-    uint64_t baddr = (uint64_t)(uintptr_t)b;
-    if (baddr < HEAP_START || baddr + HEAP_HEADER_SIZE > heap_brk ||
-        (baddr & (HEAP_ALIGNMENT - 1))) {
-        spin_unlock_irqrestore(&heap_lock, flags);
-        log_printf(LOG_LEVEL_ERROR, "kfree: bad header %p\r\n", addr);
-        return;
-    }
-    uint64_t raw = b->size;
-    if ((raw & HEAP_BLOCK_FREE) || b->magic != HEAP_MAGIC_USED) {
-        /* Covers double-free (FREE bit set, magic clobbered by next
-         * pointer) and wild payload pointers. */
-        spin_unlock_irqrestore(&heap_lock, flags);
-        log_printf(LOG_LEVEL_ERROR, "kfree: double-free or corrupt %p\r\n", addr);
-        return;
-    }
-    uint64_t block_size = raw & HEAP_SIZE_MASK;
-    if (!heap_size_sane(raw, baddr)) {
-        spin_unlock_irqrestore(&heap_lock, flags);
-        log_printf(LOG_LEVEL_ERROR, "kfree: bad size %p\r\n", addr);
-        return;
-    }
-
-    heap_block_t *prev = NULL;
-    heap_block_t *cur = heap_free_list;
-
-    for (uint64_t steps = 0; cur && steps < HEAP_MAX_WALK; steps++) {
-        uint64_t caddr = (uint64_t)(uintptr_t)cur;
-        if (caddr < HEAP_START || caddr + HEAP_HEADER_SIZE > heap_brk ||
-            (caddr & (HEAP_ALIGNMENT - 1)))
-            break;
-        if (caddr == baddr) { /* already linked: double-free */
-            spin_unlock_irqrestore(&heap_lock, flags);
-            log_printf(LOG_LEVEL_ERROR, "kfree: double-free %p\r\n", addr);
-            return;
-        }
-        if (caddr > baddr)
-            break;
-        prev = cur;
-        cur = cur->next;
-    }
-
-    b->size = block_size | HEAP_BLOCK_FREE;
-    b->next = cur;
-    if (prev)
-        prev->next = b;
-    else
-        heap_free_list = b;
-
-    heap_coalesce(b);
-    if (prev && (uint64_t)(uintptr_t)prev + (prev->size & HEAP_SIZE_MASK) == baddr)
-        heap_coalesce(prev);
-
-    heap_shrink();
-
-    spin_unlock_irqrestore(&heap_lock, flags);
-}
-
-void vmm_init_heap(void) {
-    heap_free_list = NULL;
-    heap_mapped_end = HEAP_START;
-    heap_brk = HEAP_START;
-
-    heap_map_until(HEAP_START + HEAP_INITIAL_PAGES * PAGE_SIZE);
-
-    log_printf(LOG_LEVEL_INFO, "vmm: heap initialized at 0x%lx\r\n", HEAP_START);
-}
-
+/* Heap now unified in mk/vm/heap.c — HAL provides heap_init/kmalloc/kfree */
 page_directory_t *vmm_create_directory(void) {
     pml4_t *dir = (pml4_t *)pmm_alloc_page();
     if (!dir)
@@ -696,6 +389,11 @@ uint64_t vmm_get_physical(page_directory_t *dir, uint64_t virt) {
     uint64_t *pte = walk_leaf(dir, virt);
     if (!pte || !(*pte & VMM_PRESENT))
         return 0;
+    /* Huge (2MB) leaves carry a 21-bit page offset, not 12-bit.
+     * Masking with 0xFFF returned the wrong phys (interior page) and
+     * callers then freed the wrong frame. */
+    if (*pte & PTE_HUGE)
+        return (*pte & PTE_ADDR_MASK) | (virt & 0x1FFFFFULL);
     return (*pte & PTE_ADDR_MASK) | (virt & 0xFFF);
 }
 
@@ -1040,19 +738,48 @@ int user_range_ok(const void *uaddr, size_t size, int write) {
 
 int copy_from_user(void *dst, const void *user_src, size_t size) {
     if (size == 0) return 0;
-    if (!user_range_ok(user_src, size, 0)) return -1;
-
-    for (size_t i = 0; i < size; i++)
-        ((uint8_t *)dst)[i] = ((const uint8_t *)(uintptr_t)user_src)[i];
+    if (!user_src) return -1;
+    uint64_t addr = (uint64_t)(uintptr_t)user_src;
+    if (addr >= USER_STACK_TOP || size > USER_STACK_TOP - addr) return -1;
+    page_directory_t *dir = vmm_get_current_directory();
+    /* Per-page validate-then-copy: re-walks each page immediately before
+     * touching it so a concurrent munmap/mprotect can only race the
+     * current 4K chunk, not the whole buffer.  COW races are safe —
+     * page_fault_handler() breaks COW for kernel faults too.  A racing
+     * unmap can still fault in kernel mode (panic); full immunity needs
+     * fault recovery/pinning, this narrows the window to one page. */
+    for (size_t offset = 0; offset < size; ) {
+        uint64_t vaddr = addr + offset;
+        int flags = vmm_get_page_flags(dir, vaddr & ~0xFFFULL);
+        if (!(flags & VMM_PRESENT) || !(flags & VMM_USER)) return -1;
+        size_t chunk = PAGE_SIZE - (vaddr & 0xFFF);
+        if (chunk > size - offset) chunk = size - offset;
+        for (size_t i = 0; i < chunk; i++)
+            ((uint8_t *)dst)[offset + i] =
+                ((const uint8_t *)(uintptr_t)vaddr)[i];
+        offset += chunk;
+    }
     return 0;
 }
 
 int copy_to_user(void *user_dst, const void *src, size_t size) {
     if (size == 0) return 0;
-    if (!user_range_ok(user_dst, size, 1)) return -1;
-
-    for (size_t i = 0; i < size; i++)
-        ((uint8_t *)(uintptr_t)user_dst)[i] = ((const uint8_t *)src)[i];
+    if (!user_dst) return -1;
+    uint64_t addr = (uint64_t)(uintptr_t)user_dst;
+    if (addr >= USER_STACK_TOP || size > USER_STACK_TOP - addr) return -1;
+    page_directory_t *dir = vmm_get_current_directory();
+    for (size_t offset = 0; offset < size; ) {
+        uint64_t vaddr = addr + offset;
+        int flags = vmm_get_page_flags(dir, vaddr & ~0xFFFULL);
+        if (!(flags & VMM_PRESENT) || !(flags & VMM_USER)) return -1;
+        if (!(flags & (VMM_WRITABLE | VMM_COW))) return -1;
+        size_t chunk = PAGE_SIZE - (vaddr & 0xFFF);
+        if (chunk > size - offset) chunk = size - offset;
+        for (size_t i = 0; i < chunk; i++)
+            ((uint8_t *)(uintptr_t)vaddr)[i] =
+                ((const uint8_t *)src)[offset + i];
+        offset += chunk;
+    }
     return 0;
 }
 

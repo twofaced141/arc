@@ -41,6 +41,7 @@
 #include "debug.h"
 #include "string.h"
 #include "pmm.h"
+#include "memory.h"
 /* errno definitions — bsd/include/bsd/errno.h */
 #define EAGAIN  11
 #define EINVAL  22
@@ -92,7 +93,10 @@ static int pager_fault_find_by_tid(uint32_t tid) {
     return -1;
 }
 
-/* ---- Internal: resolve a paging port handle to an ipc_port_t* ---- */
+/* ---- Internal: resolve a paging port handle to an ipc_port_t* ----
+ * Uses task_find_hold + snapshot + port table ref so a concurrent
+ * task_destroy cannot free the task/cspace between lookup and use.
+ * Caller must port_release() the returned port. */
 static ipc_port_t *pager_resolve_port(uint64_t handle) {
     if (!handle)
         return NULL;
@@ -100,17 +104,35 @@ static ipc_port_t *pager_resolve_port(uint64_t handle) {
     uint32_t task_id = handle_task_id(handle);
     int slot = handle_slot(handle);
 
-    task_t *t = task_find(task_id);
+    uint32_t task_flags;
+    task_t *t = task_find_hold(task_id, &task_flags);
     if (!t)
         return NULL;
 
-    cslot_t *cs = cspace_lookup(&t->cspace, slot);
-    if (!cs || cs->type != CAP_PORT)
+    cslot_t snap;
+    if (cspace_lookup_snapshot(&t->cspace, slot, &snap) < 0) {
+        task_put(t, task_flags);
         return NULL;
-    if (!(cs->rights & CAP_SEND))
-        return NULL;
+    }
+    /* Snapshot the object id, drop the task lock, then take a port
+     * table reference: the ref keeps the port alive even if the task
+     * dies right after. */
+    cslot_t local = snap;
+    task_put(t, task_flags);
+    return port_from_cslot(&local, CAP_SEND);
+}
 
-    return (ipc_port_t *)(uintptr_t)cs->object_id;
+/* Pager-supplied phys must be a page-aligned RAM frame.  Without this a
+ * compromised/malicious pager maps kernel text, page tables, or MMIO
+ * into the victim.  RAM range is total_pages*PAGE_SIZE (pmm reports the
+ * top of usable RAM); anything above is device/reserved. */
+static int pager_phys_valid(uint64_t phys) {
+    if (phys == 0 || (phys & (PAGE_SIZE - 1)))
+        return 0;
+    uint64_t top = (uint64_t)pmm_get_total_pages() * PAGE_SIZE;
+    if (phys >= top)
+        return 0;
+    return 1;
 }
 
 /* ================================================================
@@ -217,6 +239,7 @@ int vm_pager_send_fault(uint64_t paging_port_handle,
 
     /* Send the fault request to the pager port */
     int ret = port_send(pager_port, &msg, cur_task);
+    port_release(pager_port);
     if (ret != IPC_OK) {
         /* Clean up on send failure */
         cspace_free_slot(&cur_task->cspace, reply_slot);
@@ -254,8 +277,8 @@ int vm_pager_send_fault(uint64_t paging_port_handle,
     cspace_free_slot(&cur_task->cspace, reply_slot);
     port_destroy(reply_port);
 
-    if (phys == 0) {
-        debug_print("vm_pager: pager replied with zero phys_addr\r\n");
+    if (!pager_phys_valid(phys)) {
+        debug_print("vm_pager: pager replied with invalid phys_addr\r\n");
         return -EINVAL;
     }
 
@@ -280,7 +303,7 @@ int vm_pager_send_fault(uint64_t paging_port_handle,
  *   0 on success, -ESRCH if no matching fault_tid found.
  * ================================================================ */
 int vm_pager_handle_reply(uint64_t fault_tid, uint64_t phys_addr) {
-    if (fault_tid == 0 || phys_addr == 0)
+    if (fault_tid == 0 || !pager_phys_valid(phys_addr))
         return -EINVAL;
 
     uint32_t flags;

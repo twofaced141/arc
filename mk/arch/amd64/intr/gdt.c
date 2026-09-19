@@ -53,13 +53,13 @@ static struct tss per_cpu_tss[CPU_MAX];
 
 /* Dedicated stacks for exceptions that must never run on the thread stack:
  * a double fault (e.g. overflowed/corrupt kernel stack) or NMI landing on
- * the broken stack would otherwise push it into a triple fault.  Shared by
- * all CPUs' TSS IST entries (a simultaneous DF/NMI on two CPUs is not
- * survivable anyway). */
+ * the broken stack would otherwise push it into a triple fault.  Each CPU
+ * owns private IST1/IST2 stacks: sharing one DF/NMI stack across CPUs let
+ * simultaneous faults corrupt each other into a triple fault. */
 #define DF_STACK_SIZE  16384
 #define NMI_STACK_SIZE 8192
-static uint8_t df_stack[DF_STACK_SIZE] __attribute__((aligned(16)));
-static uint8_t nmi_stack[NMI_STACK_SIZE] __attribute__((aligned(16)));
+static uint8_t df_stacks[CPU_MAX][DF_STACK_SIZE] __attribute__((aligned(16)));
+static uint8_t nmi_stacks[CPU_MAX][NMI_STACK_SIZE] __attribute__((aligned(16)));
 
 void tss_set_kernel_stack(uint64_t rsp0) {
     struct cpu *c = cpu_current();
@@ -98,8 +98,8 @@ void gdt_install(void) {
     for (unsigned i = 0; i < CPU_MAX; i++) {
         for (uint32_t w = 0; w < sizeof(struct tss) / 8; w++)
             ((uint64_t *)&per_cpu_tss[i])[w] = 0;
-        per_cpu_tss[i].ist1 = (uint64_t)(uintptr_t)&df_stack[DF_STACK_SIZE];
-        per_cpu_tss[i].ist2 = (uint64_t)(uintptr_t)&nmi_stack[NMI_STACK_SIZE];
+        per_cpu_tss[i].ist1 = (uint64_t)(uintptr_t)&df_stacks[i][DF_STACK_SIZE];
+        per_cpu_tss[i].ist2 = (uint64_t)(uintptr_t)&nmi_stacks[i][NMI_STACK_SIZE];
         gdt_set_tss_descriptor(GDT_TSS_ENTRY(i), (uint64_t)&per_cpu_tss[i],
                                sizeof(struct tss) - 1);
     }

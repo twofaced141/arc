@@ -296,6 +296,20 @@ void mk_init(struct arc_boot_info *boot_info) {
             uint64_t cr4;
             __asm__ __volatile__("mov %%cr4, %0" : "=r"(cr4));
             cr4 |= (1 << 9) | (1 << 10);
+            /* SMEP (20) / SMAP (21) when available: check CPUID.7:0:EBX
+             * before setting, otherwise #GP on older CPUs.  Ret2usr
+             * without these is trivial once any kernel RIP hijack
+             * exists (heap/stack are now NX, but SMEP/SMAP close the
+             * remaining user-memory execution/access window). */
+            {
+                uint32_t eax = 7, ecx = 0, ebx = 0, edx = 0;
+                __asm__ __volatile__("cpuid"
+                                     : "+a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx));
+                if (ebx & (1u << 7))
+                    cr4 |= (1ULL << 20); /* SMEP */
+                if (ebx & (1u << 20))
+                    cr4 |= (1ULL << 21); /* SMAP */
+            }
             __asm__ __volatile__("mov %0, %%cr4" : : "r"(cr4));
         }
         vmm_init();

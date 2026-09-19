@@ -54,6 +54,16 @@
 #define ECHO   0x0008
 #define VMIN   6
 #define VTIME  5
+#define VINTR  0
+#define VQUIT  1
+#define VERASE 2
+#define VKILL  3
+#define VEOF   4
+#define VSUSP  10
+#define VSTART 8
+#define VSTOP  9
+#define VEOL   11
+#define VEOL2  16
 
 typedef struct termios {
     uint32_t c_iflag;

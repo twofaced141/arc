@@ -178,6 +178,7 @@ typedef struct proc {
      * killed by a signal (or stopped, for stopped children). */
     uint8_t exit_sig;
     uint8_t stopped;
+    uint8_t continued; /* SIGCONT after stop — report via WCONTINUED */
 
     /* Credentials */
     uint32_t uid;
@@ -273,10 +274,14 @@ void    proc_exit(int exitcode, registers_t *r);
 void    proc_thread_exit(int exitcode);  /* exit a clone thread (group member) */
 void    proc_kill_by_signal(int sig, registers_t *r);
 pid_t   proc_waitpid(pid_t pid, int *status, int options);
+pid_t   proc_setsid(void);
+int     proc_setpgid(pid_t pid, pid_t pgid);
+int     proc_killpg(pid_t pgrp, int sig);
 
 /* waitpid(2) options */
-#define WNOHANG   1
-#define WUNTRACED 2
+#define WNOHANG    1
+#define WUNTRACED  2
+#define WCONTINUED 8
 
 /* wait status encoding (Linux/BSD compatible) */
 #define WIFEXITED(s)    (((s) & 0x7F) == 0)
@@ -285,6 +290,7 @@ pid_t   proc_waitpid(pid_t pid, int *status, int options);
 #define WTERMSIG(s)     ((s) & 0x7F)
 #define WIFSTOPPED(s)   (((s) & 0xFF) == 0x7F)
 #define WSTOPSIG(s)     (((s) >> 8) & 0xFF)
+#define WIFCONTINUED(s) ((s) == 0xFFFF)
 
 /* Process file descriptor operations */
 int     proc_fd_alloc(proc_t *p);

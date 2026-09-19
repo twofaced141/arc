@@ -177,6 +177,9 @@ void syscall_init(void) {
     syscall_table[SYS_SYSINFO]   = sys_sysinfo;
     syscall_table[SYS_GETRLIMIT] = sys_getrlimit;
     syscall_table[SYS_SETRLIMIT] = sys_setrlimit;
+    syscall_table[SYS_SETSID]    = sys_setsid;
+    syscall_table[SYS_SETPGID]   = sys_setpgid;
+    syscall_table[SYS_KILLPG]    = sys_killpg;
 
     /* Networking */
     syscall_table[SYS_SOCKET]      = sys_socket;

@@ -185,7 +185,12 @@ typedef struct proc proc_t;
 #define SYS_GETSOCKOPT  105
 #define SYS_SHUTDOWN    106
 
-#define SYS_MAX         108
+/* Process group / session (POSIX) */
+#define SYS_SETSID      109
+#define SYS_SETPGID     110
+#define SYS_KILLPG      111
+
+#define SYS_MAX         112
 
 /* Syscall dispatch */
 void syscall_init(void);
@@ -267,6 +272,9 @@ int64_t sys_uname(proc_t *p, registers_t *r);
 int64_t sys_sysinfo(proc_t *p, registers_t *r);
 int64_t sys_getrlimit(proc_t *p, registers_t *r);
 int64_t sys_setrlimit(proc_t *p, registers_t *r);
+int64_t sys_setsid(proc_t *p, registers_t *r);
+int64_t sys_setpgid(proc_t *p, registers_t *r);
+int64_t sys_killpg(proc_t *p, registers_t *r);
 
 /* Driver support syscalls */
 int64_t sys_phys_map(proc_t *p, registers_t *r);

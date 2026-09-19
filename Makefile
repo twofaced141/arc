@@ -116,8 +116,12 @@ ifeq ($(DEBUG),1)
 endif
 
 CFLAGS   = -ffreestanding -nostdlib -nostartfiles -nodefaultlibs \
-           -Wall -Wextra -std=c17 \
-           -fno-pic -no-pie -fno-stack-protector \
+           -Wall -Wextra -Werror -std=c17 \
+           -MMD -MP \
+           -Wno-error=unused-function -Wno-error=unused-parameter -Wno-error=unused-variable \
+           -Wno-error=unused-but-set-variable -Wno-error=sign-compare -Wno-error=overflow \
+           -Wno-error=unused-value -Wno-error=pointer-to-int-cast -Wno-error=int-to-pointer-cast \
+           -fno-pic -no-pie -fstack-protector-strong \
            -fno-asynchronous-unwind-tables $(CFLAGS_X86) -O$(OPT) \
            -fno-builtin \
            $(CC_ARCH) $(DEBUG_FLAGS)
@@ -144,7 +148,11 @@ OBJS   = $(patsubst %.c,%.o,$(SRCS_C)) \
 # =====================================================================
 
 USER_CFLAGS = -ffreestanding -nostdlib -nostartfiles -nodefaultlibs \
-              -Wall -Wextra -std=c17 \
+              -Wall -Wextra -Werror -std=c17 \
+              -MMD -MP \
+              -Wno-error=unused-function -Wno-error=unused-parameter -Wno-error=unused-variable \
+              -Wno-error=unused-but-set-variable -Wno-error=sign-compare -Wno-error=unused-value \
+              -Wno-error=pointer-to-int-cast -Wno-error=int-to-pointer-cast \
               -fno-pic -no-pie -fno-stack-protector \
               -fno-asynchronous-unwind-tables \
               $(CFLAGS_X86) \
@@ -232,9 +240,9 @@ user/tests/sigexec/sigexec.elf: user/tests/sigexec/sigexec.o user/tests/sigexec/
 	$(LD) $(USER_LDFLAGS) -T user/tests/sigexec/sigexec.ld -o $@ user/tests/sigexec/sigexec.o
 
 # lwIP is whitelisted and needs different warnings (upstream triggers -Wunused-parameter etc.)
-bsd/net/lwip/%.o: CFLAGS += -Wno-unused-parameter -Wno-unused-function -Wno-sign-compare -Wno-missing-field-initializers
+bsd/net/lwip/%.o: CFLAGS += -Wno-unused-parameter -Wno-unused-function -Wno-sign-compare -Wno-missing-field-initializers -Wno-unused-value -Wno-error
 # bsd/net/ (our wrapper) also sees lwIP headers
-bsd/net/%.o: CFLAGS += -Wno-unused-parameter
+bsd/net/%.o: CFLAGS += -Wno-unused-parameter -Wno-unused-value -Wno-error
 
 %.o: %.c
 	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ $<
@@ -276,7 +284,11 @@ clean:
 # =====================================================================
 
 HOST_CC     ?= gcc
-HOST_CFLAGS  = -Wall -Wextra -std=c17 -g -O0 \
+HOST_CFLAGS  = -Wall -Wextra -std=c17 -g -O0 -Werror -MMD -MP \
+               -fstack-protector-strong -fsanitize=address,undefined \
+               -Wno-error=unused-function -Wno-error=unused-parameter -Wno-error=unused-variable \
+               -Wno-error=unused-but-set-variable -Wno-error=sign-compare -Wno-error=unused-value \
+               -Wno-error=pointer-to-int-cast -Wno-error=int-to-pointer-cast \
                -I mk/include -I include -I . \
                -DHOST_TEST \
                $(HOST_BSD_FLAGS)

@@ -86,10 +86,14 @@ int64_t sys_phys_map(proc_t *p, registers_t *r) {
     if (!p || !p->page_dir) return -1;
     if (size == 0) return -1;
 
-    /* Align phys down, size up to page boundaries */
+    /* Align phys down, size up to page boundaries, rejecting overflow:
+     * offset+size near 2^64 wrapped map_size to 0 and mapped nothing
+     * while passing the capability check for a 0-length range. */
     uint64_t phys_page = phys & ~(PAGE_SIZE - 1ULL);
     uint64_t offset    = phys - phys_page;
+    if (size > ~0ULL - offset - (PAGE_SIZE - 1ULL)) return -1;
     uint64_t map_size  = (offset + size + PAGE_SIZE - 1ULL) & ~(PAGE_SIZE - 1ULL);
+    if (map_size == 0) return -1;
     uint64_t virt_page;
 
     /* Capability gate: the range must be an MMIO resource of a device
@@ -107,6 +111,7 @@ int64_t sys_phys_map(proc_t *p, registers_t *r) {
      * page tables and overwrite a GLOBAL PTE (visible to every
      * process) with its own MMIO frame. */
     if (virt != 0) {
+        if (virt < offset) return -1;
         virt_page = virt - offset;
         if ((virt & (PAGE_SIZE - 1)) || virt_page < USER_BASE ||
             virt_page > USER_STACK_TOP ||
@@ -124,7 +129,9 @@ int64_t sys_phys_map(proc_t *p, registers_t *r) {
         p->mmap_cursor = (uintptr_t)(virt_page + map_size);
     }
 
-    uint32_t vmm_flags = VMM_PRESENT | VMM_USER | VMM_WRITABLE;
+    /* MMIO is device memory: never executable.  VMM_NX is 0 on i386
+     * (no-op there). */
+    uint64_t vmm_flags = VMM_PRESENT | VMM_USER | VMM_WRITABLE | VMM_NX;
     if (flags & 1)
         vmm_flags |= VMM_CACHE_DISABLE;
 
@@ -146,14 +153,14 @@ int64_t sys_phys_map(proc_t *p, registers_t *r) {
 
 /* ---- 2. DMA buffer allocation ---- */
 
-/* Result struct for dma_alloc — written to user-provided pointer.
- * MUST mirror libdriver.h's dma_buf_t { void *virt; uint32_t phys; }:
- * virt is pointer-sized so the driver can use it directly; padding it
- * as two uint32s once glued a bogus high dword onto the pointer and
- * crashed the driver in memset. */
+/* Result struct for dma_alloc.
+ * phys is 64-bit: truncating to u32 programmed devices with the low
+ * half of a >4G buffer (DMA to the wrong phys).  On LP64 the layout
+ * stays 16 bytes ({ptr, u64} vs old {ptr, u32+pad}), so existing
+ * 64-bit drivers keep working (low 32 bits at the same offset). */
 typedef struct {
     uintptr_t virt;
-    uint32_t phys;
+    uint64_t phys;
 } dma_alloc_result_t;
 
 int64_t sys_dma_alloc(proc_t *p, registers_t *r) {
@@ -169,10 +176,13 @@ int64_t sys_dma_alloc(proc_t *p, registers_t *r) {
     if (!dev_handle_any(p) && io_channel_owned_by(p->pid) == 0)
         return -1;
 
-    uint32_t count = (uint32_t)((size + PAGE_SIZE - 1ULL) / PAGE_SIZE);
-    if (count == 0) return -1;
-    /* Cap the allocation so the cursor below can never run away. */
-    if (count > 4096) return -1;   /* 16 MB */
+    /* Compute the page count in 64 bits first: the old
+     * (uint32_t)((size+FFF)/4K) truncated sizes near 16TB*2^k to a
+     * small count and bypassed the 4096 cap. */
+    if (size > ~0ULL - (PAGE_SIZE - 1ULL)) return -1;
+    uint64_t pages64 = (size + PAGE_SIZE - 1ULL) / PAGE_SIZE;
+    if (pages64 == 0 || pages64 > 4096) return -1;   /* 16 MB cap */
+    uint32_t count = (uint32_t)pages64;
 
     /* Allocate physically contiguous pages */
     void *phys = pmm_alloc_pages(count);
@@ -190,7 +200,7 @@ int64_t sys_dma_alloc(proc_t *p, registers_t *r) {
     }
     p->mmap_cursor = virt + count * PAGE_SIZE;
 
-    uint32_t vmm_flags = VMM_PRESENT | VMM_USER | VMM_WRITABLE;
+    uint64_t vmm_flags = VMM_PRESENT | VMM_USER | VMM_WRITABLE | VMM_NX;
     for (uint32_t i = 0; i < count; i++) {
 #if defined(__x86_64__) || defined(__aarch64__)
         if (vmm_map_page(p->page_dir, (uint64_t)phys + i * PAGE_SIZE,
@@ -207,15 +217,15 @@ int64_t sys_dma_alloc(proc_t *p, registers_t *r) {
     /* Write result back to userspace */
     dma_alloc_result_t result;
     result.virt = (uintptr_t)virt;
-    result.phys = (uint32_t)(uintptr_t)phys;
+    result.phys = (uint64_t)(uintptr_t)phys;
 
     if (copy_to_user(user_result, &result, sizeof(result)) < 0) {
         pmm_free_pages(phys, count);
         return -1;
     }
 
-    log_printf(LOG_LEVEL_DEBUG, "dma_alloc: size=0x%lx count=%u phys=0x%x virt=0x%x\n",
-                 size, count, result.phys, result.virt);
+    log_printf(LOG_LEVEL_DEBUG, "dma_alloc: size=0x%lx count=%u phys=0x%lx virt=0x%lx\n",
+                 size, count, (unsigned long)result.phys, (unsigned long)result.virt);
     return 0;
 }
 
@@ -532,23 +542,27 @@ int64_t sys_service_query(proc_t *p, registers_t *r) {
     while (desc_len < SERVICE_DESC_MAX &&
            service_table[idx].desc[desc_len] != '\0')
         desc_len++;
-    size_t copy_len = (len < desc_len) ? len : desc_len;
+    /* Copy under lock into a kernel temp, then release before touching
+     * user memory: copy_to_user can fault/COW-allocate (pmm lock) and
+     * must never run with service_lock held and IRQs off. */
+    char kbuf[SERVICE_DESC_MAX];
+    size_t copy_len = (len < desc_len) ? (size_t)len : desc_len;
+    if (copy_len > sizeof(kbuf)) copy_len = sizeof(kbuf);
+    for (size_t i = 0; i < copy_len; i++)
+        kbuf[i] = service_table[idx].desc[i];
+    spin_unlock_irqrestore(&service_lock, flags);
+
     if (copy_len > 0) {
-        if (copy_to_user(user_buf, service_table[idx].desc, copy_len) < 0) {
-            spin_unlock_irqrestore(&service_lock, flags);
+        if (copy_to_user(user_buf, kbuf, copy_len) < 0)
             return -1;
-        }
     }
 
     /* NUL-terminate the caller buffer if there is room. */
     if (copy_len < len) {
         char nul = '\0';
-        if (copy_to_user(user_buf + copy_len, &nul, 1) < 0) {
-            spin_unlock_irqrestore(&service_lock, flags);
+        if (copy_to_user(user_buf + copy_len, &nul, 1) < 0)
             return -1;
-        }
     }
-    spin_unlock_irqrestore(&service_lock, flags);
 
     return (int)copy_len;
 }

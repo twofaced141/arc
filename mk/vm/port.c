@@ -518,8 +518,9 @@ int port_notify(ipc_port_t *port) {
  * Returns the port with one reference taken (caller must
  * port_release()), or NULL if the slot is not a usable port
  * capability.  The reference closes the destroy-vs-use window: the
- * port memory stays alive until we are done with it. */
-static ipc_port_t *port_from_cslot(cslot_t *cs, uint32_t need_rights) {
+ * port memory stays alive until we are done with it. Exported for
+ * vm_pager.c which resolves foreign-task pager handles. */
+ipc_port_t *port_from_cslot(cslot_t *cs, uint32_t need_rights) {
     if (!cs || cs->type != CAP_PORT)
         return NULL;
     if (!(cs->rights & need_rights))

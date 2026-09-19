@@ -142,6 +142,24 @@ static int vmm_present(proc_t *p, uintptr_t page) {
     return vmm_is_page_present(p->page_dir, page);
 }
 
+/* Free one user page iff it is private RAM: skip COW-shared (still used
+ * by parent/child) and MMIO (VMM_CACHE_DISABLE — device memory, never
+ * from the PMM allocator; freeing it corrupts the bitmap / aliases
+ * devices as RAM). */
+static void free_user_page(proc_t *p, uintptr_t pg) {
+    uint64_t phys = vmm_get_physical(p->page_dir, pg);
+    if (!phys)
+        goto unmap;
+    int fl = vmm_get_page_flags(p->page_dir, pg);
+    if (fl & VMM_COW)
+        goto unmap;
+    if (fl & VMM_CACHE_DISABLE)
+        goto unmap;
+    pmm_free_page((void *)(uintptr_t)phys);
+unmap:
+    vmm_unmap_page(p->page_dir, pg);
+}
+
 /* Materialize one page of a region: allocate, zero-fill, page in file
  * contents for file-backed regions.  Returns 0 or -ENOMEM. */
 static int region_materialize(proc_t *p, mmap_region_t *r, uintptr_t page) {
@@ -167,14 +185,13 @@ static int region_materialize(proc_t *p, mmap_region_t *r, uintptr_t page) {
     vmm_temp_unmap();
 
     /* VMM_NX lives at PTE bit 63 on amd64 — keep the flags wide or
-     * the bit silently truncates away and pages stay executable. */
+     * the bit silently truncates away and pages stay executable.
+     * arm64 maps VMM_NX to PXN, i386 defines it as 0 (no-op). */
     uint64_t flags = VMM_PRESENT | VMM_USER;
     if (r->prot & PROT_WRITE)
         flags |= VMM_WRITABLE;
-#if defined(__x86_64__)
     if (!(r->prot & PROT_EXEC))
         flags |= VMM_NX;
-#endif
 
     if (vmm_map_page(p->page_dir, (uintptr_t)phys, page, flags) < 0) {
         pmm_free_page(phys);
@@ -228,6 +245,11 @@ int64_t sys_mmap(proc_t *p, registers_t *r) {
         return -EINVAL;
     if (prot & ~(PROT_READ | PROT_WRITE | PROT_EXEC))
         return -EINVAL;
+    /* W^X: never allow a mapping that is both writable and executable.
+     * RWX is the classic shellcode primitive; JITs must map RX and
+     * remap (which mprotect also rejects). */
+    if ((prot & PROT_WRITE) && (prot & PROT_EXEC))
+        return -EACCES;
     if ((flags & (MAP_PRIVATE | MAP_SHARED)) == 0 ||
         (flags & (MAP_PRIVATE | MAP_SHARED)) == (MAP_PRIVATE | MAP_SHARED))
         return -EINVAL;
@@ -268,6 +290,11 @@ int64_t sys_mmap(proc_t *p, registers_t *r) {
 
     if (start & (PAGE_SIZE - 1))
         start &= ~(uintptr_t)(PAGE_SIZE - 1);
+    /* Lower bound: MAP_FIXED must not aim below USER_BASE (null page,
+     * kernel identity map 0-64M).  Auto-placed mappings already come
+     * from mmap_cursor >= USER_MMAP_START. */
+    if (start < USER_BASE)
+        return -ENOMEM;
     if (start + pagelen < start || start + pagelen > USER_STACK_TOP)
         return -ENOMEM;
 
@@ -290,12 +317,8 @@ int64_t sys_mmap(proc_t *p, registers_t *r) {
 
         uintptr_t ustart = start > old->start ? start : old->start;
         uintptr_t uend   = end < oend ? end : oend;
-        for (uintptr_t pg = ustart; pg < uend; pg += PAGE_SIZE) {
-            uint64_t phys = vmm_get_physical(p->page_dir, pg);
-            if (phys && !(vmm_get_page_flags(p->page_dir, pg) & VMM_COW))
-                pmm_free_page((void *)(uintptr_t)phys);
-            vmm_unmap_page(p->page_dir, pg);
-        }
+        for (uintptr_t pg = ustart; pg < uend; pg += PAGE_SIZE)
+            free_user_page(p, pg);
 
         if (ustart == old->start && uend == oend) {
             region_slot_free(p, old);              /* fully replaced */
@@ -326,12 +349,8 @@ int64_t sys_mmap(proc_t *p, registers_t *r) {
                     vnode_ref((vnode_t *)old->vnode);
             } else {
                 /* No slots left: drop the tail rather than leak. */
-                for (uintptr_t pg = uend; pg < oend; pg += PAGE_SIZE) {
-                    uint64_t phys = vmm_get_physical(p->page_dir, pg);
-                    if (phys && !(vmm_get_page_flags(p->page_dir, pg) & VMM_COW))
-                        pmm_free_page((void *)(uintptr_t)phys);
-                    vmm_unmap_page(p->page_dir, pg);
-                }
+                for (uintptr_t pg = uend; pg < oend; pg += PAGE_SIZE)
+                    free_user_page(p, pg);
             }
             old->len = ustart - old->start;
         }
@@ -390,15 +409,11 @@ int64_t sys_munmap(proc_t *p, registers_t *r) {
         if (addr >= rend || end <= rstart)
             continue;   /* no overlap */
 
-        /* Unmap the covered pages and free them (skip COW-shared). */
+        /* Unmap the covered pages and free them (skip COW-shared/MMIO). */
         uintptr_t ustart = addr > rstart ? addr : rstart;
         uintptr_t uend   = end < rend ? end : rend;
-        for (uintptr_t pg = ustart; pg < uend; pg += PAGE_SIZE) {
-            uint64_t phys = vmm_get_physical(p->page_dir, pg);
-            if (phys && !(vmm_get_page_flags(p->page_dir, pg) & VMM_COW))
-                pmm_free_page((void *)(uintptr_t)phys);
-            vmm_unmap_page(p->page_dir, pg);
-        }
+        for (uintptr_t pg = ustart; pg < uend; pg += PAGE_SIZE)
+            free_user_page(p, pg);
 
         if (ustart == rstart && uend == rend) {
             region_slot_free(p, rgn);         /* whole region gone */
@@ -414,12 +429,8 @@ int64_t sys_munmap(proc_t *p, registers_t *r) {
                            (vnode_t *)rgn->vnode,
                            rgn->offset + (int64_t)(uend - rstart)) < 0) {
                 /* Out of slots: drop the tail rather than leak. */
-                for (uintptr_t pg = uend; pg < rend; pg += PAGE_SIZE) {
-                    uint64_t phys = vmm_get_physical(p->page_dir, pg);
-                    if (phys && !(vmm_get_page_flags(p->page_dir, pg) & VMM_COW))
-                        pmm_free_page((void *)(uintptr_t)phys);
-                    vmm_unmap_page(p->page_dir, pg);
-                }
+                for (uintptr_t pg = uend; pg < rend; pg += PAGE_SIZE)
+                    free_user_page(p, pg);
                 region_slot_free(p, rgn);
                 continue;
             }
@@ -438,6 +449,8 @@ int64_t sys_mprotect(proc_t *p, registers_t *r) {
 
     if (prot & ~(PROT_READ | PROT_WRITE | PROT_EXEC))
         return -EINVAL;
+    if ((prot & PROT_WRITE) && (prot & PROT_EXEC))
+        return -EACCES;
     if (addr & (PAGE_SIZE - 1))
         return -EINVAL;
     if (len == 0)
@@ -478,14 +491,7 @@ int64_t sys_mprotect(proc_t *p, registers_t *r) {
              * silently writing one physical page.  On allocation
              * failure report ENOMEM (POSIX allows it here). */
             if (prot & PROT_WRITE) {
-#if defined(__aarch64__)
-                /* arm64 PTEs carry no VMM_COW flag bit (COW pages are
-                 * simply read-only), so any not-yet-writable page may
-                 * be shared — break it before granting write access. */
-                int cow = !(fl & VMM_WRITABLE);
-#else
                 int cow = (fl & VMM_COW) != 0;
-#endif
                 if (cow) {
                     if (!vmm_cow_break(p->page_dir, pg))
                         return -ENOMEM;
@@ -494,11 +500,9 @@ int64_t sys_mprotect(proc_t *p, registers_t *r) {
             }
 
             uint64_t new = fl & ~((uint64_t)VMM_WRITABLE);
-#if defined(__x86_64__)
             new &= ~VMM_NX;
             if (!(prot & PROT_EXEC))
                 new |= VMM_NX;
-#endif
             if (prot & PROT_WRITE)
                 new |= VMM_WRITABLE;
             vmm_map_page(p->page_dir, vmm_get_physical(p->page_dir, pg), pg, new);

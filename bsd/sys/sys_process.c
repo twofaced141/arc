@@ -179,27 +179,30 @@ static int proc_brk_resize(proc_t *p, uint64_t new_brk) {
             memset(tmp, 0, PAGE_SIZE);
             vmm_temp_unmap();
             if (vmm_map_page(p->page_dir, (uintptr_t)phys, vaddr,
-                             VMM_PRESENT | VMM_USER | VMM_WRITABLE) < 0) {
+                             VMM_PRESENT | VMM_USER | VMM_WRITABLE | VMM_NX) < 0) {
                 pmm_free_page(phys);
                 goto rollback;
             }
         }
     } else if (new_top < old_top) {
         for (uint64_t rv = new_top; rv < old_top; rv += PAGE_SIZE) {
+            int fl = vmm_get_page_flags(p->page_dir, rv);
             uint64_t phys = vmm_get_physical(p->page_dir, rv);
-            vmm_unmap_page(p->page_dir, rv);
-            if (phys)
+            /* Never free COW-shared (parent still maps it) or MMIO. */
+            if (phys && !(fl & VMM_COW) && !(fl & VMM_CACHE_DISABLE))
                 pmm_free_page((void *)(uintptr_t)phys);
+            vmm_unmap_page(p->page_dir, rv);
         }
     }
     return 0;
 
 rollback:
     for (uint64_t rv = old_top; rv < vaddr; rv += PAGE_SIZE) {
+        int fl = vmm_get_page_flags(p->page_dir, rv);
         uint64_t phys = vmm_get_physical(p->page_dir, rv);
-        vmm_unmap_page(p->page_dir, rv);
-        if (phys)
+        if (phys && !(fl & VMM_COW) && !(fl & VMM_CACHE_DISABLE))
             pmm_free_page((void *)(uintptr_t)phys);
+        vmm_unmap_page(p->page_dir, rv);
     }
     return -ENOMEM;
 }
@@ -425,5 +428,25 @@ int64_t sys_futex(proc_t *p, registers_t *r) {
     default:
         return -ENOSYS;
     }
+}
+
+int64_t sys_setsid(proc_t *p, registers_t *r) {
+    (void)p;
+    (void)r;
+    return proc_setsid();
+}
+
+int64_t sys_setpgid(proc_t *p, registers_t *r) {
+    (void)p;
+    pid_t pid = (pid_t)ARG1(r);
+    pid_t pgid = (pid_t)ARG2(r);
+    return proc_setpgid(pid, pgid);
+}
+
+int64_t sys_killpg(proc_t *p, registers_t *r) {
+    (void)p;
+    pid_t pgrp = (pid_t)ARG1(r);
+    int sig = (int)ARG2(r);
+    return proc_killpg(pgrp, sig);
 }
 

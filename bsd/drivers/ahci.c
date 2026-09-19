@@ -471,10 +471,21 @@ static int ahci_write_sectors(uint32_t lba, int count, const void *buf) {
 }
 
 
+/* 28-bit LBA limit of the READ/WRITE DMA (non-EXT) commands used
+ * below: lba4/lba5 are zero and device carries only bits 24..27.
+ * Anything at/above 2^28 would silently wrap to the wrong sectors
+ * (partition escape), so reject it instead of truncating. */
+#define AHCI_LBA28_MAX ((uint64_t)0x0FFFFFFFULL)
+
 static int ahci_block_read(block_dev_t *dev, uint64_t lba, void *buf, size_t count) {
     (void)dev;
     uint8_t *ptr = (uint8_t *)buf;
 
+    if (count == 0) return 0;
+    if (count > ahci_dev.total_sectors) return -1;
+    if (lba > AHCI_LBA28_MAX) return -1;
+    if (lba + count - 1 > AHCI_LBA28_MAX) return -1;
+    if (lba + count < lba) return -1;
     while (count > 0) {
         size_t batch = (count > MAX_DMA_SECTORS) ? MAX_DMA_SECTORS : count;
         if (ahci_read_sectors((uint32_t)lba, (int)batch, ptr) < 0)
@@ -490,6 +501,11 @@ static int ahci_block_write(block_dev_t *dev, uint64_t lba, const void *buf, siz
     (void)dev;
     const uint8_t *ptr = (const uint8_t *)buf;
 
+    if (count == 0) return 0;
+    if (count > ahci_dev.total_sectors) return -1;
+    if (lba > AHCI_LBA28_MAX) return -1;
+    if (lba + count - 1 > AHCI_LBA28_MAX) return -1;
+    if (lba + count < lba) return -1;
     while (count > 0) {
         size_t batch = (count > MAX_DMA_SECTORS) ? MAX_DMA_SECTORS : count;
         if (ahci_write_sectors((uint32_t)lba, (int)batch, ptr) < 0)

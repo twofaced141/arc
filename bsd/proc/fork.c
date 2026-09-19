@@ -98,6 +98,10 @@ int proc_fork(registers_t *r) {
      * own vnode reference for lazy faults in the child). */
     mmap_fork(parent, child);
 
+    child->heap_end = parent->heap_end;
+    child->mmap_cursor = parent->mmap_cursor;
+    child->mmap_next = parent->mmap_next;
+
     child->ppid = parent->pid;
     child->tgid = child->pid;    /* group leader of its own thread group */
     child->pgrp = parent->pgrp;

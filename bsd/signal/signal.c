@@ -99,13 +99,24 @@ int signal_deliver(proc_t *p, int sig, registers_t *r) {
         case SIGACT_STOP:
             p->state = PRS_STOPPED;
             p->stopped = 1;
+            p->continued = 0;
             p->exit_sig = (uint8_t)sig;
             p->signals.pending[sig] = 0;
+            {
+                proc_t *parent = proc_find(p->ppid);
+                if (parent) waitq_wake_all(&parent->waitq);
+            }
             return 0;
         case SIGACT_CONT:
-            p->state = PRS_NORMAL;
-            p->stopped = 0;
-            p->signals.pending[sig] = 0;
+            {
+                int was_stopped = p->stopped;
+                p->state = PRS_NORMAL;
+                p->stopped = 0;
+                if (was_stopped) p->continued = 1;
+                p->signals.pending[sig] = 0;
+                proc_t *parent = proc_find(p->ppid);
+                if (parent) waitq_wake_all(&parent->waitq);
+            }
             return 0;
         case SIGACT_TERM:
         case SIGACT_CORE:
@@ -238,13 +249,24 @@ int signal_deliver(proc_t *p, int sig, registers_t *r) {
         case SIGACT_STOP:
             p->state = PRS_STOPPED;
             p->stopped = 1;
+            p->continued = 0;
             p->exit_sig = (uint8_t)sig;
             p->signals.pending[sig] = 0;
+            {
+                proc_t *parent = proc_find(p->ppid);
+                if (parent) waitq_wake_all(&parent->waitq);
+            }
             return 0;
         case SIGACT_CONT:
-            p->state = PRS_NORMAL;
-            p->stopped = 0;
-            p->signals.pending[sig] = 0;
+            {
+                int was_stopped = p->stopped;
+                p->state = PRS_NORMAL;
+                p->stopped = 0;
+                if (was_stopped) p->continued = 1;
+                p->signals.pending[sig] = 0;
+                proc_t *parent = proc_find(p->ppid);
+                if (parent) waitq_wake_all(&parent->waitq);
+            }
             return 0;
         case SIGACT_TERM:
         case SIGACT_CORE:
@@ -371,13 +393,24 @@ int signal_deliver(proc_t *p, int sig, registers_t *r) {
         case SIGACT_STOP:
             p->state = PRS_STOPPED;
             p->stopped = 1;
+            p->continued = 0;
             p->exit_sig = (uint8_t)sig;
             p->signals.pending[sig] = 0;
+            {
+                proc_t *parent = proc_find(p->ppid);
+                if (parent) waitq_wake_all(&parent->waitq);
+            }
             return 0;
         case SIGACT_CONT:
-            p->state = PRS_NORMAL;
-            p->stopped = 0;
-            p->signals.pending[sig] = 0;
+            {
+                int was_stopped = p->stopped;
+                p->state = PRS_NORMAL;
+                p->stopped = 0;
+                if (was_stopped) p->continued = 1;
+                p->signals.pending[sig] = 0;
+                proc_t *parent = proc_find(p->ppid);
+                if (parent) waitq_wake_all(&parent->waitq);
+            }
             return 0;
         case SIGACT_TERM:
         case SIGACT_CORE:

@@ -159,6 +159,16 @@ int vm_map_map(vm_map_t *map, uint64_t addr, vm_object_t *obj,
     uint64_t end = addr + size;
     if (end < addr)
         return -1;  /* overflow */
+#ifdef USER_BASE
+    /* Defense in depth: vm_entries must stay in the user half even if
+     * a syscall wrapper forgets its own check. */
+    if (addr < USER_BASE)
+        return -1;
+#endif
+#ifdef USER_STACK_TOP
+    if (end > USER_STACK_TOP)
+        return -1;
+#endif
 
     uint32_t flags;
     spin_lock_irqsave(&map->lock, &flags);

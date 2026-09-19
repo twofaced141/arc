@@ -26,12 +26,23 @@ struct arc_boot_info *arc_boot_init(uint32_t mboot_magic,
 
     size_t nreg = 0;
     multiboot2_tag_t *tag = multiboot2_first_tag(mboot);
+    uint8_t *mboot_end = (uint8_t *)mboot + mboot->total_size;
 
-    while (tag->type != MULTIBOOT_TAG_END) {
+    while ((uint8_t *)tag + sizeof(*tag) <= mboot_end &&
+           tag->type != MULTIBOOT_TAG_END) {
+        /* Malformed size would walk OOB or spin forever (size 0-7
+         * rounds to 0/8 and never advances past a 0-size tag). */
+        if (tag->size < 8) break;
+        uint32_t step = (tag->size + 7) & ~7u;
+        if (step < 8) break;
+        if ((uint8_t *)tag + step > mboot_end) break;
         switch (tag->type) {
         case MULTIBOOT_TAG_CMDLINE: {
             const char *src = (const char *)tag + 8;
-            size_t len = strlen(src);
+            size_t max = tag->size > 8 ? tag->size - 8 : 0;
+            /* Bounded strlen: a missing NUL must not run off the tag. */
+            size_t len = 0;
+            while (len < max && src[len] != '\0') len++;
             if (len >= ARC_BOOT_CMDLINE_MAX)
                 len = ARC_BOOT_CMDLINE_MAX - 1;
             memcpy(boot_cmdline, src, len);
@@ -42,7 +53,9 @@ struct arc_boot_info *arc_boot_init(uint32_t mboot_magic,
         }
         case MULTIBOOT_TAG_MMAP: {
             multiboot2_tag_mmap_t *mtag = (multiboot2_tag_mmap_t *)tag;
+            if (mtag->entry_size == 0) break;
             uint8_t *end = (uint8_t *)tag + tag->size;
+            if (end > mboot_end) end = mboot_end;
 
             for (uint8_t *p = mtag->entries;
                  p + sizeof(multiboot2_mmap_entry_t) <= end && nreg < ARC_BOOT_MAX_REGIONS;

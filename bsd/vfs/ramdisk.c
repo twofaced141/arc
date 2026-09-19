@@ -43,8 +43,17 @@ typedef struct {
 
 static int ramdisk_read(block_dev_t *dev, uint64_t lba, void *buf, size_t count) {
     ramdisk_priv_t *priv = (ramdisk_priv_t *)dev->priv;
-    uint64_t offset = lba * dev->block_size;
-    size_t len = count * dev->block_size;
+    uint64_t boff, blen;
+    /* Overflow-safe: lba*512 or count*512 near 2^64 wrapped the old
+     * offset+len check and gave OOB memcpy. */
+    if (__builtin_mul_overflow(lba, (uint64_t)dev->block_size, &boff))
+        return -1;
+    if (__builtin_mul_overflow((uint64_t)count, (uint64_t)dev->block_size, &blen))
+        return -1;
+    if (blen > priv->size || boff > priv->size - blen)
+        return -1;
+    uint64_t offset = boff;
+    size_t len = (size_t)blen;
     if (offset + len > priv->size)
         return -1;
     memcpy(buf, (uint8_t *)priv->data + offset, len);
@@ -53,8 +62,15 @@ static int ramdisk_read(block_dev_t *dev, uint64_t lba, void *buf, size_t count)
 
 static int ramdisk_write(block_dev_t *dev, uint64_t lba, const void *buf, size_t count) {
     ramdisk_priv_t *priv = (ramdisk_priv_t *)dev->priv;
-    uint64_t offset = lba * dev->block_size;
-    size_t len = count * dev->block_size;
+    uint64_t boff, blen;
+    if (__builtin_mul_overflow(lba, (uint64_t)dev->block_size, &boff))
+        return -1;
+    if (__builtin_mul_overflow((uint64_t)count, (uint64_t)dev->block_size, &blen))
+        return -1;
+    if (blen > priv->size || boff > priv->size - blen)
+        return -1;
+    uint64_t offset = boff;
+    size_t len = (size_t)blen;
     if (offset + len > priv->size)
         return -1;
     memcpy((uint8_t *)priv->data + offset, buf, len);

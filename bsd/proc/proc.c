@@ -838,9 +838,10 @@ void proc_thread_exit(int exitcode) {
 }
 
 /* waitpid(2): wait for a child.  pid > 0 waits for that specific child;
- * pid <= 0 waits for any child.  Blocks (interruptibly) until a child
- * exits or stops, unless WNOHANG is given.  Returns the child pid,
- * 0 with WNOHANG when nothing to reap, or a negative errno. */
+ * pid == 0 waits for any child in same pgrp; pid == -1 waits for any;
+ * pid < -1 waits for pgrp == -pid.  Blocks (interruptibly) until a child
+ * exits, stops (WUNTRACED) or continues (WCONTINUED), unless WNOHANG is given.
+ * Returns the child pid, 0 with WNOHANG when nothing to reap, or a negative errno. */
 pid_t proc_waitpid(pid_t pid, int *status, int options) {
     proc_t *p = proc_current();
     if (!p)
@@ -850,9 +851,18 @@ pid_t proc_waitpid(pid_t pid, int *status, int options) {
         /* Scan ALL matching children, not just the first one: children
          * are pushed LIFO by fork, so stopping at the head would let
          * the newest live child hide an older zombie forever. */
-        proc_t *zombie = NULL, *stopped_child = NULL, *any = NULL;
+        proc_t *zombie = NULL, *stopped_child = NULL, *continued_child = NULL, *any = NULL;
         for (proc_t *c = p->children; c; c = c->sibling) {
-            if (pid > 0 && c->pid != pid)
+            int match;
+            if (pid > 0)
+                match = (c->pid == pid);
+            else if (pid == 0)
+                match = (c->pgrp == p->pgrp);
+            else if (pid == -1)
+                match = 1;
+            else /* pid < -1 */
+                match = (c->pgrp == -pid);
+            if (!match)
                 continue;
             if (!any)
                 any = c;
@@ -862,6 +872,8 @@ pid_t proc_waitpid(pid_t pid, int *status, int options) {
             }
             if ((options & WUNTRACED) && c->stopped && !stopped_child)
                 stopped_child = c;
+            if ((options & WCONTINUED) && c->continued && !continued_child)
+                continued_child = c;
         }
 
         if (zombie) {
@@ -882,7 +894,15 @@ pid_t proc_waitpid(pid_t pid, int *status, int options) {
         if (stopped_child) {
             if (status)
                 *status = 0x7F | ((stopped_child->exit_sig & 0xFF) << 8);
+            /* POSIX: a stopped child stays stopped; do not clear flag until continued */
             return stopped_child->pid;
+        }
+
+        if (continued_child) {
+            if (status)
+                *status = 0xFFFF;
+            continued_child->continued = 0;
+            return continued_child->pid;
         }
 
         if (!any)
@@ -898,6 +918,139 @@ pid_t proc_waitpid(pid_t pid, int *status, int options) {
         if (r < 0)
             return -ERESTARTSYS;
     }
+}
+
+pid_t proc_setsid(void) {
+    proc_t *p = proc_current();
+    if (!p)
+        return -EINVAL;
+    /* POSIX: if caller is process group leader, fail with EPERM */
+    if (p->pgrp == p->pid)
+        return -EPERM;
+    p->session = p->pid;
+    p->pgrp = p->pid;
+    /* Drop controlling tty */
+    p->tty.pgrp = 0;
+    p->tty.tty_dev = 0;
+    return p->pid;
+}
+
+int proc_setpgid(pid_t pid, pid_t pgid) {
+    proc_t *caller = proc_current();
+    if (!caller)
+        return -EINVAL;
+    if (pid == 0)
+        pid = caller->pid;
+    if (pgid == 0)
+        pgid = pid;
+    if (pgid < 0)
+        return -EINVAL;
+    proc_t *target = proc_find(pid);
+    if (!target)
+        return -ESRCH;
+    /* Target must be caller or child, and in same session */
+    if (target != caller) {
+        int is_child = 0;
+        for (proc_t *c = caller->children; c; c = c->sibling)
+            if (c == target) { is_child = 1; break; }
+        if (!is_child)
+            return -ESRCH;
+    }
+    if (target->session != caller->session)
+        return -EPERM;
+    /* pgid must be positive and, if not existing, must equal pid of target */
+    target->pgrp = pgid;
+    return 0;
+}
+
+int proc_killpg(pid_t pgrp, int sig) {
+    if (pgrp <= 0 || !signal_is_valid(sig))
+        return -EINVAL;
+    proc_t *caller = proc_current();
+    if (!caller)
+        return -EINVAL;
+    int n = 0, perm_fail = 0;
+    /* Collect and validate under lock, deliver without lock */
+    pid_t pids[PROC_MAX];
+    uint32_t flags;
+    spin_lock_irqsave(&proc_lock, &flags);
+    for (proc_t *q = live_list; q; q = q->next) {
+        if (q->pgrp == pgrp) {
+            if (n < PROC_MAX)
+                pids[n++] = q->pid;
+        }
+    }
+    spin_unlock_irqrestore(&proc_lock, flags);
+    if (n == 0)
+        return -ESRCH;
+    int delivered = 0;
+    for (int i = 0; i < n; i++) {
+        proc_t *t = proc_find(pids[i]);
+        if (!t) continue;
+        /* Permission check: same as kill */
+        if (t->pid == caller->pid) {
+            /* self always allowed */
+        } else if (caller->euid == 0) {
+            /* root */
+        } else if (caller->euid == t->uid || caller->euid == t->euid) {
+            /* allowed */
+        } else {
+            perm_fail = 1;
+            continue;
+        }
+        if (sig == 0) {
+            delivered++;
+            continue;
+        }
+        /* Handle stop/continue state for waitpid visibility */
+        if (sig == SIGSTOP || sig == SIGTSTP || sig == SIGTTIN || sig == SIGTTOU) {
+            t->stopped = 1;
+            t->exit_sig = (uint8_t)sig;
+            t->state = PRS_STOPPED;
+            proc_t *parent = proc_find(t->ppid);
+            if (parent)
+                waitq_wake_all(&parent->waitq);
+            t->signals.pending[sig] = 0;
+            proc_wakeup(t);
+            delivered++;
+            continue;
+        } else if (sig == SIGCONT) {
+            int was_stopped = t->stopped;
+            t->stopped = 0;
+            if (t->state == PRS_STOPPED)
+                t->state = PRS_NORMAL;
+            if (was_stopped)
+                t->continued = 1;
+            proc_t *parent = proc_find(t->ppid);
+            if (parent)
+                waitq_wake_all(&parent->waitq);
+            t->signals.pending[sig] = 0;
+            proc_wakeup(t);
+            delivered++;
+            continue;
+        }
+        if (t->signals.blocked[sig]) {
+            t->signals.pending[sig] = 1;
+            delivered++;
+            continue;
+        }
+        if (sig == SIGKILL) {
+            t->exit_sig = (uint8_t)sig;
+            t->signals.pending[sig] = 1;
+            proc_wakeup(t);
+            waitq_wake_all(&t->waitq);
+            delivered++;
+        } else {
+            t->signals.pending[sig] = 1;
+            proc_wakeup(t);
+            delivered++;
+        }
+    }
+    if (delivered == 0 && perm_fail)
+        return -EPERM;
+    if (delivered == 0)
+        return -ESRCH;
+    return 0;
 }
 
 thread_t *kthread_create(kthread_func_t func, void *arg, const char *name) {

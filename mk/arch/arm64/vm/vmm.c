@@ -54,6 +54,7 @@ extern uint64_t pci_ecam_size;
 #define DESC_PAGE       (3ULL << 0)
 #define ATTR_UXN        (1ULL << 54)
 #define ATTR_PXN        (1ULL << 53)
+#define ATTR_SW_COW     (1ULL << 55)
 #define ATTR_CONT       (1ULL << 52)
 #define ATTR_DBM        (1ULL << 51)
 #define ATTR_nG         (1ULL << 11)
@@ -180,7 +181,7 @@ static uint64_t pte_flags(uint64_t flags) {
         attr |= ATTR_UXN;
     }
     if (flags & VMM_COW)
-        attr |= ATTR_AP_RO;
+        attr |= ATTR_AP_RO | ATTR_SW_COW;
     return attr;
 }
 
@@ -316,9 +317,7 @@ void vmm_init(void) {
     }
 }
 
-void vmm_init_heap(void) {
-}
-
+/* Heap now unified in mk/vm/heap.c */
 /* User VA range inside L1[0], in L2-index units.  VAs 0x00000000 ..
  * 0x07FFFFFF (null guard, ELF base, heap, mmap, stack) get PRIVATE L3
  * tables per process (fresh L2 per directory, L3s created on demand);
@@ -431,10 +430,11 @@ void vmm_free_directory(page_directory_t *dir) {
         return;
     /* Only L0[0]/user_l1 is private; everything else is shared with
      * the boot tables (same table pointers).  For user PTEs: skip
-     * read-only pages — they are either COW-shared with the parent
-     * (fork marks parent writable pages RO) or genuinely read-only
-     * segments; freeing their phys would corrupt the other process
-     * (same policy as amd64, which skips VMM_COW). */
+     * COW-shared pages — fork marks every user page SW_COW so parent
+     * and child share phys until break; freeing shared phys would
+     * corrupt the other process (same policy as amd64, which skips
+     * VMM_COW).  Genuine private RO (never fork-shared) has no SW_COW
+     * and is freed normally. */
     if (!(dir->entries[0] & DESC_VALID))
         goto free_l0;
     page_directory_t *user_l1 =
@@ -459,8 +459,8 @@ void vmm_free_directory(page_directory_t *dir) {
                     continue;
                 if (!(pte & ATTR_AP_USER))
                     continue;
-                if (pte & ATTR_AP_RO)
-                    continue;  /* COW-shared or RO segment */
+                if (pte & ATTR_SW_COW)
+                    continue;  /* COW-shared with parent/child */
                 pmm_free_page((void *)(uintptr_t)(pte & ADDR_MASK));
             }
             pmm_free_page(l3);
@@ -491,8 +491,8 @@ void vmm_free_directory(page_directory_t *dir) {
                     continue;
                 if (!(pte & ATTR_AP_USER))
                     continue;
-                if (pte & ATTR_AP_RO)
-                    continue;  /* COW-shared or RO segment */
+                if (pte & ATTR_SW_COW)
+                    continue;  /* COW-shared with parent/child */
                 pmm_free_page((void *)(uintptr_t)(pte & ADDR_MASK));
             }
             pmm_free_page(l3);
@@ -607,6 +607,7 @@ int vmm_get_page_flags(page_directory_t *dir, uint64_t virt) {
     if (*pte & DESC_VALID) flags |= VMM_PRESENT;
     if (!(*pte & ATTR_AP_RO)) flags |= VMM_WRITABLE;
     if (*pte & ATTR_AP_USER) flags |= VMM_USER;
+    if (*pte & ATTR_SW_COW) flags |= VMM_COW;
     return flags;
 }
 
@@ -625,11 +626,11 @@ static int handle_cow(page_directory_t *l0, uint64_t fault_addr) {
     uint64_t *pte = walk_pt(l0, fault_addr, 0);
     if (!pte) return 0;
     if (!(*pte & DESC_VALID)) return 0;
-    if (!(*pte & ATTR_AP_RO)) return 0;
+    if (!(*pte & ATTR_SW_COW)) return 0;
     if (!(*pte & DESC_PAGE)) return 0;
 
     uint64_t old_phys = *pte & ADDR_MASK;
-    uint64_t flags = *pte & ~(ADDR_MASK | ATTR_AP_RO);
+    uint64_t flags = *pte & ~(ADDR_MASK | ATTR_AP_RO | ATTR_SW_COW);
     flags |= ATTR_AF;
     if (*pte & ATTR_AP_USER)
         flags |= ATTR_AP_USER;
@@ -715,13 +716,14 @@ void vmm_fork_cow_pages(page_directory_t *parent_dir, page_directory_t *child_di
                     if (!(pte & DESC_PAGE)) continue;
                     if (!(pte & ATTR_AP_USER)) continue;
 
-                    /* Enable COW on pages still writable.  Pages already
-                     * RO (shared via an earlier fork, or genuinely
-                     * read-only segments) are simply mapped into the
-                     * child as-is: handle_cow() breaks them lazily on
-                     * first write. */
-                    if (!(pte & ATTR_AP_RO))
-                        parent_l3->entries[l3i] = pte | ATTR_AP_RO;
+                    /* Mark every user page COW-shared (mirrors amd64:
+                     * clear writable, set SW_COW).  Genuine RO pages
+                     * become COW-shared too so handle_cow() can
+                     * distinguish them from ordinary RO and
+                     * vmm_free_directory() can skip freeing shared
+                     * phys. */
+                    parent_l3->entries[l3i] =
+                        (pte | ATTR_AP_RO | ATTR_SW_COW);
 
                     uint64_t *cpte = fork_child_l3(child_dir, l0i, l1i, l2i, l3i);
                     if (cpte)
@@ -776,105 +778,7 @@ void vmm_clear_user_pages(page_directory_t *dir) {
     __asm__ __volatile__("dsb ish\n\ttlbi vmalle1is\n\tdsb ish\n\tisb");
 }
 
-/* ---- Heap ---- */
-typedef struct heap_block {
-    uint32_t magic;
-    uint32_t size;
-    struct heap_block *next;
-} heap_block_t;
-
-#define HEAP_MAGIC_FREE 0x48454150
-#define HEAP_MAGIC_USED 0x44454144
-#define HEAP_SIZE_MASK  0x7FFFFFFF
-
-extern char __heap_start[];
-extern char __heap_end[];
-
-static heap_block_t *heap_base;
-static heap_block_t *heap_free_list;
-static int heap_initialized;
-static spinlock_t heap_lock = SPINLOCK_INIT;
-
-static void heap_init(void) {
-    heap_base = (heap_block_t *)__heap_start;
-    memset(heap_base, 0, sizeof(heap_block_t));
-    heap_base->magic = HEAP_MAGIC_FREE;
-    heap_base->size = (uint64_t)(__heap_end - __heap_start) - sizeof(heap_block_t);
-    heap_base->next = NULL;
-    heap_free_list = heap_base;
-    heap_initialized = 1;
-}
-
-void *kmalloc(uint32_t size) {
-    if (size == 0) return NULL;
-
-    uint32_t flags;
-    spin_lock_irqsave(&heap_lock, &flags);
-    if (!heap_initialized) heap_init();
-
-    size = (size + 3) & ~3;
-    if (size < 16) size = 16;
-
-    heap_block_t *prev = NULL;
-    heap_block_t *block = heap_free_list;
-    while (block) {
-        if (block->magic != HEAP_MAGIC_FREE) {
-            heap_free_list = block->next;
-            block = heap_free_list;
-            prev = NULL;
-            continue;
-        }
-        uint32_t block_size = block->size & HEAP_SIZE_MASK;
-        if (block_size >= size) {
-            if (block_size >= size + sizeof(heap_block_t) + 16) {
-                heap_block_t *new_block = (heap_block_t *)((uint8_t *)block + sizeof(heap_block_t) + size);
-                new_block->magic = HEAP_MAGIC_FREE;
-                new_block->size = block_size - size - sizeof(heap_block_t);
-                new_block->next = block->next;
-                block->size = size | HEAP_MAGIC_USED;
-                block->next = new_block;
-            } else {
-                block->magic = HEAP_MAGIC_USED;
-            }
-            if (prev)
-                prev->next = block->next;
-            else
-                heap_free_list = block->next;
-            spin_unlock_irqrestore(&heap_lock, flags);
-            memset((uint8_t *)block + sizeof(heap_block_t), 0, size);
-            return (void *)((uint8_t *)block + sizeof(heap_block_t));
-        }
-        prev = block;
-        block = block->next;
-    }
-    spin_unlock_irqrestore(&heap_lock, flags);
-    return NULL;
-}
-
-void *kcalloc(uint32_t count, uint32_t size) {
-    if (count != 0 && size > 0xFFFFFFFFU / count)
-        return NULL;  /* overflow, matches amd64 */
-    uint32_t total = count * size;
-    void *p = kmalloc(total);
-    if (p) memset(p, 0, total);
-    return p;
-}
-
-void kfree(void *addr) {
-    if (!addr) return;
-    uint32_t flags;
-    spin_lock_irqsave(&heap_lock, &flags);
-    heap_block_t *block = (heap_block_t *)((uint8_t *)addr - sizeof(heap_block_t));
-    if (block->magic != HEAP_MAGIC_USED) {
-        spin_unlock_irqrestore(&heap_lock, flags);
-        return;
-    }
-    block->magic = HEAP_MAGIC_FREE;
-    block->next = heap_free_list;
-    heap_free_list = block;
-    spin_unlock_irqrestore(&heap_lock, flags);
-}
-
+/* Heap unified in mk/vm/heap.c — HAL provides kmalloc/kfree/kcalloc */
 /* Per-CPU TEMP slots (SMP): parallel COW faults on two CPUs must not
  * share one mapping.  TEMP_BASE - id*PAGE, 32 slots max. */
 #define TEMP_BASE 0x00007FFFFFFFF000ULL
@@ -904,19 +808,26 @@ void vmm_temp_unmap(void) {
 /* ---- User copy ---- */
 /* Validate a user range without touching it (matches amd64: COW pages
  * count as writable — the fault path breaks them lazily, so a
- * write-check must accept read-only-present user pages here; the
- * per-page enforcement happens in copy_to_user's own walk). */
+ * write-check accepts SW_COW pages but rejects genuine RO). */
 int user_range_ok(const void *uaddr, size_t size, int write) {
-    (void)write;
     if (size == 0) return 1;
     if (!uaddr) return 0;
-    /* Overflow-safe: reject wrapped ranges up front. */
-    if ((uintptr_t)uaddr + size < (uintptr_t)uaddr) return 0;
+    uint64_t addr = (uint64_t)(uintptr_t)uaddr;
+    /* Overflow-safe upper bound check against the user/kernel split:
+     * size > TOP-addr rejects both out-of-range and wrapped ranges.
+     * Also reject anything below USER_BASE (null guard / MMIO). */
+    if (addr < USER_BASE) return 0;
+    if (addr >= USER_STACK_TOP || size > USER_STACK_TOP - addr) return 0;
     page_directory_t *dir = vmm_get_current_directory();
     for (size_t offset = 0; offset < size; ) {
-        uint64_t vaddr = (uint64_t)(uintptr_t)uaddr + offset;
+        uint64_t vaddr = addr + offset;
         uint64_t *pte = walk_pt(dir, vaddr, 0);
         if (!pte || !(*pte & DESC_VALID) || !(*pte & ATTR_AP_USER))
+            return 0;
+        /* COW counts as writable: the pending write breaks it via
+         * handle_cow().  Genuine RO (AP_RO without SW_COW) is rejected
+         * for writes. */
+        if (write && (*pte & ATTR_AP_RO) && !(*pte & ATTR_SW_COW))
             return 0;
         size_t chunk = PAGE_SIZE - (vaddr & 0xFFF);
         if (chunk > size - offset) chunk = size - offset;
@@ -928,10 +839,13 @@ int user_range_ok(const void *uaddr, size_t size, int write) {
 
 int copy_from_user(void *dst, const void *user_src, size_t size) {
     if (size == 0) return 0;
-    if ((uintptr_t)user_src + size < (uintptr_t)user_src) return -1;
+    if (!user_src) return -1;
+    uint64_t addr = (uint64_t)(uintptr_t)user_src;
+    if (addr < USER_BASE) return -1;
+    if (addr >= USER_STACK_TOP || size > USER_STACK_TOP - addr) return -1;
     page_directory_t *dir = vmm_get_current_directory();
     for (size_t offset = 0; offset < size; ) {
-        uint64_t vaddr = (uint64_t)(uintptr_t)user_src + offset;
+        uint64_t vaddr = addr + offset;
         uint64_t *pte = walk_pt(dir, vaddr, 0);
         if (!pte || !(*pte & DESC_VALID) || !(*pte & ATTR_AP_USER))
             return -1;
@@ -945,12 +859,17 @@ int copy_from_user(void *dst, const void *user_src, size_t size) {
 
 int copy_to_user(void *user_dst, const void *src, size_t size) {
     if (size == 0) return 0;
-    if ((uintptr_t)user_dst + size < (uintptr_t)user_dst) return -1;
+    if (!user_dst) return -1;
+    uint64_t addr = (uint64_t)(uintptr_t)user_dst;
+    if (addr < USER_BASE) return -1;
+    if (addr >= USER_STACK_TOP || size > USER_STACK_TOP - addr) return -1;
     page_directory_t *dir = vmm_get_current_directory();
     for (size_t offset = 0; offset < size; ) {
-        uint64_t vaddr = (uint64_t)(uintptr_t)user_dst + offset;
+        uint64_t vaddr = addr + offset;
         uint64_t *pte = walk_pt(dir, vaddr, 0);
         if (!pte || !(*pte & DESC_VALID) || !(*pte & ATTR_AP_USER))
+            return -1;
+        if ((*pte & ATTR_AP_RO) && !(*pte & ATTR_SW_COW))
             return -1;
         size_t chunk = PAGE_SIZE - (vaddr & 0xFFF);
         if (chunk > size - offset) chunk = size - offset;
@@ -961,24 +880,29 @@ int copy_to_user(void *user_dst, const void *src, size_t size) {
 }
 
 int strncpy_from_user(char *dst, const char *user_src, size_t max_len) {
+    if (max_len == 0) return -1;
+    if (!user_src) return -1;
+    uint64_t addr = (uint64_t)(uintptr_t)user_src;
+    if (addr < USER_BASE || addr >= USER_STACK_TOP) return -1;
+    uint64_t avail = USER_STACK_TOP - addr;
+    if (max_len > avail) max_len = (size_t)avail;
+    if (max_len == 0) return -1;
     page_directory_t *dir = vmm_get_current_directory();
     for (size_t i = 0; i < max_len; i++) {
-        uint64_t vaddr = (uint64_t)(uintptr_t)user_src + i;
+        uint64_t vaddr = addr + i;
         uint64_t *pte = walk_pt(dir, vaddr, 0);
         if (!pte || !(*pte & DESC_VALID) || !(*pte & ATTR_AP_USER))
             return -1;
         char c = *(volatile char *)(uintptr_t)vaddr;
         dst[i] = c;
         if (c == '\0') {
-            if (i > (size_t)0x7FFFFFFF)
+            if (i + 1 > (size_t)0x7FFFFFFF)
                 return -1;
-            return (int)i;
+            return (int)(i + 1);
         }
     }
     dst[max_len - 1] = '\0';
-    if (max_len - 1 > (size_t)0x7FFFFFFF)
-        return -1;
-    return (int)max_len - 1;
+    return -1;
 }
 
 /* Full local TLB flush (used by the IPI_TLB handler on remote CPUs). */
@@ -997,7 +921,7 @@ int vmm_handle_page_fault(registers_t *r, uint64_t fault_addr, uint32_t esr) {
     uint64_t *pte = walk_pt(dir, fault_addr, 0);
 
     if (pte && (*pte & DESC_VALID)) {
-        if ((*pte & ATTR_AP_RO) && (write || ec == 0x25)) {
+        if ((*pte & ATTR_SW_COW) && (write || ec == 0x25)) {
             if (handle_cow(dir, fault_addr))
                 return 1;
         }

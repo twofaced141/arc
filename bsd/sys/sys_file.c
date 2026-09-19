@@ -282,8 +282,13 @@ int64_t sys_pipe(proc_t *p, registers_t *r) {
     int ret = pipe_create(p, kfds);
     if (ret < 0)
         return ret;
-    if (copy_to_user(ufds, kfds, sizeof(kfds)) < 0)
+    if (copy_to_user(ufds, kfds, sizeof(kfds)) < 0) {
+        /* copy_to_user failed: close both ends so a bad pointer
+         * cannot be looped for fd exhaustion. */
+        vfs_close(p, kfds[0]);
+        vfs_close(p, kfds[1]);
         return -EFAULT;
+    }
     return 0;
 }
 

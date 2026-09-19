@@ -41,8 +41,11 @@
 #include "string.h"
 #include "debug.h"
 #include "vmm.h"
+#include "memory.h"
+#include "spinlock.h"
 
 #define MAX_MOUNTS 8
+static spinlock_t vfs_open_lock = SPINLOCK_INIT;
 
 static mount_t mounts[MAX_MOUNTS];
 static int mount_count;
@@ -463,6 +466,11 @@ int vfs_open(proc_t *p, const char *upath, int flags, int mode) {
     if (flags & O_CREAT)
         mode &= ~p->umask;
 
+    /* Parent-lock for O_EXCL race (PLAN.md:140): two concurrent
+     * O_CREAT|O_EXCL opens for the same non-existent file must not both
+     * succeed.  Lookup and create are atomic under vfs_open_lock. */
+    uint32_t open_lock_flags;
+    spin_lock_irqsave(&vfs_open_lock, &open_lock_flags);
     /* O_NOFOLLOW: the final component must not be a symbolic link. */
     vnode_t *vp;
     if (flags & O_NOFOLLOW)
@@ -472,6 +480,7 @@ int vfs_open(proc_t *p, const char *upath, int flags, int mode) {
 
     if (vp && (flags & O_NOFOLLOW) && vp->type == VLNK) {
         vnode_put(vp);
+        spin_unlock_irqrestore(&vfs_open_lock, open_lock_flags);
         return -ELOOP;
     }
 
@@ -479,6 +488,7 @@ int vfs_open(proc_t *p, const char *upath, int flags, int mode) {
      * O_CREAT; without O_CREAT the flag is ignored, per POSIX). */
     if (vp && (flags & O_CREAT) && (flags & O_EXCL)) {
         vnode_put(vp);
+        spin_unlock_irqrestore(&vfs_open_lock, open_lock_flags);
         return -EEXIST;
     }
 
@@ -489,17 +499,23 @@ int vfs_open(proc_t *p, const char *upath, int flags, int mode) {
         if (parent && parent->ops && parent->ops->create) {
             if (vfs_perm_check(p, parent, W_OK) < 0) {
                 vnode_put(parent);
+                spin_unlock_irqrestore(&vfs_open_lock, open_lock_flags);
                 return -EACCES;
             }
             err = parent->ops->create(parent, name, mode, &vp);
             if (err < 0) {
                 vnode_put(parent);
+                spin_unlock_irqrestore(&vfs_open_lock, open_lock_flags);
                 return err;
             }
         }
         if (parent) vnode_put(parent);
     }
-    if (!vp) return -ENOENT;
+    if (!vp) {
+        spin_unlock_irqrestore(&vfs_open_lock, open_lock_flags);
+        return -ENOENT;
+    }
+    spin_unlock_irqrestore(&vfs_open_lock, open_lock_flags);
 
     /* O_DIRECTORY: only directories may be opened. */
     if ((flags & O_DIRECTORY) && vp->type != VDIR) {
@@ -697,6 +713,16 @@ int vfs_ioctl(proc_t *p, int fd, int cmd, void *data) {
     vnode_t *vp = (vnode_t *)f->vnode_ptr;
     if (!vp || !vp->ops || !vp->ops->ioctl) return -ENOTTY;
 
+    /* A raw user pointer reaches driver ioctl handlers here.  The
+     * length is command-specific so the core cannot validate the full
+     * range, but it can reject obvious kernel pointers (NULL is
+     * allowed — many commands take no argument).  Each handler must
+     * still copy_from/to_user its own payload. */
+    if (data != NULL) {
+        uint64_t a = (uint64_t)(uintptr_t)data;
+        if (a < USER_BASE || a >= USER_STACK_TOP)
+            return -EFAULT;
+    }
     return vp->ops->ioctl(vp, cmd, data);
 }
 

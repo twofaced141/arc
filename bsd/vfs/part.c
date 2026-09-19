@@ -196,8 +196,23 @@ static int gpt_parse(block_dev_t *parent) {
 
         part_device_t *pd = &partitions[part_count];
         pd->parent = parent;
+        /* Validate LBA range: first<=last, otherwise sector_count
+         * underflows to ~2^64 and the partition escapes its parent. */
+        if (e->last_lba < e->first_lba) {
+            log_printf(LOG_LEVEL_WARN, "part: %s: GPT entry %u inverted range, skipped\n",
+                       parent->name, i + 1);
+            continue;
+        }
         pd->lba_start = e->first_lba;
         pd->sector_count = e->last_lba - e->first_lba + 1;
+        /* Clamp to the parent device so a crafted GPT cannot address
+         * sectors past the disk. */
+        if (pd->lba_start >= parent->num_blocks ||
+            pd->sector_count > parent->num_blocks - pd->lba_start) {
+            log_printf(LOG_LEVEL_WARN, "part: %s: GPT entry %u out of range, skipped\n",
+                       parent->name, i + 1);
+            continue;
+        }
 
         /* Name: parent_name + p + index (e.g., "ahci0p1") */
         int n = strlen(parent->name);

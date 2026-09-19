@@ -35,7 +35,9 @@
 #include "bsd/errno.h"
 
 /* ENODEV not in errno.h — use ENXIO */
+#ifndef ENODEV
 #define ENODEV ENXIO
+#endif
 #include "io_channel.h"
 #include "pmm.h"
 #include "vmm.h"
