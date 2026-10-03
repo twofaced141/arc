@@ -127,6 +127,11 @@ static int elf_load_segments_common(struct elf_load_state *st,
     for (uint16_t i = 0; i < phnum; i++) {
         if (phdrs[i].p_type != PT_LOAD)
             continue;
+        /* Empty segments (no .data/.bss content) map nothing: the
+         * linker still emits them (often at vaddr 0), and the floor
+         * check below would wrongly reject the whole image. */
+        if (phdrs[i].p_memsz == 0)
+            continue;
 
         bsd_elf_addr_t seg_start = phdrs[i].p_vaddr;
         bsd_elf_addr_t seg_end_file = seg_start + phdrs[i].p_filesz;

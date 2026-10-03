@@ -9,7 +9,7 @@ PHDRS
 
 SECTIONS
 {
-    . = 0x401000;
+    . = USER_LOAD_BASE;
 
     .text : {
         *(.text*)

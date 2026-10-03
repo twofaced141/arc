@@ -160,7 +160,17 @@ USER_CFLAGS = -ffreestanding -nostdlib -nostartfiles -nodefaultlibs \
 
 USER_INCLUDES = -I user
 
-USER_LDFLAGS  = -nostdlib $(LD_ARCH)
+# Userspace link base: must satisfy the exec loader (USER_BASE <= seg <
+# USER_STACK_TOP).  x86 USER_BASE is 0x8000000 (above the 0-64MB identity
+# map); arm64 USER_BASE is 0x400000.  Passed as an absolute symbol so a
+# single .ld serves every ARCH.
+ifeq ($(ARCH),arm64)
+USER_LD_BASE = 0x401000
+else
+USER_LD_BASE = 0x8001000
+endif
+
+USER_LDFLAGS  = -nostdlib $(LD_ARCH) --defsym USER_LOAD_BASE=$(USER_LD_BASE)
 
 # List of userspace ELFs to build.  Built for every ARCH — the ABI
 # (libdriver.h / init.c) has x86, amd64 and aarch64 branches, and the
