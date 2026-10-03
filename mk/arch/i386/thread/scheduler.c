@@ -214,24 +214,27 @@ static void *context_switch(registers_t *r) {
         return (void *)idle_thread->kernel_esp;
     }
 
+    /* Unlink the picked head: like Linux O(1), the running thread is on
+     * no runqueue — expiry paths re-enqueue it to expired.  The old
+     * code rotated the head to the tail but cleared next->array while
+     * keeping it linked, breaking the array<=>listed invariant: later
+     * re-enqueues corrupted the circular list and desynced nr_active
+     * from the bitmap (active nr>0 with empty bitmap wedged the CPU on
+     * idle; walking the torn list jumped to garbage -> #GP). */
     thread_t *next = active->queue[top_prio];
     if (next->next == next) {
-        /* Single thread — actually remove it */
+        /* Single thread — drop the level entirely */
         active->queue[top_prio] = NULL;
         active->bitmap[top_prio / 32] &= ~(1u << (top_prio % 32));
-        next->array = NULL;
-        active->nr_active--;
     } else {
-        /* Multiple threads — rotate, don't remove. nr_active unchanged. */
-        next->prev->next = next->next;
         next->next->prev = next->prev;
+        next->prev->next = next->next;
         active->queue[top_prio] = next->next;
-        thread_t *tail = next->next->prev;
-        next->prev = tail;
-        tail->next = next;
-        next->next->prev = next;
-        next->array = NULL;
     }
+    next->next = NULL;
+    next->prev = NULL;
+    next->array = NULL;
+    active->nr_active--;
 
     if (next->state == THREAD_ZOMBIE || next->state == THREAD_UNUSED)
         return context_switch(r);
@@ -282,10 +285,21 @@ void *scheduler_switch(registers_t *r) {
                         current_thread->sleep_avg = 0;
 
                     current_thread->prio = effective_prio(current_thread->static_prio,
-                                                          current_thread->sleep_avg);
+                                                         current_thread->sleep_avg);
                     current_thread->time_slice = prio_to_timeslice(current_thread->static_prio);
 
                     prio_array_enqueue(expired, current_thread, current_thread->prio);
+                    current_thread = NULL;
+                } else {
+                    /* Preempted with slice left: context_switch()
+                     * below unconditionally picks the active head, so
+                     * the current thread must go back on the active
+                     * tail (round-robin).  Without this it keeps
+                     * THREAD_RUNNING while belonging to no queue and
+                     * starves forever. */
+                    current_thread->state = THREAD_READY;
+                    prio_array_enqueue(active, current_thread,
+                                       current_thread->prio);
                     current_thread = NULL;
                 }
             }
