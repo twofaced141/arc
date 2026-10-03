@@ -121,7 +121,7 @@ int64_t sys_setrlimit(proc_t *p, registers_t *r) {
 
     if (k.rlim_cur > k.rlim_max)
         return -EINVAL;
-    if (k.rlim_max > p->rlim[which].rlim_max && p->uid != 0)
+    if (k.rlim_max > p->rlim[which].rlim_max && p->euid != 0)
         return -EPERM;
 
     p->rlim[which].rlim_cur = k.rlim_cur;

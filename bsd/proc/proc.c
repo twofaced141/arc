@@ -958,13 +958,32 @@ int proc_setpgid(pid_t pid, pid_t pgid) {
     }
     if (target->session != caller->session)
         return -EPERM;
-    /* pgid must be positive and, if not existing, must equal pid of target */
+    /* POSIX: pgid must be positive; if the group does not exist yet it
+     * must equal the target's pid (i.e. the target creates its own
+     * group). Joining an arbitrary numeric group is not allowed. */
+    if (pgid <= 0)
+        return -EINVAL;
+    if (pgid != target->pid) {
+        int exists = 0;
+        uint32_t flags;
+        spin_lock_irqsave(&proc_lock, &flags);
+        for (proc_t *q = live_list; q; q = q->next) {
+            if (q->pid != PROC_NULL && q->pgrp == pgid &&
+                q->session == caller->session) {
+                exists = 1;
+                break;
+            }
+        }
+        spin_unlock_irqrestore(&proc_lock, flags);
+        if (!exists)
+            return -EPERM;
+    }
     target->pgrp = pgid;
     return 0;
 }
 
 int proc_killpg(pid_t pgrp, int sig) {
-    if (pgrp <= 0 || !signal_is_valid(sig))
+    if (pgrp <= 0 || (!signal_is_valid(sig) && sig != 0))
         return -EINVAL;
     proc_t *caller = proc_current();
     if (!caller)
@@ -1029,7 +1048,7 @@ int proc_killpg(pid_t pgrp, int sig) {
             delivered++;
             continue;
         }
-        if (t->signals.blocked[sig]) {
+        if (sig != SIGKILL && sig != SIGSTOP && t->signals.blocked[sig]) {
             t->signals.pending[sig] = 1;
             delivered++;
             continue;

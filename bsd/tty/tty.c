@@ -257,6 +257,28 @@ int tty_ioctl(tty_t *t, int cmd, void *data) {
         pid_t pgrp;
         if (!data || copy_from_user(&pgrp, data, sizeof(pgrp)) != 0)
             return -EFAULT;
+        if (pgrp <= 0)
+            return -EINVAL;
+        /* Foreground group must exist in the caller's session:
+         * otherwise any process could divert terminal-generated
+         * signals (Ctrl-C) to a victim group. */
+        {
+            proc_t *self = proc_current();
+            if (!self)
+                return -ENXIO;
+            int found = 0;
+            for (int pid = 1; pid < PROC_MAX; pid++) {
+                proc_t *q = proc_find(pid);
+                if (!q)
+                    continue;
+                if (q->pgrp == pgrp && q->session == self->session) {
+                    found = 1;
+                    break;
+                }
+            }
+            if (!found)
+                return -EPERM;
+        }
         t->pgrp = pgrp;
         return 0;
     }

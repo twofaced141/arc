@@ -134,11 +134,38 @@ static int elf_load_segments_common(struct elf_load_state *st,
 
         if (seg_end_mem < seg_start)
             return -ENOEXEC;
+        if (seg_end_file < seg_start)
+            return -ENOEXEC;
+        if (phdrs[i].p_filesz > phdrs[i].p_memsz)
+            return -ENOEXEC;
+        /* Loader floor: no null page, no kernel identity map.  mmap()
+         * refuses everything below USER_BASE — exec must not be the
+         * backdoor that maps it. */
+        if (seg_start < USER_BASE)
+            return -ENOEXEC;
         if (seg_end_mem > USER_STACK_TOP)
             return -ENOEXEC;
 
         bsd_elf_addr_t page_start = seg_start & ~(bsd_elf_addr_t)(PAGE_SIZE - 1);
         bsd_elf_addr_t page_end = (seg_end_mem + PAGE_SIZE - 1) & ~(bsd_elf_addr_t)(PAGE_SIZE - 1);
+        /* The relocated range must stay in user space too (interpreter
+         * base_offset) and must not collide with the initial stack or
+         * the TLS page mapped later. */
+        if (page_start + base_offset < USER_BASE)
+            return -ENOEXEC;
+        if (page_end + base_offset > USER_STACK_TOP)
+            return -ENOEXEC;
+        {
+            bsd_elf_addr_t stack_lo =
+                USER_STACK_TOP - (bsd_elf_addr_t)USER_STACK_PAGES * PAGE_SIZE;
+            bsd_elf_addr_t map_lo = page_start + base_offset;
+            bsd_elf_addr_t map_hi = page_end + base_offset;
+            if (map_lo < USER_STACK_TOP && map_hi > stack_lo)
+                return -ENOEXEC;
+            if (map_lo < USER_TLS_VADDR + PAGE_SIZE &&
+                map_hi > USER_TLS_VADDR)
+                return -ENOEXEC;
+        }
 
         /* W^X: map segments non-executable unless the segment asks for
          * PF_X.  The loader used to leave every page executable —

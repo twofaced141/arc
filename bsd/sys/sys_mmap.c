@@ -84,6 +84,7 @@ static mmap_region_t *region_slot_alloc(proc_t *p) {
 }
 
 static void region_slot_free(proc_t *p, mmap_region_t *r) {
+    (void)p;
     if (r->vnode) {
         vnode_put((vnode_t *)r->vnode);
         r->vnode = NULL;

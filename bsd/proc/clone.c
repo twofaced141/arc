@@ -56,6 +56,7 @@
 
 #include "bsd/proc.h"
 #include "bsd/errno.h"
+#include "bsd/signal.h"
 #include "bsd/arch.h"
 #include "thread.h"
 #include "scheduler.h"
@@ -107,6 +108,21 @@ int proc_clone(registers_t *r, unsigned long flags, uintptr_t child_stack,
     }
 
     memcpy(&child->signals, &parent->signals, sizeof(sigstate_t));
+    /* A fork/clone from inside a handler must not inherit the in-flight
+     * frame: it points at the parent's stack and in_signal would pin
+     * all future delivery in the child (incl. SIGKILL). Pending
+     * restart state is per-syscall and must not leak either. */
+    child->signals.in_signal = 0;
+    child->signals.on_altstack = 0;
+    child->signals.sigframe_addr = 0;
+    child->signals.syscall_restartable = 0;
+    child->signals.restart_sysno = 0;
+    child->signals.restart_frame = 0;
+    for (int __si = 0; __si < NSIG; __si++)
+        child->signals.pending[__si] = 0;
+    /* Paranoia: never inherit a blocked KILL/STOP. */
+    child->signals.blocked[SIGKILL] = 0;
+    child->signals.blocked[SIGSTOP] = 0;
 
     child->ppid = parent->pid;
     child->pgrp = parent->pgrp;

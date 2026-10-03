@@ -182,13 +182,13 @@ int64_t sys_sigaction(proc_t *p, registers_t *r) {
             return -EFAULT;
     }
 
-    /* Set new action */
+    /* Set new action.  sa_mask can never include SIGKILL/SIGSTOP. */
     if (act) {
         sigaction_t newact;
         if (copy_from_user(&newact, act, sizeof(sigaction_t)) != 0)
             return -EFAULT;
         p->signals.handler[sig] = newact.sa_handler;
-        p->signals.sa_mask[sig] = newact.sa_mask;
+        p->signals.sa_mask[sig] = newact.sa_mask & ~((1u << SIGKILL) | (1u << SIGSTOP));
         p->signals.sa_flags[sig] = (uint32_t)newact.sa_flags;
         p->signals.sa_restorer[sig] = (uintptr_t)newact.sa_restorer;
     }
@@ -209,9 +209,12 @@ int64_t sys_sigsuspend(proc_t *p, registers_t *r) {
     memcpy(old, p->signals.blocked, sizeof(old));
 
     memset(p->signals.blocked, 0, sizeof(p->signals.blocked));
+    mask &= ~((1u << SIGKILL) | (1u << SIGSTOP));
     for (int i = 0; i < NSIG; i++)
         if (mask & (1u << i))
             p->signals.blocked[i] = 1;
+    p->signals.blocked[SIGKILL] = 0;
+    p->signals.blocked[SIGSTOP] = 0;
 
     if (!signal_has_pending(p))
         waitq_sleep(&p->waitq);
@@ -265,12 +268,17 @@ int64_t sys_sigaltstack(proc_t *p, registers_t *r) {
 }
 
 /* Restore the blocked mask saved in the sigframe (POSIX: sigreturn
- * restores the mask that was in effect when the signal arrived). */
+ * restores the mask that was in effect when the signal arrived).
+ * SIGKILL/SIGSTOP are never blockable — bits for them are dropped so a
+ * crafted frame cannot make the process unkillable. */
 static void sigreturn_restore_mask(proc_t *p, uint32_t mask) {
+    mask &= ~((1u << SIGKILL) | (1u << SIGSTOP));
     memset(p->signals.blocked, 0, sizeof(p->signals.blocked));
     for (int i = 1; i < NSIG; i++)
         if (mask & (1u << i))
             p->signals.blocked[i] = 1;
+    p->signals.blocked[SIGKILL] = 0;
+    p->signals.blocked[SIGSTOP] = 0;
 }
 
 /* The sigframe lives in user memory, so every field in it is
@@ -435,28 +443,37 @@ int64_t sys_sigprocmask(proc_t *p, registers_t *r) {
             return -EFAULT;
     }
 
-    /* Apply new mask */
+    /* Apply new mask.  SIGKILL/SIGSTOP are never blockable
+     * (POSIX): attempts to block them are silently ignored and they
+     * stay unblocked after UNBLOCK/SETMASK. */
     if (set) {
         uint32_t newmask;
         if (copy_from_user(&newmask, set, sizeof(uint32_t)) != 0)
             return -EFAULT;
+        newmask &= ~((1u << SIGKILL) | (1u << SIGSTOP));
 
         switch (how) {
         case SIG_BLOCK:
             for (int i = 0; i < NSIG; i++)
                 if (newmask & (1u << i))
                     p->signals.blocked[i] = 1;
+            p->signals.blocked[SIGKILL] = 0;
+            p->signals.blocked[SIGSTOP] = 0;
             break;
         case SIG_UNBLOCK:
             for (int i = 0; i < NSIG; i++)
                 if (newmask & (1u << i))
                     p->signals.blocked[i] = 0;
+            p->signals.blocked[SIGKILL] = 0;
+            p->signals.blocked[SIGSTOP] = 0;
             break;
         case SIG_SETMASK:
             memset(p->signals.blocked, 0, sizeof(p->signals.blocked));
             for (int i = 0; i < NSIG; i++)
                 if (newmask & (1u << i))
                     p->signals.blocked[i] = 1;
+            p->signals.blocked[SIGKILL] = 0;
+            p->signals.blocked[SIGSTOP] = 0;
             break;
         default:
             return -EINVAL;

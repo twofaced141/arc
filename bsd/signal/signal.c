@@ -47,11 +47,18 @@ int signal_is_valid(int sig) {
     return (sig >= 1 && sig < NSIG) ? 1 : 0;
 }
 
+/* SIGKILL/SIGSTOP are never blockable: they count as pending and
+ * deliver even when the blocked bit is (incorrectly) set. */
+static int sig_is_unblockable(int sig) {
+    return sig == SIGKILL || sig == SIGSTOP;
+}
+
 int signal_has_pending(proc_t *p) {
     if (!p)
         return 0;
     for (int sig = 1; sig < NSIG; sig++) {
-        if (p->signals.pending[sig] && !p->signals.blocked[sig])
+        if (p->signals.pending[sig] &&
+            (!p->signals.blocked[sig] || sig_is_unblockable(sig)))
             return 1;
     }
     return 0;
@@ -79,9 +86,15 @@ int signal_deliver(proc_t *p, int sig, registers_t *r) {
     if (!p || !signal_is_valid(sig))
         return -EINVAL;
 
-    if (p->signals.blocked[sig]) {
+    if (p->signals.blocked[sig] && !sig_is_unblockable(sig)) {
         p->signals.pending[sig] = 1;
         return 0;
+    }
+    /* Defense in depth: a stale blocked bit for KILL/STOP (e.g. set
+     * before the sigprocmask fix) must not make the process
+     * unkillable — force it clear on delivery. */
+    if (sig_is_unblockable(sig)) {
+        p->signals.blocked[sig] = 0;
     }
 
     sighandler_t h = p->signals.handler[sig];
@@ -175,6 +188,8 @@ int signal_deliver(proc_t *p, int sig, registers_t *r) {
     if (!(p->signals.sa_flags[sig] & SA_NODEFER))
         new_mask |= (1u << sig);
     new_mask |= p->signals.sa_mask[sig];
+    /* A handler must never run with KILL/STOP blocked. */
+    new_mask &= ~((1u << SIGKILL) | (1u << SIGSTOP));
 
     uint32_t stack = r->useresp;
     if ((p->signals.sa_flags[sig] & SA_ONSTACK) && p->signals.ss_active &&
@@ -229,9 +244,15 @@ int signal_deliver(proc_t *p, int sig, registers_t *r) {
     if (!p || !signal_is_valid(sig))
         return -EINVAL;
 
-    if (p->signals.blocked[sig]) {
+    if (p->signals.blocked[sig] && !sig_is_unblockable(sig)) {
         p->signals.pending[sig] = 1;
         return 0;
+    }
+    /* Defense in depth: a stale blocked bit for KILL/STOP (e.g. set
+     * before the sigprocmask fix) must not make the process
+     * unkillable — force it clear on delivery. */
+    if (sig_is_unblockable(sig)) {
+        p->signals.blocked[sig] = 0;
     }
 
     sighandler_t h = p->signals.handler[sig];
@@ -324,6 +345,8 @@ int signal_deliver(proc_t *p, int sig, registers_t *r) {
     if (!(p->signals.sa_flags[sig] & SA_NODEFER))
         new_mask |= (1u << sig);
     new_mask |= p->signals.sa_mask[sig];
+    /* A handler must never run with KILL/STOP blocked. */
+    new_mask &= ~((1u << SIGKILL) | (1u << SIGSTOP));
 
     uint64_t stack = r->rsp;
     if ((p->signals.sa_flags[sig] & SA_ONSTACK) && p->signals.ss_active &&
@@ -373,9 +396,15 @@ int signal_deliver(proc_t *p, int sig, registers_t *r) {
     if (!p || !signal_is_valid(sig))
         return -EINVAL;
 
-    if (p->signals.blocked[sig]) {
+    if (p->signals.blocked[sig] && !sig_is_unblockable(sig)) {
         p->signals.pending[sig] = 1;
         return 0;
+    }
+    /* Defense in depth: a stale blocked bit for KILL/STOP (e.g. set
+     * before the sigprocmask fix) must not make the process
+     * unkillable — force it clear on delivery. */
+    if (sig_is_unblockable(sig)) {
+        p->signals.blocked[sig] = 0;
     }
 
     sighandler_t h = p->signals.handler[sig];
@@ -471,6 +500,8 @@ int signal_deliver(proc_t *p, int sig, registers_t *r) {
     if (!(p->signals.sa_flags[sig] & SA_NODEFER))
         new_mask |= (1u << sig);
     new_mask |= p->signals.sa_mask[sig];
+    /* A handler must never run with KILL/STOP blocked. */
+    new_mask &= ~((1u << SIGKILL) | (1u << SIGSTOP));
 
     uint64_t stack = r->sp;
     if ((p->signals.sa_flags[sig] & SA_ONSTACK) && p->signals.ss_active &&
@@ -514,7 +545,8 @@ int signal_check_pending(proc_t *p, registers_t *r) {
         return 0;
 
     for (int sig = 1; sig < NSIG; sig++) {
-        if (p->signals.pending[sig] && !p->signals.blocked[sig]) {
+        if (p->signals.pending[sig] &&
+            (!p->signals.blocked[sig] || sig_is_unblockable(sig))) {
             int ret = signal_deliver(p, sig, r);
             if (ret != 0) {
                 /* The sigframe could not be installed (unmapped stack

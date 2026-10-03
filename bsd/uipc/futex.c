@@ -64,6 +64,8 @@
 
 typedef struct futex_q {
     uintptr_t  uaddr;      /* user futex address */
+    void      *mm;         /* address-space key (proc page_dir): same VA in
+                            * different processes must not share a queue */
     waitq_t    wq;         /* waiters (proc_t linked via wait_next) */
     int        nwaiters;
     struct futex_q *next;
@@ -82,12 +84,20 @@ static unsigned futex_hash(uintptr_t uaddr) {
     return (unsigned)((uaddr >> 2) & (FUTEX_BUCKETS - 1));
 }
 
-/* Find (or create) the per-address queue.  Caller holds futex_lock with
- * interrupts disabled (UP atomicity). */
-static futex_q_t *futex_find_q(unsigned idx, uintptr_t uaddr, int create) {
+/* Address-space key for the caller: threads sharing page_dir (CLONE_VM)
+ * share futexes; separate processes never do. */
+static void *futex_current_mm(void) {
+    proc_t *p = proc_current();
+    return p ? p->page_dir : NULL;
+}
+
+/* Find (or create) the per-(mm,address) queue.  Caller holds futex_lock
+ * with interrupts disabled (UP atomicity). */
+static futex_q_t *futex_find_q(unsigned idx, void *mm, uintptr_t uaddr,
+                                int create) {
     futex_q_t *q;
     for (q = buckets[idx]; q; q = q->next)
-        if (q->uaddr == uaddr)
+        if (q->uaddr == uaddr && q->mm == mm)
             return q;
     if (!create)
         return NULL;
@@ -95,6 +105,7 @@ static futex_q_t *futex_find_q(unsigned idx, uintptr_t uaddr, int create) {
     if (!q)
         return NULL;
     q->uaddr = uaddr;
+    q->mm = mm;
     q->nwaiters = 0;
     waitq_init(&q->wq);
     q->next = buckets[idx];
@@ -117,12 +128,16 @@ int futex_wait(uintptr_t uaddr, uint32_t val, uint64_t deadline_ticks) {
     proc_t *p = proc_current();
     if (!p)
         return -EINTR;
+    /* Reject kernel addresses before allocating any queue state. */
+    if (!user_range_ok((const void *)uaddr, sizeof(uint32_t), 0))
+        return -EFAULT;
 
     uint32_t flags;
     spin_lock_irqsave(&futex_lock, &flags);
 
     unsigned idx = futex_hash(uaddr);
-    futex_q_t *q = futex_find_q(idx, uaddr, 1);
+    void *mm = p->page_dir;
+    futex_q_t *q = futex_find_q(idx, mm, uaddr, 1);
     if (!q) {
         spin_unlock_irqrestore(&futex_lock, flags);
         return -ENOMEM;
@@ -211,12 +226,15 @@ int futex_wait(uintptr_t uaddr, uint32_t val, uint64_t deadline_ticks) {
 int futex_wake(uintptr_t uaddr, int n) {
     if (n <= 0)
         return 0;
+    if (!user_range_ok((const void *)uaddr, sizeof(uint32_t), 0))
+        return 0;
 
     uint32_t flags;
     spin_lock_irqsave(&futex_lock, &flags);
 
+    void *mm = futex_current_mm();
     unsigned idx = futex_hash(uaddr);
-    futex_q_t *q = futex_find_q(idx, uaddr, 0);
+    futex_q_t *q = futex_find_q(idx, mm, uaddr, 0);
     if (!q) {
         spin_unlock_irqrestore(&futex_lock, flags);
         return 0;
@@ -241,17 +259,24 @@ int futex_wake(uintptr_t uaddr, int n) {
  * onto uaddr2's queue (so a later FUTEX_WAKE on uaddr2 releases them).
  * Returns the number woken by this call. */
 int futex_requeue(uintptr_t uaddr1, uintptr_t uaddr2, int nwake, int nmove) {
+    if (!user_range_ok((const void *)uaddr1, sizeof(uint32_t), 0))
+        return 0;
+    if (!user_range_ok((const void *)uaddr2, sizeof(uint32_t), 0))
+        return 0;
+    if (nwake < 0 || nmove < 0)
+        return 0;
     uint32_t flags;
     spin_lock_irqsave(&futex_lock, &flags);
 
+    void *mm = futex_current_mm();
     unsigned idx1 = futex_hash(uaddr1);
-    futex_q_t *q1 = futex_find_q(idx1, uaddr1, 0);
+    futex_q_t *q1 = futex_find_q(idx1, mm, uaddr1, 0);
     if (!q1) {
         spin_unlock_irqrestore(&futex_lock, flags);
         return 0;
     }
     futex_q_t *q2 = (uaddr1 == uaddr2) ? q1 : futex_find_q(futex_hash(uaddr2),
-                                                           uaddr2, 1);
+                                                           mm, uaddr2, 1);
     if (!q2) {
         spin_unlock_irqrestore(&futex_lock, flags);
         return -ENOMEM;

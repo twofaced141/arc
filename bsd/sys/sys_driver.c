@@ -84,6 +84,9 @@ int64_t sys_phys_map(proc_t *p, registers_t *r) {
     uint32_t flags = ARG4(r);
 
     if (!p || !p->page_dir) return -1;
+    /* Raw MMIO mapping is privileged: a handle alone is not enough
+     * after a setuid drop (handles survive the drop). */
+    if (p->euid != 0) return -1;
     if (size == 0) return -1;
 
     /* Align phys down, size up to page boundaries, rejecting overflow:
@@ -148,7 +151,7 @@ int64_t sys_phys_map(proc_t *p, registers_t *r) {
 
     log_printf(LOG_LEVEL_DEBUG, "phys_map: phys=0x%lx virt=0x%lx size=0x%lx flags=0x%x -> 0x%lx\n",
                  phys, virt, size, flags, (unsigned long)(virt_page + offset));
-    return (int)(virt_page + offset);
+    return (int64_t)(virt_page + offset);
 }
 
 /* ---- 2. DMA buffer allocation ---- */
@@ -169,6 +172,7 @@ int64_t sys_dma_alloc(proc_t *p, registers_t *r) {
 
     if (!p || !p->page_dir) return -1;
     if (size == 0 || !user_result) return -1;
+    if (p->euid != 0) return -1;
 
     /* Capability gate: DMA buffers need the caller to look like a
      * driver — an open device session or an owned I/O channel (the
@@ -296,6 +300,7 @@ int64_t sys_irq_subscribe(proc_t *p, registers_t *r) {
 
     if (irq_num >= IRQ_MAX) return -1;
     if (!p || !p->thread) return -1;
+    if (p->euid != 0) return -1;
 
     /* Capability gate: the process must have a device with this IRQ
      * line open. */
@@ -366,6 +371,7 @@ int64_t sys_port_in(proc_t *p, registers_t *r) {
     uint16_t port = (uint16_t)ARG1(r);
     uint8_t  size = (uint8_t)ARG2(r); /* 1, 2, or 4 */
 
+    if (!p || p->euid != 0) return -1;
     /* Capability gate: the port range must belong to a device the
      * process has open.  PCI I/O-space BARs are stored as ARC_RES_MMIO
      * resources, so the MMIO coverage check applies to them too. */
@@ -389,6 +395,7 @@ int64_t sys_port_out(proc_t *p, registers_t *r) {
     uint32_t value = ARG2(r);
     uint8_t  size  = (uint8_t)ARG3(r); /* 1, 2, or 4 */
 
+    if (!p || p->euid != 0) return -1;
     /* Capability gate, same as sys_port_in. */
     if (!dev_handle_has_resource(p, ARC_RES_MMIO, port, size))
         return -1;
@@ -450,6 +457,7 @@ int64_t sys_service_register(proc_t *p, registers_t *r) {
     uint64_t    data      = ARG2(r);
     const char *user_desc = (const char *)ARG3(r);
 
+    if (!p || p->euid != 0) return -1;
     if (!user_name) return -1;
 
     char kernel_name[SERVICE_NAME_MAX];
@@ -733,12 +741,16 @@ static int dev_handle_any(proc_t *p)
     return found;
 }
 
-/* dev_open(bus, name) -> opaque handle for this process. */
+/* dev_open(bus, name) -> opaque handle for this process.
+ * Privileged: handles gate MMIO/IRQ/port/DMA, so untrusted users
+ * must not be able to open arbitrary devices. */
 int64_t sys_dev_open(proc_t *p, registers_t *r) {
     const char *user_bus  = (const char *)(uintptr_t)ARG1(r);
     const char *user_name = (const char *)(uintptr_t)ARG2(r);
 
     if (!p || !user_bus || !user_name)
+        return -1;
+    if (p->euid != 0)
         return -1;
 
     char bus[ARC_DEVINFO_BUS_MAX];
@@ -830,11 +842,19 @@ extern int block_ipc_attach(int io_handle, const char *name,
  */
 int64_t sys_io_register(proc_t *p, registers_t *r) {
     if (!p) return -1;
+    /* Registering channels (esp. block devices that appear under
+     * devfs and serve kernel block I/O) is privileged: otherwise any
+     * user could squat a driver name and feed forged disk contents. */
+    if (p->euid != 0) return -1;
     const char *user_name = (const char *)(uintptr_t)ARG1(r);
     uint32_t    block_sz  = (uint32_t)ARG2(r);
     uint64_t    num_blk   = ARG3(r) | ((uint64_t)ARG4(r) << 32);
 
     if (!user_name) return -1;
+    /* Sanity-cap geometry: block_ipc serves 4K/request; absurd sizes
+     * only waste table slots. */
+    if (block_sz > 4096 || num_blk > (1ULL << 32))
+        return -1;
 
     char name[IO_CHANNEL_MAX_NAME];
     if (strncpy_from_user(name, user_name, IO_CHANNEL_MAX_NAME - 1) < 0)
@@ -905,6 +925,8 @@ int64_t sys_io_complete(proc_t *p, registers_t *r) {
  */
 int64_t sys_tty_input(proc_t *p, registers_t *r) {
     if (!p)
+        return -1;
+    if (p->euid != 0)
         return -1;
 
     uint8_t c = (uint8_t)ARG1(r);

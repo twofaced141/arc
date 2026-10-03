@@ -53,6 +53,10 @@ static int mount_count;
 /* Symlink resolution budget (OpenBSD-style) */
 #define VFS_SYMLINK_MAX 8
 
+/* Bounce granularity for user I/O: vnode ops get a kernel buffer, the
+ * user pointer is only touched via copy_to/from_user. */
+#define VFS_IO_CHUNK 4096
+
 int vfs_copy_path(proc_t *p, const char *user_path, char *kpath);
 static void vfs_devfs_mount(void);
 
@@ -153,6 +157,9 @@ void vfs_devfs_mount(void) {
 int vfs_mount(proc_t *p, const char *udev, const char *upath) {
     if (!p) p = proc_current();
     if (!p) return -EINVAL;
+    /* Mounting overlays the namespace for every process: root-only. */
+    if (p->euid != 0)
+        return -EPERM;
 
     char devname[64];
     char path[128];
@@ -196,6 +203,8 @@ int vfs_mount(proc_t *p, const char *udev, const char *upath) {
 int vfs_umount(proc_t *p, const char *upath) {
     if (!p) p = proc_current();
     if (!p) return -EINVAL;
+    if (p->euid != 0)
+        return -EPERM;
 
     char path[128];
     if (copy_from_user(path, upath, sizeof(path) - 1) != 0)
@@ -590,12 +599,10 @@ ssize_t vfs_read(proc_t *p, int fd, void *buf, size_t count) {
             return -EAGAIN;
     }
 
-    /* Buffer validation BEFORE any vnode op touches `buf`: it is a
-     * raw user pointer.  A kernel address here would hand the file's
-     * contents an arbitrary kernel write; an unmapped one would fault
-     * in ring 0 and panic.  The FULL count is validated (user_range_ok
-     * takes size_t) — validating a truncated 32-bit prefix while the
-     * op copies the whole 64-bit count would leave the tail unchecked. */
+    /* Buffer validation BEFORE any I/O: a kernel address must never
+     * reach the vnode ops.  The FULL count is validated upfront so a
+     * wholly-bad pointer fails without side effects (e.g. without
+     * blocking on a pipe). */
     if (!user_range_ok(buf, count, 1))
         return -EFAULT;
 
@@ -604,9 +611,44 @@ ssize_t vfs_read(proc_t *p, int fd, void *buf, size_t count) {
             return -EACCES;
     }
 
-    ssize_t ret = vp->ops->read(vp, buf, count, f->offset);
-    if (ret > 0) f->offset += ret;
-    return ret;
+    /* Bounce through a kernel buffer: vnode ops dereference their buf
+     * argument directly in ring 0.  Handing them the raw user pointer
+     * turns a concurrent munmap/mprotect from a sibling thread into a
+     * kernel-mode fault (panic), and lets a fault happen while
+     * holding driver spinlocks with IRQs off.  Chunked bounce keeps
+     * every user touch inside copy_to_user (EFAULT, never a fault). */
+    if (count == 0)
+        return 0;
+    uint8_t *kbuf = (uint8_t *)kmalloc(VFS_IO_CHUNK);
+    if (!kbuf)
+        return -ENOMEM;
+    size_t done = 0;
+    ssize_t err = 0;
+    while (done < count) {
+        size_t chunk = count - done;
+        if (chunk > VFS_IO_CHUNK)
+            chunk = VFS_IO_CHUNK;
+        ssize_t n = vp->ops->read(vp, kbuf, chunk, f->offset + (int64_t)done);
+        if (n < 0) {
+            err = n;
+            break;
+        }
+        if (n == 0)
+            break;
+        if (copy_to_user((uint8_t *)buf + done, kbuf, (size_t)n) < 0) {
+            err = -EFAULT;
+            break;
+        }
+        done += (size_t)n;
+        if ((size_t)n < chunk)
+            break;  /* short read: EOF or drained pipe */
+    }
+    kfree(kbuf);
+    if (done > 0) {
+        f->offset += (int64_t)done;
+        return (ssize_t)done;
+    }
+    return err;
 }
 
 /* pread(2): read at an explicit offset without changing the
@@ -633,7 +675,36 @@ ssize_t vfs_pread(proc_t *p, int fd, void *buf, size_t count, int64_t offset) {
         if (vfs_perm_check(p, vp, R_OK) < 0)
             return -EACCES;
     }
-    return vp->ops->read(vp, buf, count, offset);
+    if (count == 0)
+        return 0;
+    uint8_t *kbuf = (uint8_t *)kmalloc(VFS_IO_CHUNK);
+    if (!kbuf)
+        return -ENOMEM;
+    size_t done = 0;
+    ssize_t err = 0;
+    while (done < count) {
+        size_t chunk = count - done;
+        if (chunk > VFS_IO_CHUNK)
+            chunk = VFS_IO_CHUNK;
+        ssize_t n = vp->ops->read(vp, kbuf, chunk, offset + (int64_t)done);
+        if (n < 0) {
+            err = n;
+            break;
+        }
+        if (n == 0)
+            break;
+        if (copy_to_user((uint8_t *)buf + done, kbuf, (size_t)n) < 0) {
+            err = -EFAULT;
+            break;
+        }
+        done += (size_t)n;
+        if ((size_t)n < chunk)
+            break;
+    }
+    kfree(kbuf);
+    if (done > 0)
+        return (ssize_t)done;
+    return err;
 }
 
 ssize_t vfs_write(proc_t *p, int fd, const void *buf, size_t count) {
@@ -665,15 +736,43 @@ ssize_t vfs_write(proc_t *p, int fd, const void *buf, size_t count) {
     if (!user_range_ok(buf, count, 0))
         return -EFAULT;
 
-    int64_t off = (f->flags & O_APPEND) ? vp->size : f->offset;
-    ssize_t ret = vp->ops->write(vp, buf, count, off);
-    if (ret > 0) {
-        if (f->flags & O_APPEND)
+    if (count == 0)
+        return 0;
+    uint8_t *kbuf = (uint8_t *)kmalloc(VFS_IO_CHUNK);
+    if (!kbuf)
+        return -ENOMEM;
+    size_t done = 0;
+    ssize_t err = 0;
+    int is_append = (f->flags & O_APPEND) ? 1 : 0;
+    while (done < count) {
+        size_t chunk = count - done;
+        if (chunk > VFS_IO_CHUNK)
+            chunk = VFS_IO_CHUNK;
+        if (copy_from_user(kbuf, (const uint8_t *)buf + done, chunk) < 0) {
+            err = -EFAULT;
+            break;
+        }
+        int64_t off = is_append ? vp->size : f->offset + (int64_t)done;
+        ssize_t n = vp->ops->write(vp, kbuf, chunk, off);
+        if (n < 0) {
+            err = n;
+            break;
+        }
+        if (n == 0)
+            break;
+        done += (size_t)n;
+        if ((size_t)n < chunk)
+            break;
+    }
+    kfree(kbuf);
+    if (done > 0) {
+        if (is_append)
             f->offset = vp->size;
         else
-            f->offset += ret;
+            f->offset += (int64_t)done;
+        return (ssize_t)done;
     }
-    return ret;
+    return err;
 }
 
 /* pwrite(2): write at an explicit offset without changing the
@@ -700,7 +799,36 @@ ssize_t vfs_pwrite(proc_t *p, int fd, const void *buf, size_t count, int64_t off
         if (vfs_perm_check(p, vp, W_OK) < 0)
             return -EACCES;
     }
-    return vp->ops->write(vp, buf, count, offset);
+    if (count == 0)
+        return 0;
+    uint8_t *kbuf = (uint8_t *)kmalloc(VFS_IO_CHUNK);
+    if (!kbuf)
+        return -ENOMEM;
+    size_t done = 0;
+    ssize_t err = 0;
+    while (done < count) {
+        size_t chunk = count - done;
+        if (chunk > VFS_IO_CHUNK)
+            chunk = VFS_IO_CHUNK;
+        if (copy_from_user(kbuf, (const uint8_t *)buf + done, chunk) < 0) {
+            err = -EFAULT;
+            break;
+        }
+        ssize_t n = vp->ops->write(vp, kbuf, chunk, offset + (int64_t)done);
+        if (n < 0) {
+            err = n;
+            break;
+        }
+        if (n == 0)
+            break;
+        done += (size_t)n;
+        if ((size_t)n < chunk)
+            break;
+    }
+    kfree(kbuf);
+    if (done > 0)
+        return (ssize_t)done;
+    return err;
 }
 
 int vfs_ioctl(proc_t *p, int fd, int cmd, void *data) {
@@ -1137,8 +1265,8 @@ int vfs_fstat(proc_t *p, int fd, void *statbuf) {
 
 
 /* Check `amode` (R_OK/W_OK/X_OK) against the vnode's mode bits using
- * the process credentials (euid/egid).  Root can do anything except
- * execute files with no execute bit at all. */
+ * the process credentials (euid/egid).  Root bypasses R/W checks and
+ * can execute anything with at least one execute bit. */
 int vfs_perm_check(proc_t *p, vnode_t *vp, int amode) {
     if (!p || !vp)
         return -EACCES;
@@ -1149,6 +1277,13 @@ int vfs_perm_check(proc_t *p, vnode_t *vp, int amode) {
     if (vp->ops->stat(vp, &st) < 0)
         return -EACCES;
 
+    /* Root: allow R/W unconditionally; X only if any exec bit set. */
+    if (p->euid == 0) {
+        if ((amode & X_OK) && (st.st_mode & 0111) == 0)
+            return -EACCES;
+        return 0;
+    }
+
     int perm = 0;
     if (p->euid == st.st_uid) {
         perm = (st.st_mode >> 6) & 7;
@@ -1158,10 +1293,6 @@ int vfs_perm_check(proc_t *p, vnode_t *vp, int amode) {
         perm = st.st_mode & 7;
     }
 
-    if (amode & X_OK) {
-        if (p->euid == 0 && (st.st_mode & 0111) == 0)
-            return -EACCES;
-    }
     if (amode & R_OK && !(perm & 4))
         return -EACCES;
     if (amode & W_OK && !(perm & 2))
@@ -1203,6 +1334,26 @@ int vfs_chmod(proc_t *p, const char *upath, int mode) {
     if (!vp->ops || !vp->ops->chmod) {
         vnode_put(vp);
         return -EINVAL;
+    }
+    /* Only the file owner or root may change mode (POSIX).  Without
+     * this any user could chmod 0644 a 0600 root file and read it. */
+    if (vp->ops->stat) {
+        struct stat st;
+        if (vp->ops->stat(vp, &st) < 0) {
+            vnode_put(vp);
+            return -EACCES;
+        }
+        if (p->euid != 0 && p->euid != (uint32_t)st.st_uid) {
+            vnode_put(vp);
+            return -EPERM;
+        }
+    } else {
+        /* Nodes without a stat model (pipes/devices): owner-only
+         * fallback — non-root cannot chmod them. */
+        if (p->euid != 0) {
+            vnode_put(vp);
+            return -EPERM;
+        }
     }
     err = vp->ops->chmod(vp, mode & 07777);
     vnode_put(vp);
