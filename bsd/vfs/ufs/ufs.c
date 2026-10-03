@@ -1098,10 +1098,12 @@ static int64_t ufs_alloccg(ufs_fs_t *fs, uint64_t cg, int64_t bpref,
     cgp = cb.cgp;
     if (size == fs->sb.fs_bsize) {
         blkno = ufs_alloccgblk(fs, &cb, bpref, rsize);
-        if (blkno > 0)
+        if (blkno > 0) {
             ufs_cg_store(fs, &cb);
-        else
             ufs_cg_discard(&cb);
+        } else {
+            ufs_cg_discard(&cb);
+        }
         return blkno;
     }
     /*
@@ -1124,10 +1126,12 @@ static int64_t ufs_alloccg(ufs_fs_t *fs, uint64_t cg, int64_t bpref,
             return 0;
         }
         blkno = ufs_alloccgblk(fs, &cb, bpref, rsize);
-        if (blkno > 0)
+        if (blkno > 0) {
             ufs_cg_store(fs, &cb);
-        else
             ufs_cg_discard(&cb);
+        } else {
+            ufs_cg_discard(&cb);
+        }
         return blkno;
     }
     bno = ufs_mapsearch(fs, cgp, bpref, allocsiz);
@@ -1146,6 +1150,7 @@ static int64_t ufs_alloccg(ufs_fs_t *fs, uint64_t cg, int64_t bpref,
     fs->sb.fs_fmod = 1;
     blkno = CG_BASE(fs, cg) + bno;
     ufs_cg_store(fs, &cb);
+    ufs_cg_discard(&cb);
     return blkno;
 }
 
@@ -1197,6 +1202,7 @@ static int64_t ufs_fragextend(ufs_fs_t *fs, uint64_t cg, int64_t bprev,
     fs->csums[cg].cs_nffree -= nffree;
     fs->sb.fs_fmod = 1;
     ufs_cg_store(fs, &cb);
+    ufs_cg_discard(&cb);
     return bprev;
 
 fail:
@@ -1303,6 +1309,7 @@ gotit:
         fs->csums[cg].cs_ndir++;
     }
     error = ufs_cg_store(fs, &cb);
+    ufs_cg_discard(&cb);
     if (error < 0)
         return 0;
     return (int64_t)(cg * fs->sb.fs_ipg + ipref);
@@ -1428,6 +1435,7 @@ static int ufs_blkfree(ufs_fs_t *fs, int64_t bno, long size) {
     }
     fs->sb.fs_fmod = 1;
     error = ufs_cg_store(fs, &cb);
+    ufs_cg_discard(&cb);
     if (error < 0)
         return error;
     return 0;
@@ -1469,6 +1477,7 @@ static int ufs_freefile(ufs_fs_t *fs, uint32_t ino, int mode) {
     }
     fs->sb.fs_fmod = 1;
     error = ufs_cg_store(fs, &cb);
+    ufs_cg_discard(&cb);
     if (error < 0)
         return error;
     return 0;
@@ -3278,6 +3287,7 @@ static int ufs_dir_mkdir(vnode_t *vp, const char *name, int mode) {
         ufs_dir_add_entry(fs, suv, "..", dir->ino, DT_DIR) < 0) {
         ufs_dir_remove_entry(fs, dir, name);
         ufs_freefile(fs, ino, imode);
+        sub->ops->close(sub);
         vnode_put(sub);
         return -ENOSPC;
     }
@@ -3285,6 +3295,7 @@ static int ufs_dir_mkdir(vnode_t *vp, const char *name, int mode) {
     suv->mtime = now;
     suv->dirty |= IN_CHANGE | IN_UPDATE;
     ufs_vnode_flush(fs, suv);
+    sub->ops->close(sub);
     vnode_put(sub);
 
     dir->nlink++;           /* ".." reference from the new directory */
@@ -3717,6 +3728,13 @@ int ufs_unmount(struct mount *mp) {
     fs->sb.fs_fmod = 0;
     ufs_write_superblock(fs);
 
+    if (mp->root) {
+        vnode_t *root = mp->root;
+        mp->root = NULL;
+        if (root->ops && root->ops->close)
+            root->ops->close(root);
+        vnode_put(root);
+    }
     kfree(fs->csums);
     kfree(fs->maxcluster);
     kfree(fs->contigdirs);

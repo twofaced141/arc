@@ -183,8 +183,25 @@ static inline void vnode_cache_flush_mount(struct mount *m) {
 }
 
 static inline void vnode_put(vnode_t *vp) {
-    if (vp && --vp->refcount <= 0)
-        free(vp);
+    if (!vp)
+        return;
+    if (--vp->refcount > 0)
+        return;
+    /* Mirror kernel vn_destroy: close releases filesystem-private
+     * data (uv/ev) before the vnode itself is freed.  Close is
+     * idempotent (clears vp->data), so an explicit close + put from
+     * the caller is safe. */
+    if (vp->ops && vp->ops->close)
+        vp->ops->close(vp);
+    free(vp);
+}
+
+static inline void vn_close(vnode_t *vp) {
+    if (!vp)
+        return;
+    if (vp->ops && vp->ops->close)
+        vp->ops->close(vp);
+    vnode_put(vp);
 }
 
 #endif

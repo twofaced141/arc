@@ -160,7 +160,7 @@ void host_fs_tests(void) {
         TEST("fstat hello.txt", f1->ops->stat(f1, &st) == 0 &&
              st.st_size == (int)(sizeof(msg) - 1) && st.st_nlink == 1 &&
              (st.st_mode & S_IFMT) == S_IFREG);
-        f1->ops->close(f1);
+        f1->ops->close(f1); vnode_put(f1);
     }
 
     /* ---- mkdir + nested file + multi-block file ---- */
@@ -194,9 +194,9 @@ void host_fs_tests(void) {
             int rd = vn_read(pf, rb, (size_t)off, 0);
             TEST("read back passwd", rd == off && memcmp(rb, big, (size_t)off) == 0);
             free(rb);
-            pf->ops->close(pf);
+            pf->ops->close(pf); vnode_put(pf);
         }
-        etc->ops->close(etc);
+        etc->ops->close(etc); vnode_put(etc);
     }
 
     /* ---- big file: double-indirect ---- */
@@ -228,7 +228,7 @@ void host_fs_tests(void) {
             TEST("read back after truncate", rd == 3000 && memcmp(data, rb, 3000) == 0);
             free(data);
             free(rb);
-            bf->ops->close(bf);
+            bf->ops->close(bf); vnode_put(bf);
         }
     }
 
@@ -255,7 +255,7 @@ void host_fs_tests(void) {
             struct stat st;
             sf->ops->stat(sf, &st);
             TEST("sparse file size", st.st_size == 70000 + (int)sizeof(buf));
-            sf->ops->close(sf);
+            sf->ops->close(sf); vnode_put(sf);
         }
     }
 
@@ -273,7 +273,7 @@ void host_fs_tests(void) {
             struct stat st;
             sl->ops->stat(sl, &st);
             TEST("stat link1 is symlink", (st.st_mode & S_IFMT) == S_IFLNK);
-            sl->ops->close(sl);
+            sl->ops->close(sl); vnode_put(sl);
         }
     }
 
@@ -282,7 +282,7 @@ void host_fs_tests(void) {
         vnode_t *tgt = root->ops->lookup(root, "hello.txt");
         r = root->ops->link(root, "hello_hard", tgt);
         TEST("hard link hello_hard", r == 0);
-        tgt->ops->close(tgt);
+        tgt->ops->close(tgt); vnode_put(tgt);
 
         vnode_t *hl = root->ops->lookup(root, "hello_hard");
         TEST("lookup hello_hard", hl != NULL);
@@ -294,7 +294,7 @@ void host_fs_tests(void) {
             struct stat st;
             hl->ops->stat(hl, &st);
             TEST("hard link nlink == 2", st.st_nlink == 2);
-            hl->ops->close(hl);
+            hl->ops->close(hl); vnode_put(hl);
         }
 
         r = root->ops->unlink(root, "hello.txt");
@@ -306,7 +306,7 @@ void host_fs_tests(void) {
             struct stat st;
             hl2->ops->stat(hl2, &st);
             TEST("hello_hard nlink == 1", st.st_nlink == 1);
-            hl2->ops->close(hl2);
+            hl2->ops->close(hl2); vnode_put(hl2);
         }
     }
 
@@ -328,11 +328,11 @@ void host_fs_tests(void) {
             int rd = vn_read(sh, buf, 8192, 0);
             TEST("shadow content after rename", rd > 100);
             free(buf);
-            sh->ops->close(sh);
+            sh->ops->close(sh); vnode_put(sh);
         }
         vnode_t *gone = etc->ops->lookup(etc, "passwd");
         TEST("old name gone", gone == NULL);
-        if (etc2) etc2->ops->close(etc2);
+        if (etc2) { etc2->ops->close(etc2); vnode_put(etc2); }
         }
     }
 
@@ -352,7 +352,7 @@ void host_fs_tests(void) {
                 if (sub->ops->create(sub, name, 0644, &nf) != 0 || !nf) { ok = 0; break; }
                 uint8_t b[4] = {(uint8_t)i, (uint8_t)(i >> 8), (uint8_t)(i >> 16), (uint8_t)(i >> 24)};
                 nf->ops->write(nf, b, 4, 0);
-                nf->ops->close(nf);
+                nf->ops->close(nf); vnode_put(nf);
             }
             TEST("create 60 files in sub", ok);
 
@@ -362,7 +362,7 @@ void host_fs_tests(void) {
                 uint8_t rd[4] = {0, 0, 0, 0};
                 f17->ops->read(f17, rd, 4, 0);
                 TEST("file017 content", rd[0] == 17);
-                f17->ops->close(f17);
+                f17->ops->close(f17); vnode_put(f17);
             }
 
             /* unlink every other */
@@ -376,10 +376,10 @@ void host_fs_tests(void) {
 
             vnode_t *f58 = sub->ops->lookup(sub, "file058");
             TEST("file058 gone (even, unlinked)", f58 == NULL);
-            if (f58) { f58->ops->close(f58); }
+            if (f58) { f58->ops->close(f58); vnode_put(f58); }
             vnode_t *f01 = sub->ops->lookup(sub, "file001");
             TEST("file001 survives", f01 != NULL);
-            if (f01) { f01->ops->close(f01); }
+            if (f01) { f01->ops->close(f01); vnode_put(f01); }
             vnode_t *f00 = sub->ops->lookup(sub, "file000");
             TEST("file000 gone", f00 == NULL);
 
@@ -388,9 +388,9 @@ void host_fs_tests(void) {
             TEST("rename sub/file001 -> /moved.dat", r == 0);
             vnode_t *mv = root->ops->lookup(root, "moved.dat");
             TEST("lookup moved.dat", mv != NULL);
-            if (mv) { mv->ops->close(mv); }
+            if (mv) { mv->ops->close(mv); vnode_put(mv); }
 
-            sub->ops->close(sub);
+            sub->ops->close(sub); vnode_put(sub);
         }
     }
 
@@ -399,13 +399,13 @@ void host_fs_tests(void) {
         vnode_t *sub = root->ops->lookup(root, "sub");
         r = root->ops->rmdir(root, "sub");
         TEST("rmdir non-empty sub -> ENOTEMPTY", r == -ENOTEMPTY);
-        if (sub) sub->ops->close(sub);
+        if (sub) { sub->ops->close(sub); vnode_put(sub); }
 
         vnode_t *sub2 = NULL;
         r = root->ops->mkdir(root, "empty", 0755);
         TEST("mkdir empty", r == 0);
         sub2 = root->ops->lookup(root, "empty");
-        if (sub2) sub2->ops->close(sub2);
+        if (sub2) { sub2->ops->close(sub2); vnode_put(sub2); }
         r = root->ops->rmdir(root, "empty");
         TEST("rmdir empty ok", r == 0);
         vnode_t *gone = root->ops->lookup(root, "empty");
@@ -420,7 +420,7 @@ void host_fs_tests(void) {
             etc->ops->stat(etc, &st);
             TEST("stat etc is dir", (st.st_mode & S_IFMT) == S_IFDIR);
             TEST("etc nlink >= 2", st.st_nlink >= 2);
-            etc->ops->close(etc);
+            etc->ops->close(etc); vnode_put(etc);
         }
     }
 

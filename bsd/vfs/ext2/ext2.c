@@ -1134,7 +1134,10 @@ static int ext2_file_open(vnode_t *vp, int mode) {
 
 static int ext2_file_close(vnode_t *vp) {
     ext2_vnode_t *ev = (ext2_vnode_t *)vp->data;
-    if (ev) kfree(ev);
+    if (ev) {
+        kfree(ev);
+        vp->data = NULL;
+    }
     return 0;
 }
 
@@ -1364,7 +1367,10 @@ static int ext2_dir_open(vnode_t *vp, int mode) {
 
 static int ext2_dir_close(vnode_t *vp) {
     ext2_vnode_t *ev = (ext2_vnode_t *)vp->data;
-    if (ev) kfree(ev);
+    if (ev) {
+        kfree(ev);
+        vp->data = NULL;
+    }
     return 0;
 }
 
@@ -1571,6 +1577,7 @@ static int ext2_dir_mkdir(vnode_t *vp, const char *name, int mode) {
         ext2_dir_add_entry(sub_ev, "..", dir->ino, EXT2_FT_DIR) < 0) {
         ext2_ev_flush(sub_ev);
         sub->ops->close(sub);
+        vnode_put(sub);
         ext2_dir_remove_entry(dir, name);
         ext2_free_inode(fs, ino);
         return -ENOSPC;
@@ -1579,6 +1586,7 @@ static int ext2_dir_mkdir(vnode_t *vp, const char *name, int mode) {
     sub_ev->mtime = (uint32_t)now;
     ext2_ev_flush(sub_ev);
     sub->ops->close(sub);
+    vnode_put(sub);
 
     ext2_bgdesc_t bgd;
     if (ext2_read_bgdesc(fs, (ino - 1) / fs->inodes_per_group, &bgd) == 0) {
@@ -1968,6 +1976,13 @@ int ext2_unmount(mount_t *mp) {
     fs->sb.s_unmount = (uint32_t)ext2_now_sec();
     ext2_write_superblock(fs);
 
+    if (mp->root) {
+        vnode_t *root = mp->root;
+        mp->root = NULL;
+        if (root->ops && root->ops->close)
+            root->ops->close(root);
+        vnode_put(root);
+    }
     kfree(fs);
     mp->data = NULL;
     mp->root = NULL;
