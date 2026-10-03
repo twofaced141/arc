@@ -15,4 +15,5 @@ __pycache__/
 *.d
 *.map
 SMP.md
+PLAN.md
 .build-arch
