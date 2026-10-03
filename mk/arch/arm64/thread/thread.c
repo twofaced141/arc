@@ -55,6 +55,8 @@ void thread_init(void) {
         threads[i].state = THREAD_UNUSED;
         threads[i].tid = 0;
         threads[i].task = NULL;
+        threads[i].fault_active = 0;
+        threads[i].fault_jb = 0;
     }
     uart_print("thread: init done\r\n");
 }
@@ -90,6 +92,8 @@ thread_t *thread_create(uint64_t entry, void *page_dir, int user) {
     thr->rq = 0;
     thr->tls_base = 0;
     thr->task = NULL;
+    thr->fault_active = 0;
+    thr->fault_jb = 0;
     thr->page_dir = page_dir;
     thr->entry = entry;
     spin_unlock_irqrestore(&thread_lock, flags);

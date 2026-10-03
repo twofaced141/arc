@@ -37,6 +37,7 @@
 #include "gdt.h"
 #include "string.h"
 #include "personality.h"
+#include "fault.h"
 
 static isr_t interrupt_handlers[256];
 static int logged_first_user_irq;
@@ -116,6 +117,15 @@ void isr_handler(registers_t *r) {
     const char *reason = "Unknown Exception";
     if (r->int_no < 32)
         reason = exception_messages[r->int_no];
+
+    /* Kernel-mode fault in an armed copy window → -EFAULT; process
+     * context → oops (kill process); otherwise panic below. */
+    if ((r->cs & 3) != 3) {
+        if (fault_try_recover())
+            return;
+        if (fault_oops(r->eip, 0, reason, 134))
+            return;
+    }
 
     panic(reason, r);
 }

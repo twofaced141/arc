@@ -40,6 +40,7 @@
 #include "personality.h"
 #include "scheduler.h"
 #include "thread.h"
+#include "fault.h"
 #include "cpu.h"
 
 /* amd64 4-level paging:
@@ -499,6 +500,15 @@ void page_fault_handler(registers_t *r) {
         return;
     }
 
+    /* Kernel mode: armed copy window → -EFAULT, process context →
+     * oops (kill process), otherwise panic below. */
+    {
+        if (fault_try_recover())
+            return;
+        if (fault_oops(r->rip, fault_addr, "Page Fault", 139))
+            return;
+    }
+
     uint64_t cr3;
     __asm__ __volatile__("mov %%cr3, %0" : "=r"(cr3));
     thread_t *ct = scheduler_current_thread();
@@ -736,6 +746,19 @@ int user_range_ok(const void *uaddr, size_t size, int write) {
     return 1;
 }
 
+/* Faultable user-memory copies: the byte-dereference loops below run
+ * under an armed setjmp recovery point (see fault.h).
+ * Validate-then-copy still rejects bad addresses synchronously, but a
+ * page racingly unmapped between validation and touch now resumes at
+ * the fault_setjmp recovery path (-EFAULT) instead of panicking.
+ * The recovery path returns immediately without touching locals. */
+static void copy_disarm(thread_t *t) {
+    if (t) {
+        t->fault_active = 0;
+        t->fault_jb = NULL;
+    }
+}
+
 int copy_from_user(void *dst, const void *user_src, size_t size) {
     if (size == 0) return 0;
     if (!user_src) return -1;
@@ -745,13 +768,25 @@ int copy_from_user(void *dst, const void *user_src, size_t size) {
     /* Per-page validate-then-copy: re-walks each page immediately before
      * touching it so a concurrent munmap/mprotect can only race the
      * current 4K chunk, not the whole buffer.  COW races are safe —
-     * page_fault_handler() breaks COW for kernel faults too.  A racing
-     * unmap can still fault in kernel mode (panic); full immunity needs
-     * fault recovery/pinning, this narrows the window to one page. */
+     * page_fault_handler() breaks COW for kernel faults too. */
+    thread_t *t = thread_current();
+    fault_jmp_t jb;
+    if (t) {
+        t->fault_jb = &jb;
+        t->fault_active = 1;
+    }
+    if (fault_setjmp(&jb)) {
+        /* Resumed by fault_try_recover after a racing unmap.  The
+         * handler already disarmed the context. */
+        return -1;
+    }
     for (size_t offset = 0; offset < size; ) {
         uint64_t vaddr = addr + offset;
         int flags = vmm_get_page_flags(dir, vaddr & ~0xFFFULL);
-        if (!(flags & VMM_PRESENT) || !(flags & VMM_USER)) return -1;
+        if (!(flags & VMM_PRESENT) || !(flags & VMM_USER)) {
+            copy_disarm(t);
+            return -1;
+        }
         size_t chunk = PAGE_SIZE - (vaddr & 0xFFF);
         if (chunk > size - offset) chunk = size - offset;
         for (size_t i = 0; i < chunk; i++)
@@ -759,6 +794,7 @@ int copy_from_user(void *dst, const void *user_src, size_t size) {
                 ((const uint8_t *)(uintptr_t)vaddr)[i];
         offset += chunk;
     }
+    copy_disarm(t);
     return 0;
 }
 
@@ -768,11 +804,26 @@ int copy_to_user(void *user_dst, const void *src, size_t size) {
     uint64_t addr = (uint64_t)(uintptr_t)user_dst;
     if (addr >= USER_STACK_TOP || size > USER_STACK_TOP - addr) return -1;
     page_directory_t *dir = vmm_get_current_directory();
+    thread_t *t = thread_current();
+    fault_jmp_t jb;
+    if (t) {
+        t->fault_jb = &jb;
+        t->fault_active = 1;
+    }
+    if (fault_setjmp(&jb)) {
+        return -1;
+    }
     for (size_t offset = 0; offset < size; ) {
         uint64_t vaddr = addr + offset;
         int flags = vmm_get_page_flags(dir, vaddr & ~0xFFFULL);
-        if (!(flags & VMM_PRESENT) || !(flags & VMM_USER)) return -1;
-        if (!(flags & (VMM_WRITABLE | VMM_COW))) return -1;
+        if (!(flags & VMM_PRESENT) || !(flags & VMM_USER)) {
+            copy_disarm(t);
+            return -1;
+        }
+        if (!(flags & (VMM_WRITABLE | VMM_COW))) {
+            copy_disarm(t);
+            return -1;
+        }
         size_t chunk = PAGE_SIZE - (vaddr & 0xFFF);
         if (chunk > size - offset) chunk = size - offset;
         for (size_t i = 0; i < chunk; i++)
@@ -780,6 +831,7 @@ int copy_to_user(void *user_dst, const void *src, size_t size) {
                 ((const uint8_t *)src)[offset + i];
         offset += chunk;
     }
+    copy_disarm(t);
     return 0;
 }
 
@@ -793,26 +845,47 @@ int strncpy_from_user(char *dst, const char *user_src, size_t max_len) {
     if (max_len == 0) return -1;
 
     page_directory_t *dir = vmm_get_current_directory();
-    uint64_t cur_page = addr & ~0xFFFULL;
-    int flags = vmm_get_page_flags(dir, cur_page);
-    if (!(flags & VMM_PRESENT) || !(flags & VMM_USER)) return -1;
+    /* Synchronous pre-check of the first page (fast EFAULT path). */
+    {
+        int pre = vmm_get_page_flags(dir, addr & ~0xFFFULL);
+        if (!(pre & VMM_PRESENT) || !(pre & VMM_USER)) return -1;
+    }
 
+    thread_t *t = thread_current();
+    fault_jmp_t jb;
+    if (t) {
+        t->fault_jb = &jb;
+        t->fault_active = 1;
+    }
+    if (fault_setjmp(&jb)) {
+        return -1;
+    }
     /* Walk byte by byte and stop at the NUL — a string that ends early
-     * must not require pages BEYOND its terminator to be mapped. */
+     * must not require pages BEYOND its terminator to be mapped.
+     * cur_page lives entirely past the setjmp point so longjmp can
+     * never observe a stale value (-Werror=clobbered). */
+    volatile uint64_t cur_page = addr & ~0xFFFULL;
     for (size_t i = 0; i < max_len; i++) {
         char c = ((const char *)(uintptr_t)user_src)[i];
         dst[i] = c;
         if (c == '\0') {
-            if (i + 1 > (size_t)0x7FFFFFFF)
+            if (i + 1 > (size_t)0x7FFFFFFF) {
+                copy_disarm(t);
                 return -1;
+            }
+            copy_disarm(t);
             return (int)(i + 1);
         }
         if (((addr + i + 1) & ~0xFFFULL) != cur_page) {
             cur_page = (addr + i + 1) & ~0xFFFULL;
-            flags = vmm_get_page_flags(dir, cur_page);
-            if (!(flags & VMM_PRESENT) || !(flags & VMM_USER)) return -1;
+            int flags = vmm_get_page_flags(dir, cur_page);
+            if (!(flags & VMM_PRESENT) || !(flags & VMM_USER)) {
+                copy_disarm(t);
+                return -1;
+            }
         }
     }
+    copy_disarm(t);
     return -1;
 }
 

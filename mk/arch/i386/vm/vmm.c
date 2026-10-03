@@ -37,6 +37,7 @@
 #include "memory.h"
 #include "personality.h"
 #include "thread.h"
+#include "fault.h"
 #include "cpu.h"
 #include <string.h>
 
@@ -324,6 +325,15 @@ void page_fault_handler(registers_t *r) {
         }
     }
 
+    /* Kernel mode: armed copy window → -EFAULT, process context →
+     * oops (kill process), otherwise panic below. */
+    {
+        if (fault_try_recover())
+            return;
+        if (fault_oops(r->eip, fault_addr, "Page Fault", 139))
+            return;
+    }
+
     debug_print("PAGE FAULT at 0x");
     debug_print_hex32(fault_addr);
     debug_print(" err=0x");
@@ -365,6 +375,17 @@ int user_range_ok(const void *uaddr, size_t size, int write) {
     return 1;
 }
 
+/* Faultable user-memory copies under an armed setjmp recovery point
+ * (see fault.h): a racing unmap resumes at the fault_setjmp recovery
+ * path (-EFAULT) instead of panicking.  The recovery path returns
+ * immediately without touching locals. */
+static void copy_disarm(thread_t *t) {
+    if (t) {
+        t->fault_active = 0;
+        t->fault_jb = NULL;
+    }
+}
+
 int copy_from_user(void *dst, const void *user_src, size_t size) {
     if (size == 0) return 0;
     size_t addr = (size_t)user_src;
@@ -372,17 +393,33 @@ int copy_from_user(void *dst, const void *user_src, size_t size) {
     if (addr + size > 0xC0000000) return -1;
 
     page_directory_t *dir = vmm_get_current_directory();
+    thread_t *t = thread_current();
+    fault_jmp_t jb;
+    if (t) {
+        t->fault_jb = &jb;
+        t->fault_active = 1;
+    }
+    if (fault_setjmp(&jb)) {
+        return -1;
+    }
     for (size_t offset = 0; offset < size; ) {
         size_t vaddr = addr + offset;
         int flags = vmm_get_page_flags(dir, vaddr & ~0xFFFu);
-        if (!(flags & VMM_PRESENT)) return -1;
-        if (!(flags & VMM_USER)) return -1;
+        if (!(flags & VMM_PRESENT)) {
+            copy_disarm(t);
+            return -1;
+        }
+        if (!(flags & VMM_USER)) {
+            copy_disarm(t);
+            return -1;
+        }
         size_t chunk = PAGE_SIZE - (vaddr & 0xFFFu);
         if (chunk > size - offset) chunk = size - offset;
         for (size_t i = 0; i < chunk; i++)
             ((uint8_t *)dst)[offset + i] = ((const uint8_t *)user_src)[offset + i];
         offset += chunk;
     }
+    copy_disarm(t);
     return 0;
 }
 
@@ -393,18 +430,37 @@ int copy_to_user(void *user_dst, const void *src, size_t size) {
     if (addr + size > 0xC0000000) return -1;
 
     page_directory_t *dir = vmm_get_current_directory();
+    thread_t *t = thread_current();
+    fault_jmp_t jb;
+    if (t) {
+        t->fault_jb = &jb;
+        t->fault_active = 1;
+    }
+    if (fault_setjmp(&jb)) {
+        return -1;
+    }
     for (size_t offset = 0; offset < size; ) {
         size_t vaddr = addr + offset;
         int flags = vmm_get_page_flags(dir, vaddr & ~0xFFFu);
-        if (!(flags & VMM_PRESENT)) return -1;
-        if (!(flags & VMM_USER)) return -1;
-        if (!(flags & VMM_WRITABLE) && !(flags & VMM_COW)) return -1;
+        if (!(flags & VMM_PRESENT)) {
+            copy_disarm(t);
+            return -1;
+        }
+        if (!(flags & VMM_USER)) {
+            copy_disarm(t);
+            return -1;
+        }
+        if (!(flags & VMM_WRITABLE) && !(flags & VMM_COW)) {
+            copy_disarm(t);
+            return -1;
+        }
         size_t chunk = PAGE_SIZE - (vaddr & 0xFFFu);
         if (chunk > size - offset) chunk = size - offset;
         for (size_t i = 0; i < chunk; i++)
             ((uint8_t *)user_dst)[offset + i] = ((const uint8_t *)src)[offset + i];
         offset += chunk;
     }
+    copy_disarm(t);
     return 0;
 }
 
@@ -423,15 +479,28 @@ int strncpy_from_user(char *dst, const char *user_src, size_t max_len) {
         if (!(vmm_get_page_flags(dir, page) & VMM_USER)) return -1;
     }
 
+    thread_t *t = thread_current();
+    fault_jmp_t jb;
+    if (t) {
+        t->fault_jb = &jb;
+        t->fault_active = 1;
+    }
+    if (fault_setjmp(&jb)) {
+        return -1;
+    }
     for (size_t i = 0; i < max_len; i++) {
         char c = ((const char *)user_src)[i];
         dst[i] = c;
         if (c == '\0') {
-            if (i + 1 > (size_t)0x7FFFFFFF)
+            if (i + 1 > (size_t)0x7FFFFFFF) {
+                copy_disarm(t);
                 return -1;
+            }
+            copy_disarm(t);
             return (int)(i + 1);
         }
     }
+    copy_disarm(t);
     return -1;
 }
 

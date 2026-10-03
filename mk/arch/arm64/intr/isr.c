@@ -40,6 +40,7 @@
 #include "personality.h"
 #include "cpu.h"
 #include "thread.h"
+#include "fault.h"
 
 extern thread_t *scheduler_current_thread(void);
 #include <stdint.h>
@@ -196,6 +197,13 @@ void sync_handler(registers_t *r) {
         handle_svc(r);
         return;
     }
+
+    /* Non-page synchronous fault (same-EL #UD/PC-alignment/...):
+     * armed copy point → -EFAULT, process context → oops. */
+    if (fault_try_recover())
+        return;
+    if (fault_oops(r->elr, r->far, "Sync Exception", 134))
+        return;
 
     dump_regs(r);
     uart_print("\narc: stopping\n");

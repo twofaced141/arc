@@ -38,6 +38,8 @@
 #include "fdt.h"
 #include "platform.h"
 #include "spinlock.h"
+#include "fault.h"
+#include "thread.h"
 #include "cpu.h"
 
 /* PCI ECAM base discovered from FDT (extern from main.c). */
@@ -837,6 +839,17 @@ int user_range_ok(const void *uaddr, size_t size, int write) {
 }
 
 
+/* Faultable user-memory copies under an armed setjmp recovery point
+ * (see fault.h): a racing unmap resumes at the fault_setjmp recovery
+ * path (-EFAULT) instead of panicking.  The recovery path returns
+ * immediately without touching locals. */
+static void copy_disarm(thread_t *t) {
+    if (t) {
+        t->fault_active = 0;
+        t->fault_jb = NULL;
+    }
+}
+
 int copy_from_user(void *dst, const void *user_src, size_t size) {
     if (size == 0) return 0;
     if (!user_src) return -1;
@@ -844,16 +857,28 @@ int copy_from_user(void *dst, const void *user_src, size_t size) {
     if (addr < USER_BASE) return -1;
     if (addr >= USER_STACK_TOP || size > USER_STACK_TOP - addr) return -1;
     page_directory_t *dir = vmm_get_current_directory();
+    thread_t *t = thread_current();
+    fault_jmp_t jb;
+    if (t) {
+        t->fault_jb = &jb;
+        t->fault_active = 1;
+    }
+    if (fault_setjmp(&jb)) {
+        return -1;
+    }
     for (size_t offset = 0; offset < size; ) {
         uint64_t vaddr = addr + offset;
         uint64_t *pte = walk_pt(dir, vaddr, 0);
-        if (!pte || !(*pte & DESC_VALID) || !(*pte & ATTR_AP_USER))
+        if (!pte || !(*pte & DESC_VALID) || !(*pte & ATTR_AP_USER)) {
+            copy_disarm(t);
             return -1;
+        }
         size_t chunk = PAGE_SIZE - (vaddr & 0xFFF);
         if (chunk > size - offset) chunk = size - offset;
         memcpy((uint8_t *)dst + offset, (uint8_t *)(uintptr_t)vaddr, chunk);
         offset += chunk;
     }
+    copy_disarm(t);
     return 0;
 }
 
@@ -864,18 +889,32 @@ int copy_to_user(void *user_dst, const void *src, size_t size) {
     if (addr < USER_BASE) return -1;
     if (addr >= USER_STACK_TOP || size > USER_STACK_TOP - addr) return -1;
     page_directory_t *dir = vmm_get_current_directory();
+    thread_t *t = thread_current();
+    fault_jmp_t jb;
+    if (t) {
+        t->fault_jb = &jb;
+        t->fault_active = 1;
+    }
+    if (fault_setjmp(&jb)) {
+        return -1;
+    }
     for (size_t offset = 0; offset < size; ) {
         uint64_t vaddr = addr + offset;
         uint64_t *pte = walk_pt(dir, vaddr, 0);
-        if (!pte || !(*pte & DESC_VALID) || !(*pte & ATTR_AP_USER))
+        if (!pte || !(*pte & DESC_VALID) || !(*pte & ATTR_AP_USER)) {
+            copy_disarm(t);
             return -1;
-        if ((*pte & ATTR_AP_RO) && !(*pte & ATTR_SW_COW))
+        }
+        if ((*pte & ATTR_AP_RO) && !(*pte & ATTR_SW_COW)) {
+            copy_disarm(t);
             return -1;
+        }
         size_t chunk = PAGE_SIZE - (vaddr & 0xFFF);
         if (chunk > size - offset) chunk = size - offset;
         memcpy((uint8_t *)(uintptr_t)vaddr, (const uint8_t *)src + offset, chunk);
         offset += chunk;
     }
+    copy_disarm(t);
     return 0;
 }
 
@@ -888,19 +927,34 @@ int strncpy_from_user(char *dst, const char *user_src, size_t max_len) {
     if (max_len > avail) max_len = (size_t)avail;
     if (max_len == 0) return -1;
     page_directory_t *dir = vmm_get_current_directory();
+    thread_t *t = thread_current();
+    fault_jmp_t jb;
+    if (t) {
+        t->fault_jb = &jb;
+        t->fault_active = 1;
+    }
+    if (fault_setjmp(&jb)) {
+        return -1;
+    }
     for (size_t i = 0; i < max_len; i++) {
         uint64_t vaddr = addr + i;
         uint64_t *pte = walk_pt(dir, vaddr, 0);
-        if (!pte || !(*pte & DESC_VALID) || !(*pte & ATTR_AP_USER))
+        if (!pte || !(*pte & DESC_VALID) || !(*pte & ATTR_AP_USER)) {
+            copy_disarm(t);
             return -1;
+        }
         char c = *(volatile char *)(uintptr_t)vaddr;
         dst[i] = c;
         if (c == '\0') {
-            if (i + 1 > (size_t)0x7FFFFFFF)
+            if (i + 1 > (size_t)0x7FFFFFFF) {
+                copy_disarm(t);
                 return -1;
+            }
+            copy_disarm(t);
             return (int)(i + 1);
         }
     }
+    copy_disarm(t);
     dst[max_len - 1] = '\0';
     return -1;
 }
@@ -933,6 +987,13 @@ int vmm_handle_page_fault(registers_t *r, uint64_t fault_addr, uint32_t esr) {
             return 1;
         }
     }
+
+    /* Same-EL (kernel) fault under an armed copy point → -EFAULT,
+     * process context → oops (kill process), otherwise halt below. */
+    if (fault_try_recover())
+        return 1;
+    if (fault_oops(r->elr, fault_addr, "Data Abort", 139))
+        return 1;
 
     return 0;
 }

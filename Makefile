@@ -302,6 +302,15 @@ HOST_TEST_SRCS = mk/tests/host/host_test_main.c \
                  user/rc/rcparse.c \
                  $(HOST_BSD_SRCS)
 
+# fault_jmp round-trip test links the real amd64 asm verbatim — only on
+# x86_64 hosts (elsewhere the asm does not assemble).
+HOST_UNAME_M := $(shell uname -m)
+ifeq ($(HOST_UNAME_M),x86_64)
+HOST_TEST_SRCS += mk/tests/host/host_fault_test.c \
+                  mk/arch/amd64/thread/fault_jmp.S
+HOST_CFLAGS += -DHOST_HAS_FAULT_JMP
+endif
+
 .PHONY: hosttest clean-hosttest
 
 hosttest: host_test

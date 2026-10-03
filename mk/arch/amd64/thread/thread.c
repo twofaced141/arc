@@ -48,6 +48,8 @@ void thread_init(void) {
         threads[i].page_dir = NULL;
         threads[i].tid = 0;
         threads[i].task = NULL;
+        threads[i].fault_active = 0;
+        threads[i].fault_jb = 0;
     }
     log_print(LOG_LEVEL_DEBUG, "thread: init done\r\n");
 }
@@ -83,6 +85,8 @@ thread_t *thread_create(uint64_t rip, page_directory_t *page_dir, int user) {
     thr->array = NULL;
     thr->rq = NULL;
     thr->task = NULL;
+    thr->fault_active = 0;
+    thr->fault_jb = 0;
 
     {
         int ni = 0;

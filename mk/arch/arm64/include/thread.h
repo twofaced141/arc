@@ -36,6 +36,7 @@
 #include <stdint.h>
 #include "isr.h"
 #include "spinlock.h"
+#include "fault.h"
 
 struct task;
 struct runqueue;
@@ -73,6 +74,10 @@ typedef struct thread {
     uint64_t entry;
     uint32_t sleep_until;
     uint64_t tls_base;              /* per-thread TLS base (unused on arm64 yet) */
+    /* Recoverable-fault context (see fault.h): armed around
+     * user-memory copies, consumed by the kernel fault handlers. */
+    int fault_active;
+    fault_jmp_t *fault_jb;
     char name[32];
 
     /* FP/SIMD state — Q0-Q31 (each 16 bytes, offsets 0..496), then

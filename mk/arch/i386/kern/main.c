@@ -53,6 +53,7 @@
 #include <arc/boot.h>
 #include "test.h"
 #include "personality.h"
+#include "fault.h"
 
 /* Forward declarations from mk components */
 void gdt_install(void);
@@ -77,6 +78,14 @@ static void gp_fault_handler(registers_t *r) {
                 return;
             }
         }
+    }
+    /* Kernel mode: armed copy window → -EFAULT, process context →
+     * oops (kill process), otherwise panic below. */
+    {
+        if (fault_try_recover())
+            return;
+        if (fault_oops(r->eip, 0, "General Protection Fault", 134))
+            return;
     }
     panic("General Protection Fault", r);
 }

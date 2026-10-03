@@ -48,6 +48,8 @@ void thread_init(void) {
         threads[i].page_dir = NULL;
         threads[i].tid = 0;
         threads[i].task = NULL;
+        threads[i].fault_active = 0;
+        threads[i].fault_jb = 0;
     }
     debug_print("thread: init done\r\n");
 }
@@ -82,7 +84,9 @@ thread_t *thread_create(uint32_t eip, page_directory_t *page_dir, int user) {
     thr->prev = NULL;
     thr->array = NULL;
     thr->task = NULL;
-    
+    thr->fault_active = 0;
+    thr->fault_jb = 0;
+
     {
         int ni = 0;
         const char *d = user ? "user_thread" : "kernel_thread";

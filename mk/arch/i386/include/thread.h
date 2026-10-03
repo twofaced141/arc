@@ -37,6 +37,7 @@
 #include "vmm.h"
 #include "isr.h"
 #include "spinlock.h"
+#include "fault.h"
 
 struct task;
 
@@ -74,6 +75,10 @@ typedef struct thread {
     uint32_t user_esp;
     uint32_t sleep_until;
     uintptr_t tls_base;          /* CLONE_SETTLS per-thread TLS base */
+    /* Recoverable-fault context (see fault.h): armed around
+     * user-memory copies, consumed by the kernel fault handlers. */
+    int fault_active;
+    fault_jmp_t *fault_jb;
     char name[32];
 
     /* FPU/SSE state — FXSAVE area (x87 + XMM + MXCSR, 512 bytes).

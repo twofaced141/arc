@@ -37,6 +37,9 @@ void host_bitmap_tests(void);
 void host_elf_tests(void);
 void host_rcparse_tests(void);
 void host_smp_tests(void);
+#ifdef HOST_HAS_FAULT_JMP
+void host_fault_tests(void);
+#endif
 #ifdef HOST_TEST_EXT2
 void host_ext2_tests(void);
 void host_fs_tests(void);
@@ -52,6 +55,9 @@ int main(void) {
     host_elf_tests();
     host_rcparse_tests();
     host_smp_tests();
+#ifdef HOST_HAS_FAULT_JMP
+    host_fault_tests();
+#endif
 #ifdef HOST_TEST_EXT2
     host_ext2_tests();
     host_fs_tests();
